@@ -1,0 +1,277 @@
+import json
+import time
+import os
+import hmac
+import hashlib
+import base64
+import re
+import boto3
+from botocore.exceptions import ClientError
+
+sqs = boto3.client("sqs")
+dynamodb = boto3.resource("dynamodb")
+
+QUEUE_URL = os.environ["SQS_QUEUE_URL"]
+SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
+SLACK_BOT_USER_ID = os.environ.get("SLACK_BOT_USER_ID")
+DEDUP_TABLE = os.environ.get("DEDUP_TABLE", "O3_EventDedup2")
+DEDUP_TTL_SECONDS = int(os.environ.get("DEDUP_TTL_SECONDS", "172800"))
+SLACK_SIGNATURE_TOLERANCE_SECONDS = int(os.environ.get("SLACK_SIGNATURE_TOLERANCE_SECONDS", "300"))
+
+dedup_table = dynamodb.Table(DEDUP_TABLE)
+SLACK_MENTION_PATTERN = re.compile(r"<@[A-Z0-9]+>\s*")
+
+
+def log_json(data):
+    print(json.dumps(data, default=str))
+
+
+def get_header(headers, name):
+    if not headers:
+        return None
+
+    name_lower = name.lower()
+
+    for header_name, header_value in headers.items():
+        if header_name.lower() == name_lower:
+            return header_value
+
+    return None
+
+
+def get_raw_body(event):
+    body = event.get("body", "")
+
+    if event.get("isBase64Encoded"):
+        return base64.b64decode(body).decode("utf-8")
+
+    return body
+
+
+def verify_slack_signature(event, raw_body):
+    headers = event.get("headers", {})
+    signature = get_header(headers, "X-Slack-Signature")
+    timestamp = get_header(headers, "X-Slack-Request-Timestamp")
+
+    if not signature or not timestamp:
+        log_json({
+            "level": "WARN",
+            "message": "missing_slack_signature_headers"
+        })
+        return False
+
+    try:
+        timestamp_int = int(timestamp)
+    except ValueError:
+        log_json({
+            "level": "WARN",
+            "message": "invalid_slack_signature_timestamp",
+            "timestamp": timestamp
+        })
+        return False
+
+    now = int(time.time())
+
+    if abs(now - timestamp_int) > SLACK_SIGNATURE_TOLERANCE_SECONDS:
+        log_json({
+            "level": "WARN",
+            "message": "stale_slack_signature_timestamp",
+            "timestamp": timestamp_int,
+            "now": now
+        })
+        return False
+
+    basestring = f"v0:{timestamp}:{raw_body}".encode("utf-8")
+    expected_signature = "v0=" + hmac.new(
+        SLACK_SIGNING_SECRET.encode("utf-8"),
+        basestring,
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected_signature, signature):
+        log_json({
+            "level": "WARN",
+            "message": "invalid_slack_signature"
+        })
+        return False
+
+    return True
+
+
+def is_direct_message(slack_event):
+    channel = slack_event.get("channel", "")
+    return slack_event.get("channel_type") == "im" or channel.startswith("D")
+
+
+def is_bot_mentioned(text):
+    if not SLACK_BOT_USER_ID:
+        return False
+
+    return f"<@{SLACK_BOT_USER_ID}>" in text
+
+
+def clean_slack_text(text, event_type):
+    text = (text or "").strip()
+
+    if SLACK_BOT_USER_ID:
+        return text.replace(f"<@{SLACK_BOT_USER_ID}>", "").strip()
+
+    if event_type == "app_mention":
+        return SLACK_MENTION_PATTERN.sub("", text, count=1).strip()
+
+    return text
+
+
+def should_process_slack_event(slack_event):
+    event_type = slack_event.get("type")
+    channel_type = slack_event.get("channel_type")
+    text = slack_event.get("text", "")
+
+    if event_type == "app_mention":
+        return True, "app_mention"
+
+    if event_type != "message":
+        return False, "unsupported_event_type"
+
+    if is_direct_message(slack_event):
+        return True, "direct_message"
+
+    if is_bot_mentioned(text):
+        return True, "bot_mentioned_in_channel"
+
+    if channel_type in {"channel", "group", "mpim"}:
+        return False, "bot_not_mentioned"
+
+    return False, "unsupported_channel_type"
+
+
+def lambda_handler(event, context):
+    raw_body = get_raw_body(event)
+
+    if not verify_slack_signature(event, raw_body):
+        return {
+            "statusCode": 401,
+            "body": "invalid signature"
+        }
+
+    body = json.loads(raw_body or "{}")
+
+    # Slack URL verification
+    if body.get("type") == "url_verification":
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "text/plain"},
+            "body": body["challenge"]
+        }
+
+    event_id = body.get("event_id")
+    event_time = body.get("event_time")
+    now = int(time.time())
+
+    # Deduplicate Slack retry events before sending to SQS
+    if event_id:
+        try:
+            dedup_table.put_item(
+                Item={
+                    "event_id": event_id,
+                    "event_time": event_time,
+                    "created_at": now,
+                    "ttl": now + DEDUP_TTL_SECONDS
+                },
+                ConditionExpression="attribute_not_exists(event_id)"
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                log_json({
+                    "level": "INFO",
+                    "message": "duplicate_event_ignored",
+                    "event_id": event_id
+                })
+
+                return {
+                    "statusCode": 200,
+                    "body": "duplicate ignored"
+                }
+
+            raise
+
+    slack_event = body.get("event", {})
+    event_type = slack_event.get("type")
+    channel_type = slack_event.get("channel_type")
+
+    # Ignore bot messages
+    if slack_event.get("bot_id") or slack_event.get("subtype") == "bot_message":
+        return {
+            "statusCode": 200,
+            "body": "ignore bot"
+        }
+
+    if slack_event.get("subtype"):
+        log_json({
+            "level": "INFO",
+            "message": "slack_event_ignored",
+            "event_id": event_id,
+            "reason": "unsupported_message_subtype",
+            "subtype": slack_event.get("subtype")
+        })
+
+        return {
+            "statusCode": 200,
+            "body": "unsupported message subtype"
+        }
+
+    should_process, routing_reason = should_process_slack_event(slack_event)
+
+    if not should_process:
+        log_json({
+            "level": "INFO",
+            "message": "slack_event_ignored",
+            "event_id": event_id,
+            "reason": routing_reason,
+            "event_type": event_type,
+            "channel_type": channel_type
+        })
+
+        return {
+            "statusCode": 200,
+            "body": routing_reason
+        }
+
+    channel = slack_event.get("channel")
+    raw_text = slack_event.get("text", "")
+    text = clean_slack_text(raw_text, event_type)
+    user = slack_event.get("user")
+    ts = slack_event.get("ts")
+
+    log_json({
+        "level": "INFO",
+        "message": "slack_event_received",
+        "event_id": event_id,
+        "channel": channel,
+        "event_type": event_type,
+        "channel_type": channel_type,
+        "routing_reason": routing_reason,
+        "user": user,
+        "text": text
+    })
+
+    if channel and user:
+        sqs.send_message(
+            QueueUrl=QUEUE_URL,
+            MessageBody=json.dumps({
+                "event_id": event_id,
+                "channel": channel,
+                "text": text,
+                "raw_text": raw_text,
+                "user": user,
+                "ts": ts,
+                "event_type": event_type,
+                "channel_type": channel_type,
+                "routing_reason": routing_reason
+            })
+        )
+
+    return {
+        "statusCode": 200,
+        "body": "OK"
+    }
