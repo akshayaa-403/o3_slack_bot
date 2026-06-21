@@ -12,7 +12,10 @@ sqs = boto3.client("sqs")
 dynamodb = boto3.resource("dynamodb")
 
 QUEUE_URL = os.environ["SQS_QUEUE_URL"]
-SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
+# Slack signature verification is disabled by default for open testing.
+# Set VERIFY_SLACK_SIGNATURE=true and SLACK_SIGNING_SECRET to enforce it again.
+SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "")
+VERIFY_SLACK_SIGNATURE = os.environ.get("VERIFY_SLACK_SIGNATURE", "false").lower() == "true"
 SLACK_BOT_USER_ID = os.environ.get("SLACK_BOT_USER_ID")
 DEDUP_TABLE = os.environ.get("DEDUP_TABLE", "O3_EventDedup2")
 DEDUP_TTL_SECONDS = int(os.environ.get("DEDUP_TTL_SECONDS", "172800"))
@@ -148,7 +151,7 @@ def should_process_slack_event(slack_event):
 def lambda_handler(event, context):
     raw_body = get_raw_body(event)
 
-    if not verify_slack_signature(event, raw_body):
+    if VERIFY_SLACK_SIGNATURE and not verify_slack_signature(event, raw_body):
         return {
             "statusCode": 401,
             "body": "invalid signature"
