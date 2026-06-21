@@ -1,14 +1,17 @@
 import json
 import os
 import time
+import hashlib
 import boto3
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from botocore.exceptions import ClientError
 
 AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
 
 lex = boto3.client("lexv2-runtime", region_name=AWS_REGION)
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+scheduler = boto3.client("scheduler", region_name=AWS_REGION)
 
 BOT_ID = os.environ["BOT_ID"]
 BOT_ALIAS_ID = os.environ["BOT_ALIAS_ID"]
@@ -17,6 +20,12 @@ LOCALE_ID = os.environ.get("LOCALE_ID", "en_US")
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "o3_slack_sessions")
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "86400"))
+INACTIVITY_TIMEOUT_SECONDS = int(os.environ.get("INACTIVITY_TIMEOUT_SECONDS", "900"))
+TIMEOUT_SCHEDULING_ENABLED = os.environ.get("TIMEOUT_SCHEDULING_ENABLED", "true").lower() == "true"
+TIMEOUT_HANDLER_ARN = os.environ.get("TIMEOUT_HANDLER_ARN")
+SCHEDULER_ROLE_ARN = os.environ.get("SCHEDULER_ROLE_ARN")
+SCHEDULER_GROUP_NAME = os.environ.get("SCHEDULER_GROUP_NAME", "default")
+SCHEDULER_NAME_PREFIX = os.environ.get("SCHEDULER_NAME_PREFIX", "o3-slack-timeout")
 EMPTY_USER_TEXT_REPLY = os.environ.get("EMPTY_USER_TEXT_REPLY", "Hi, how can I help?")
 EMPTY_LEX_REPLY = os.environ.get(
     "EMPTY_LEX_REPLY",
@@ -26,8 +35,8 @@ EMPTY_LEX_REPLY = os.environ.get(
 sessions_table = dynamodb.Table(DYNAMODB_TABLE)
 
 
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+def to_iso(dt):
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def ttl_epoch():
@@ -95,6 +104,139 @@ def get_conversation_status(lex_state):
         return "failed"
 
     return "active"
+
+
+def timeout_schedule_name(session_id, phase):
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+    suffix = f"-{phase}"
+    max_prefix_length = 64 - len(digest) - len(suffix) - 1
+    prefix = SCHEDULER_NAME_PREFIX[:max_prefix_length]
+
+    return f"{prefix}-{digest}{suffix}"
+
+
+def timeout_token(session_id, event_id, activity_at):
+    raw_token = f"{session_id}|{event_id or ''}|{activity_at}"
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()[:32]
+
+
+def scheduler_at_expression(due_at):
+    utc_due_at = due_at.astimezone(timezone.utc).replace(microsecond=0)
+    return f"at({utc_due_at.strftime('%Y-%m-%dT%H:%M:%S')})"
+
+
+def upsert_schedule(name, due_at, payload):
+    request = {
+        "GroupName": SCHEDULER_GROUP_NAME,
+        "ScheduleExpression": scheduler_at_expression(due_at),
+        "ScheduleExpressionTimezone": "UTC",
+        "FlexibleTimeWindow": {
+            "Mode": "OFF"
+        },
+        "Target": {
+            "Arn": TIMEOUT_HANDLER_ARN,
+            "RoleArn": SCHEDULER_ROLE_ARN,
+            "Input": json.dumps(payload)
+        },
+        "State": "ENABLED",
+        "ActionAfterCompletion": "DELETE"
+    }
+
+    try:
+        scheduler.update_schedule(Name=name, **request)
+        return "updated"
+
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise
+
+    scheduler.create_schedule(Name=name, **request)
+    return "created"
+
+
+def refresh_timeout_schedule(session_id, timeout_state):
+    if not TIMEOUT_SCHEDULING_ENABLED:
+        log_json({
+            "level": "INFO",
+            "message": "timeout_schedule_skipped",
+            "session_id": session_id,
+            "reason": "disabled"
+        })
+        return False
+
+    if not TIMEOUT_HANDLER_ARN or not SCHEDULER_ROLE_ARN:
+        log_json({
+            "level": "WARN",
+            "message": "timeout_schedule_skipped",
+            "session_id": session_id,
+            "reason": "missing_timeout_scheduler_env",
+            "has_timeout_handler_arn": bool(TIMEOUT_HANDLER_ARN),
+            "has_scheduler_role_arn": bool(SCHEDULER_ROLE_ARN)
+        })
+        return False
+
+    payload = {
+        "action": "prompt",
+        "session_id": session_id,
+        "timeout_token": timeout_state["timeout_token"],
+        "timeout_due_at": timeout_state["timeout_due_at"]
+    }
+
+    try:
+        action = upsert_schedule(
+            timeout_state["timeout_schedule_name"],
+            timeout_state["timeout_due_at_dt"],
+            payload
+        )
+
+        log_json({
+            "level": "INFO",
+            "message": "timeout_schedule_refreshed",
+            "session_id": session_id,
+            "schedule_name": timeout_state["timeout_schedule_name"],
+            "timeout_due_at": timeout_state["timeout_due_at"],
+            "scheduler_action": action
+        })
+        return True
+
+    except Exception as e:
+        log_json({
+            "level": "ERROR",
+            "message": "timeout_schedule_refresh_failed",
+            "session_id": session_id,
+            "schedule_name": timeout_state["timeout_schedule_name"],
+            "error": str(e)
+        })
+        return False
+
+
+def delete_timeout_schedule(session_id, phase):
+    if not TIMEOUT_SCHEDULING_ENABLED:
+        return
+
+    name = timeout_schedule_name(session_id, phase)
+
+    try:
+        scheduler.delete_schedule(Name=name, GroupName=SCHEDULER_GROUP_NAME)
+
+        log_json({
+            "level": "INFO",
+            "message": "timeout_schedule_deleted",
+            "session_id": session_id,
+            "schedule_name": name
+        })
+
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+            return
+
+        log_json({
+            "level": "ERROR",
+            "message": "timeout_schedule_delete_failed",
+            "session_id": session_id,
+            "schedule_name": name,
+            "error": str(e)
+        })
 
 
 def get_lex_reply(messages):
@@ -168,62 +310,112 @@ def process_record(record):
         lex_reply = EMPTY_USER_TEXT_REPLY
 
     conversation_status = get_conversation_status(lex_state)
-    updated_at = now_iso()
+    activity_at_dt = datetime.now(timezone.utc).replace(microsecond=0)
+    updated_at = to_iso(activity_at_dt)
+
+    timeout_state = None
+    if conversation_status == "active":
+        timeout_due_at_dt = activity_at_dt + timedelta(seconds=INACTIVITY_TIMEOUT_SECONDS)
+        timeout_due_at = to_iso(timeout_due_at_dt)
+        timeout_state = {
+            "timeout_due_at_dt": timeout_due_at_dt,
+            "timeout_due_at": timeout_due_at,
+            "timeout_token": timeout_token(session_id, event_id, updated_at),
+            "timeout_schedule_name": timeout_schedule_name(session_id, "prompt")
+        }
+
+    update_expression = """
+        SET
+            #channel = :channel,
+            #user = :user,
+            last_event_id = :event_id,
+            last_user_text = :last_user_text,
+            last_raw_user_text = :last_raw_user_text,
+            last_bot_reply = :last_bot_reply,
+            last_ts = :last_ts,
+            last_activity_at = :last_activity_at,
+            event_type = :event_type,
+            channel_type = :channel_type,
+            routing_reason = :routing_reason,
+            lex_session_id = :lex_session_id,
+            lex_intent = :lex_intent,
+            lex_state = :lex_state,
+            lex_slots = :lex_slots,
+            conversation_status = :conversation_status,
+            timeout_status = :timeout_status,
+            created_at = if_not_exists(created_at, :created_at),
+            updated_at = :updated_at,
+            #ttl = :ttl
+    """
+
+    expression_attribute_values = {
+        ":channel": channel,
+        ":user": user,
+        ":event_id": event_id,
+        ":last_user_text": text,
+        ":last_raw_user_text": raw_text,
+        ":last_bot_reply": lex_reply,
+        ":last_ts": ts,
+        ":last_activity_at": updated_at,
+        ":event_type": event_type,
+        ":channel_type": channel_type,
+        ":routing_reason": routing_reason,
+        ":lex_session_id": lex_session_id,
+        ":lex_intent": lex_intent,
+        ":lex_state": lex_state,
+        ":lex_slots": lex_slots,
+        ":conversation_status": conversation_status,
+        ":timeout_status": "scheduled" if timeout_state else "inactive",
+        ":created_at": updated_at,
+        ":updated_at": updated_at,
+        ":ttl": ttl_epoch(),
+        ":one": 1
+    }
+
+    if timeout_state:
+        update_expression += """
+            ,
+            timeout_due_at = :timeout_due_at,
+            timeout_token = :timeout_token,
+            timeout_schedule_name = :timeout_schedule_name
+            REMOVE timeout_prompt_started_at, timeout_prompted_at,
+                timeout_close_due_at, timeout_closed_at
+        """
+        expression_attribute_values.update({
+            ":timeout_due_at": timeout_state["timeout_due_at"],
+            ":timeout_token": timeout_state["timeout_token"],
+            ":timeout_schedule_name": timeout_state["timeout_schedule_name"]
+        })
+    else:
+        update_expression += """
+            REMOVE timeout_due_at, timeout_token, timeout_schedule_name,
+                timeout_prompt_started_at, timeout_prompted_at,
+                timeout_close_due_at, timeout_closed_at
+        """
+
+    update_expression += """
+        ADD
+            message_count :one
+    """
 
     sessions_table.update_item(
         Key={
             "session_id": session_id
         },
-        UpdateExpression="""
-            SET
-                #channel = :channel,
-                #user = :user,
-                last_event_id = :event_id,
-                last_user_text = :last_user_text,
-                last_raw_user_text = :last_raw_user_text,
-                last_bot_reply = :last_bot_reply,
-                last_ts = :last_ts,
-                event_type = :event_type,
-                channel_type = :channel_type,
-                routing_reason = :routing_reason,
-                lex_session_id = :lex_session_id,
-                lex_intent = :lex_intent,
-                lex_state = :lex_state,
-                lex_slots = :lex_slots,
-                conversation_status = :conversation_status,
-                created_at = if_not_exists(created_at, :created_at),
-                updated_at = :updated_at,
-                #ttl = :ttl
-            ADD
-                message_count :one
-        """,
+        UpdateExpression=update_expression,
         ExpressionAttributeNames={
             "#channel": "channel",
             "#user": "user",
             "#ttl": "ttl"
         },
-        ExpressionAttributeValues={
-            ":channel": channel,
-            ":user": user,
-            ":event_id": event_id,
-            ":last_user_text": text,
-            ":last_raw_user_text": raw_text,
-            ":last_bot_reply": lex_reply,
-            ":last_ts": ts,
-            ":event_type": event_type,
-            ":channel_type": channel_type,
-            ":routing_reason": routing_reason,
-            ":lex_session_id": lex_session_id,
-            ":lex_intent": lex_intent,
-            ":lex_state": lex_state,
-            ":lex_slots": lex_slots,
-            ":conversation_status": conversation_status,
-            ":created_at": updated_at,
-            ":updated_at": updated_at,
-            ":ttl": ttl_epoch(),
-            ":one": 1
-        }
+        ExpressionAttributeValues=expression_attribute_values
     )
+
+    if timeout_state:
+        refresh_timeout_schedule(session_id, timeout_state)
+    else:
+        delete_timeout_schedule(session_id, "prompt")
+        delete_timeout_schedule(session_id, "close")
 
     slack_response = send_slack_message(channel, lex_reply)
 
@@ -240,6 +432,8 @@ def process_record(record):
         "lex_intent": lex_intent,
         "lex_state": lex_state,
         "lex_slots": lex_slots,
+        "timeout_status": "scheduled" if timeout_state else "inactive",
+        "timeout_due_at": timeout_state["timeout_due_at"] if timeout_state else None,
         "reply_sent": True,
         "slack_ts": slack_response.get("ts")
     })
