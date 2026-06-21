@@ -43,14 +43,11 @@ Responsibilities:
 - Receives Slack Events API payloads through API Gateway or Lambda URL.
 - Handles Slack `url_verification`.
 - Optionally verifies Slack request signatures.
-- Deduplicates Slack events in DynamoDB using `event_id`.
+- Deduplicates accepted Slack DM events in DynamoDB using `event_id`.
 - Ignores bot messages and unsupported message subtypes.
-- Supports:
-  - DMs
-  - `app_mention`
-  - channel messages only when the bot is mentioned
-- Cleans bot mention text before sending to Lex.
-- Sends valid Slack messages to SQS.
+- Supports DMs only.
+- Ignores public channels, private channels, MPIMs, and `app_mention` events for this phase.
+- Sends valid Slack DM messages to SQS.
 
 Current testing mode:
 
@@ -87,7 +84,6 @@ Required:
 
 Optional:
 
-- `SLACK_BOT_USER_ID`
 - `DEDUP_TABLE`, default `O3_EventDedup2`
 - `DEDUP_TTL_SECONDS`, default `172800`
 - `VERIFY_SLACK_SIGNATURE`, default `false`
@@ -154,8 +150,10 @@ Manual Slack test scenarios:
 
 - DM bot with text: should process.
 - Public channel without bot mention: should ignore.
-- Public channel with bot mention: should process.
-- Bare bot mention: should send empty-user-text fallback.
+- Public channel with bot mention: should ignore.
+- Private channel message: should ignore.
+- `app_mention`: should ignore.
+- Empty DM text: should send empty-user-text fallback.
 - Duplicate Slack `event_id`: should return `duplicate ignored`.
 
 Manual SQS worker test:
@@ -169,14 +167,13 @@ Planned next phase: timeout flow.
 Decision summary:
 
 - Inactivity timeout: 15 minutes.
-- Timeout prompt: post in Slack thread.
+- Timeout prompt: post as a normal DM message.
 - Close grace window after prompt: 5 minutes.
 - AWS region: use Lambda `AWS_REGION`.
 - Summarizer: optional hook only for now.
 
 Implementation outline:
 
-- Add thread/session continuity to worker.
 - Add EventBridge Scheduler schedule refresh after each user message.
 - Create `lambda_o3_slack_timeout_handler.py`.
 - Timeout handler should ignore stale schedules, prompt once, then close stale sessions.
@@ -190,6 +187,7 @@ Implementation outline:
 - Documented current handler and worker responsibilities.
 - Documented current architecture alignment against the PDF.
 - Documented timeout-flow plan as the next implementation phase.
+- Changed Slack routing scope to strict DM-only; public/private channels, MPIMs, and app mentions are deferred.
 
 ### 2026-06-20
 
@@ -205,4 +203,3 @@ Implementation outline:
 - Added worker handling for empty user text and empty Lex replies.
 - Added SQS partial batch failure response.
 - Extracted architecture diagram into code/data artifacts using the advanced PDF stack.
-

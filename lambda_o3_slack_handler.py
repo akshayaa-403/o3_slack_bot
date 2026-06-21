@@ -4,7 +4,6 @@ import os
 import hmac
 import hashlib
 import base64
-import re
 import boto3
 from botocore.exceptions import ClientError
 
@@ -16,13 +15,11 @@ QUEUE_URL = os.environ["SQS_QUEUE_URL"]
 # Set VERIFY_SLACK_SIGNATURE=true and SLACK_SIGNING_SECRET to enforce it again.
 SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "")
 VERIFY_SLACK_SIGNATURE = os.environ.get("VERIFY_SLACK_SIGNATURE", "false").lower() == "true"
-SLACK_BOT_USER_ID = os.environ.get("SLACK_BOT_USER_ID")
 DEDUP_TABLE = os.environ.get("DEDUP_TABLE", "O3_EventDedup2")
 DEDUP_TTL_SECONDS = int(os.environ.get("DEDUP_TTL_SECONDS", "172800"))
 SLACK_SIGNATURE_TOLERANCE_SECONDS = int(os.environ.get("SLACK_SIGNATURE_TOLERANCE_SECONDS", "300"))
 
 dedup_table = dynamodb.Table(DEDUP_TABLE)
-SLACK_MENTION_PATTERN = re.compile(r"<@[A-Z0-9]+>\s*")
 
 
 def log_json(data):
@@ -106,32 +103,12 @@ def is_direct_message(slack_event):
     return slack_event.get("channel_type") == "im" or channel.startswith("D")
 
 
-def is_bot_mentioned(text):
-    if not SLACK_BOT_USER_ID:
-        return False
-
-    return f"<@{SLACK_BOT_USER_ID}>" in text
-
-
-def clean_slack_text(text, event_type):
-    text = (text or "").strip()
-
-    if SLACK_BOT_USER_ID:
-        return text.replace(f"<@{SLACK_BOT_USER_ID}>", "").strip()
-
-    if event_type == "app_mention":
-        return SLACK_MENTION_PATTERN.sub("", text, count=1).strip()
-
-    return text
+def clean_slack_text(text):
+    return (text or "").strip()
 
 
 def should_process_slack_event(slack_event):
     event_type = slack_event.get("type")
-    channel_type = slack_event.get("channel_type")
-    text = slack_event.get("text", "")
-
-    if event_type == "app_mention":
-        return True, "app_mention"
 
     if event_type != "message":
         return False, "unsupported_event_type"
@@ -139,13 +116,7 @@ def should_process_slack_event(slack_event):
     if is_direct_message(slack_event):
         return True, "direct_message"
 
-    if is_bot_mentioned(text):
-        return True, "bot_mentioned_in_channel"
-
-    if channel_type in {"channel", "group", "mpim"}:
-        return False, "bot_not_mentioned"
-
-    return False, "unsupported_channel_type"
+    return False, "non_dm_ignored"
 
 
 def lambda_handler(event, context):
@@ -170,33 +141,6 @@ def lambda_handler(event, context):
     event_id = body.get("event_id")
     event_time = body.get("event_time")
     now = int(time.time())
-
-    # Deduplicate Slack retry events before sending to SQS
-    if event_id:
-        try:
-            dedup_table.put_item(
-                Item={
-                    "event_id": event_id,
-                    "event_time": event_time,
-                    "created_at": now,
-                    "ttl": now + DEDUP_TTL_SECONDS
-                },
-                ConditionExpression="attribute_not_exists(event_id)"
-            )
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                log_json({
-                    "level": "INFO",
-                    "message": "duplicate_event_ignored",
-                    "event_id": event_id
-                })
-
-                return {
-                    "statusCode": 200,
-                    "body": "duplicate ignored"
-                }
-
-            raise
 
     slack_event = body.get("event", {})
     event_type = slack_event.get("type")
@@ -240,9 +184,36 @@ def lambda_handler(event, context):
             "body": routing_reason
         }
 
+    # Deduplicate accepted DM retry events before sending to SQS.
+    if event_id:
+        try:
+            dedup_table.put_item(
+                Item={
+                    "event_id": event_id,
+                    "event_time": event_time,
+                    "created_at": now,
+                    "ttl": now + DEDUP_TTL_SECONDS
+                },
+                ConditionExpression="attribute_not_exists(event_id)"
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                log_json({
+                    "level": "INFO",
+                    "message": "duplicate_event_ignored",
+                    "event_id": event_id
+                })
+
+                return {
+                    "statusCode": 200,
+                    "body": "duplicate ignored"
+                }
+
+            raise
+
     channel = slack_event.get("channel")
     raw_text = slack_event.get("text", "")
-    text = clean_slack_text(raw_text, event_type)
+    text = clean_slack_text(raw_text)
     user = slack_event.get("user")
     ts = slack_event.get("ts")
 
