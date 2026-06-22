@@ -1,0 +1,82 @@
+how do worker lambda call iam and execute the timeout?
+explain the code flow.
+
+
+
+6:00 PM
+
+
+
+
+
+
+Worked for 18s
+
+
+
+The worker Lambda does not directly call IAM.
+It calls EventBridge Scheduler, and passes the IAM role ARN inside the schedule request.
+In code:
+SCHEDULER_ROLE_ARN = os.environ.get("SCHEDULER_ROLE_ARN")
+This reads the role ARN from Lambda env vars. Then the worker uses it here: [lambda_o3_slack_worker.py (line 128)](/E:/Project IVY/lambda_o3_slack_worker.py:128)
+"Target": {
+    "Arn": TIMEOUT_HANDLER_ARN,
+    "RoleArn": SCHEDULER_ROLE_ARN,
+    "Input": json.dumps(payload)
+}
+Meaning:
+EventBridge Scheduler, later invoke TIMEOUT_HANDLER_ARN.
+When you invoke it, assume/use SCHEDULER_ROLE_ARN.
+Worker Code Flow
+Worker receives an SQS message in process_record: [lambda_o3_slack_worker.py (line 262)](/E:/Project IVY/lambda_o3_slack_worker.py:262)
+
+Worker calls Lex and gets a reply.
+
+If conversation is still active, worker creates timeout data:
+
+timeout_due_at = now + 15 minutes
+timeout_token = unique safety token
+timeout_schedule_name = deterministic schedule name
+This starts around [lambda_o3_slack_worker.py (line 316)](/E:/Project IVY/lambda_o3_slack_worker.py:316).
+Worker stores timeout fields in DynamoDB: [lambda_o3_slack_worker.py (line 401)](/E:/Project IVY/lambda_o3_slack_worker.py:401)
+
+Worker calls refresh_timeout_schedule: [lambda_o3_slack_worker.py (line 157)](/E:/Project IVY/lambda_o3_slack_worker.py:157)
+
+refresh_timeout_schedule calls upsert_schedule.
+
+upsert_schedule calls AWS EventBridge Scheduler:
+
+scheduler.update_schedule(...)
+or:
+scheduler.create_schedule(...)
+See [lambda_o3_slack_worker.py (line 146)](/E:/Project IVY/lambda_o3_slack_worker.py:146).
+What IAM Does Here
+When worker calls create_schedule, AWS checks:
+Is the worker Lambda execution role allowed to create schedules?
+Is it allowed to pass SCHEDULER_ROLE_ARN?
+So the worker Lambda execution role needs:
+scheduler:CreateSchedule
+scheduler:UpdateSchedule
+scheduler:DeleteSchedule
+iam:PassRole
+Then later, EventBridge Scheduler uses SCHEDULER_ROLE_ARN to invoke the timeout handler Lambda.
+Timeout Execution Flow
+After 15 minutes:
+EventBridge Scheduler -> invokes timeout handler Lambda
+Timeout handler entry point: [lambda_o3_slack_timeout_handler.py (line 470)](/E:/Project IVY/lambda_o3_slack_timeout_handler.py:470)
+Then:
+lambda_handler receives event with action="prompt".
+It calls handle_prompt: [lambda_o3_slack_timeout_handler.py (line 350)](/E:/Project IVY/lambda_o3_slack_timeout_handler.py:350)
+It reads DynamoDB and checks timeout_token.
+If token is still current, it sends Slack timeout prompt.
+Then it schedules itself again for the close action using schedule_close: [lambda_o3_slack_timeout_handler.py (line 129)](/E:/Project IVY/lambda_o3_slack_timeout_handler.py:129)
+After 5 more minutes:
+EventBridge Scheduler -> invokes timeout handler again with action="close"
+Then handle_close marks the session closed: [lambda_o3_slack_timeout_handler.py (line 412)](/E:/Project IVY/lambda_o3_slack_timeout_handler.py:412)
+Key point: worker does not “execute timeout” itself. It creates a future schedule. EventBridge Scheduler executes the timeout later by invoking the timeout handler.
+======================
+22/6/26
+worker_processing_started
+timeout_schedule_refreshed
+timeout_event_received
+===========
