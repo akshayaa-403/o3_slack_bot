@@ -1,0 +1,1297 @@
+[
+  {
+    "intentName": "ADAMaccPswdReset",
+    "description": "Imported from Intents_20_List.xlsx. Original name: ADAMaccPswdReset. Category: Password & Auth. Uses Lambda in source sheet: No.",
+    "sampleUtterances": [
+      {
+        "utterance": "How can I reset/set my InnovyQ adam account password?"
+      },
+      {
+        "utterance": "I got an email saying that I need to reset my password on adam.InnovyQ.com."
+      },
+      {
+        "utterance": "I am unable to see the password reset option for my account in the ADAM self service portal"
+      },
+      {
+        "utterance": "I am not seeing the option to reset password in the ADAM portal"
+      },
+      {
+        "utterance": "adm password reset"
+      },
+      {
+        "utterance": "adam account password"
+      },
+      {
+        "utterance": "Change email password / Change ADAM password"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "ADAM Self Service - Privileged Account Password Reset"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Standard ADAM accounts do not have a password. If you need to reset the password for an ADM (privileged) account, you can follow the steps outlined in this guide. This Knowledge Base article provides guidance on how to reset the password for a privileged account using the ADAM Self Service portal."
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "For detailed step-by-step instructions, kindly refer to the article below:\n<https://InnovyQ.atlassian.net/wiki/spaces/oab/pages/547488756/ADAM+Self+Service+-+Privileged+account+password+reset|Refer here>"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Please follow the instructions outlined in the article to complete the password reset process successfully."
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "ADMaccount",
+    "description": "Imported from Intents_20_List.xlsx. Original name: ADMaccount. Category: Password & Auth. Uses Lambda in source sheet: No.",
+    "sampleUtterances": [
+      {
+        "utterance": "need adm account"
+      },
+      {
+        "utterance": "ADM account creation"
+      },
+      {
+        "utterance": "get adm account"
+      },
+      {
+        "utterance": "request adm account"
+      },
+      {
+        "utterance": "new adm account"
+      },
+      {
+        "utterance": "create adm account"
+      },
+      {
+        "utterance": "Kindly enable my adm account"
+      },
+      {
+        "utterance": "I need access to InnovyQ ADM account credentials"
+      },
+      {
+        "utterance": "I need an ADM account for internal testing requirement for Horizon on OpenShift platform"
+      },
+      {
+        "utterance": "Please activate my ADM account to login to Prism testbeds"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "ADM Account Request"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "To request an ADM account, please use the link below:"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "https://InnovyQ.atlassian.net/servicedesk/customer/portal/29/group/88/create/7176"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Once submitted, the request will be reviewed and processed by the respective team."
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "ADP_issues",
+    "description": "Imported from Intents_20_List.xlsx. Original name: ADP_issues. Category: HR & Payroll. Uses Lambda in source sheet: No.",
+    "sampleUtterances": [
+      {
+        "utterance": "Can someone share me the login link for ADP?"
+      },
+      {
+        "utterance": "Where do I find the ESS portal"
+      },
+      {
+        "utterance": "Apply leaves is not available in adp. Can you help"
+      },
+      {
+        "utterance": "ADP Portal not visible in workspace environment as a new hire"
+      },
+      {
+        "utterance": "I'm unable to log into this ADP portal"
+      },
+      {
+        "utterance": "getting login issues while trying to login to ADP."
+      },
+      {
+        "utterance": "From where can I login ADP?"
+      },
+      {
+        "utterance": "reset my password for ADP,"
+      },
+      {
+        "utterance": "how to download payslip from ADP platform?"
+      },
+      {
+        "utterance": "I can't see Other declaration tab in ADP portal."
+      },
+      {
+        "utterance": "Whom should I reach for new hire ADP access?"
+      },
+      {
+        "utterance": "unable to access ADP."
+      },
+      {
+        "utterance": "need to get access to https://www.regus.adp.com/in/V6/ess/dashboard to report their time."
+      },
+      {
+        "utterance": "Need Payroll assistance here as still have not recieved the welcome email for ADP regus -"
+      },
+      {
+        "utterance": "unable to find the page where to apply leaves in ADP portal"
+      },
+      {
+        "utterance": "Checking if anyone can look into ADP regus access for me."
+      },
+      {
+        "utterance": "From whom shall I receive access to payslip?"
+      },
+      {
+        "utterance": "address is incorrect in ADP and it is not possible to change it."
+      },
+      {
+        "utterance": "How do I login to ADP?"
+      },
+      {
+        "utterance": "Could someone help with ADP access?"
+      },
+      {
+        "utterance": "How to check ADP portal?"
+      },
+      {
+        "utterance": "How do I access ADP"
+      },
+      {
+        "utterance": "No access to ADP - error 100"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "ADP Access & Support"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Please use the options below:"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "*Login to ADP:*"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "\u2022 For Global Employees:\n<https://InnovyQ.link/4nGH7Sl|ADP Workforce Now>"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "\u2022For India Employees:\n<https://InnovyQ.link/4dnDux4|ADP regus>\nHere, you will find your pay-slips, tax submissions, leaves, and much more.\n\n*New User* or *If you don't have the account created for logging in:*\nSend a mail, requesting access at<ESS_Onboarding_Support@ADP.com>\n\n*Need Help?*:\nIn case of any issues in accessing pay-slips , logging in to ADP, or leave balance errors or any other queries, please raise a HR request:<https://InnovyQ.atlassian.net/servicedesk/customer/portal/33/group/110 | HR Portal>"
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "AWSMigrationRequest",
+    "description": "Imported from Intents_20_List.xlsx. Original name: AWSMigrationRequest. Category: Software & Access. Uses Lambda in source sheet: No.",
+    "sampleUtterances": [
+      {
+        "utterance": "Is there a dedicated support team to assist with AWS account migration requests?"
+      },
+      {
+        "utterance": "how do I migrate AWS accounts"
+      },
+      {
+        "utterance": "What is the procedure for access migration for AWS account?"
+      },
+      {
+        "utterance": "Can I transfer the AWS account billing responsibility to a different user?"
+      },
+      {
+        "utterance": "I need to transfer my AWS account to another team member, what steps do I follow?"
+      },
+      {
+        "utterance": "How do I change the permissions for a new AWS account owner without affecting the existing setup?"
+      },
+      {
+        "utterance": "How do I delegate full administrative access to another user in the AWS account?"
+      },
+      {
+        "utterance": "How do I assign existing IAM policies to a new person handling the AWS account?"
+      },
+      {
+        "utterance": "What AWS support plan do I need to request a transfer of account ownership?"
+      },
+      {
+        "utterance": "Have AWS account ownership migrated from me to someone else in the team"
+      },
+      {
+        "utterance": "Can I change the email address associated with my AWS account as part of ownership transfer?"
+      },
+      {
+        "utterance": "What steps are involved in reassigning my AWS resource access to someone else?"
+      },
+      {
+        "utterance": "Who should I contact to migrate my AWS account ownership to someone else?"
+      },
+      {
+        "utterance": "How long does it take to complete an AWS account ownership transfer?"
+      },
+      {
+        "utterance": "How can I grant administrative privileges to a new account owner on AWS?"
+      },
+      {
+        "utterance": "Kindly help with AWS account access migration from one account to another"
+      },
+      {
+        "utterance": "How do I migrate the AWS billing and usage access to another team member?"
+      },
+      {
+        "utterance": "How do I migrate my AWS permissions to another user?"
+      },
+      {
+        "utterance": "How do I get in touch with AWS support for account migration issues?"
+      },
+      {
+        "utterance": "How can I transfer AWS account ownership to another person in my team?"
+      },
+      {
+        "utterance": "Is there a way to change the root user for an AWS account?"
+      },
+      {
+        "utterance": "How do I assign a new owner to an AWS account?"
+      },
+      {
+        "utterance": "Can I transfer all my AWS IAM roles to a new account holder?"
+      },
+      {
+        "utterance": "Who can help with transferring the management of an AWS account to a different person?"
+      },
+      {
+        "utterance": "What is the process for migrating AWS account ownership within my organization?"
+      },
+      {
+        "utterance": "Who can assist in updating access rights for a new AWS account administrator?"
+      },
+      {
+        "utterance": "Who should I contact to handle an AWS account ownership transfer?"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "AWS Migration Request"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Please submit your AWS migration request using the link below:"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "AWS Migration Requests\nhttps://InnovyQ.atlassian.net/servicedesk/customer/portal/18/create/2081"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "The appropriate team will begin working on your request shortly after submission."
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "AWSaccount",
+    "description": "Imported from Intents_20_List.xlsx. Original name: AWSaccount. Category: Software & Access. Uses Lambda in source sheet: Yes.",
+    "sampleUtterances": [
+      {
+        "utterance": "Kindly help with AWS account access"
+      },
+      {
+        "utterance": "Access to an AWS account"
+      },
+      {
+        "utterance": "I don't see AWS Access app in InnovyQ app catalog portal"
+      },
+      {
+        "utterance": "What is the procedure to request access removal for AWS account?"
+      },
+      {
+        "utterance": "Kindly help with AWS account access removal"
+      },
+      {
+        "utterance": "I want to remove my AWS account"
+      },
+      {
+        "utterance": "Help me get a new AWS account"
+      },
+      {
+        "utterance": "Issue with AWS account"
+      },
+      {
+        "utterance": "Access removal for AWS account"
+      },
+      {
+        "utterance": "Need access to a specific account in R&D \u2013 AWS Access, where to open a ticket?"
+      },
+      {
+        "utterance": "Add members to AWS account"
+      },
+      {
+        "utterance": "I need to close my AWS account"
+      },
+      {
+        "utterance": "Need to be able to access AWS portal"
+      },
+      {
+        "utterance": "Error with my AWS account"
+      },
+      {
+        "utterance": "I would like to request AWS \u201cDataScienceUser\u201d intelligence access"
+      },
+      {
+        "utterance": "I want a fresh AWS account"
+      },
+      {
+        "utterance": "New access request for AWS account"
+      },
+      {
+        "utterance": "Not able to view the AWS account in IT AWS Access tile"
+      },
+      {
+        "utterance": "Procedure to request access for AWS accounts"
+      },
+      {
+        "utterance": "Help with AWS account"
+      },
+      {
+        "utterance": "Provide access to AWS accounts"
+      },
+      {
+        "utterance": "Need access to these AWS environments"
+      },
+      {
+        "utterance": "I need a new AWS account"
+      },
+      {
+        "utterance": "I no longer need my AWS account"
+      },
+      {
+        "utterance": "I want to request a new AWS account"
+      },
+      {
+        "utterance": "What is the procedure to request access for AWS account?"
+      },
+      {
+        "utterance": "When I reached out to the AWS team that setup these environments, they said that this is some VPN migration issue and raised it with IT."
+      },
+      {
+        "utterance": "AWSAccess app not in Hub"
+      },
+      {
+        "utterance": "AWS app not visible in catalog"
+      },
+      {
+        "utterance": "cannot find AWS app in portal"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Thank you for contacting IvvY support. If you need any further assistance, please feel free to reach out. Have a great day!"
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "AWSRelatedQueries",
+    "description": "Imported from Intents_20_List.xlsx. Original name: AWS related queries. Category: Software & Access. Uses Lambda in source sheet: Yes.",
+    "sampleUtterances": [
+      {
+        "utterance": "Request for DNS update for AWS"
+      },
+      {
+        "utterance": "Having issue related to AWS"
+      },
+      {
+        "utterance": "I am not able to access aws ip (which I have mapped in local host) from my Engineering VDI IP"
+      },
+      {
+        "utterance": "I need to access prod database hosted in AWS - AWS Bastion Host Access"
+      }
+    ],
+    "intentDisplayName": "AWS related queries",
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "(Lambda handles response)"
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "AboutBotKBs",
+    "description": "Imported from Intents_20_List.xlsx. Original name: AboutBotKBs. Category: Bot & Session. Uses Lambda in source sheet: No.",
+    "sampleUtterances": [
+      {
+        "utterance": "What knowledge sources are you trained on?"
+      },
+      {
+        "utterance": "Can you tell me what documentation you use?"
+      },
+      {
+        "utterance": "What knowledge base supports your answers?"
+      },
+      {
+        "utterance": "Do you use internal IT support articles?"
+      },
+      {
+        "utterance": "Where does your information come from?"
+      },
+      {
+        "utterance": "Are your answers based on official company documentation?"
+      },
+      {
+        "utterance": "What kind of knowledge do you rely on to help users?"
+      },
+      {
+        "utterance": "Do you have access to internal support guides?"
+      },
+      {
+        "utterance": "How do you know the answers to IT issues?"
+      },
+      {
+        "utterance": "Can I see the resources or documents you refer to?"
+      },
+      {
+        "utterance": "What LLM do you use"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "I'm trained on InnovyQ's internal IT  knowledge  including our support  documentation, common IT issues, and  internal processes."
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "AboutBotLLM",
+    "description": "Imported from Intents_20_List.xlsx. Original name: AboutBotLLM. Category: Bot & Session. Uses Lambda in source sheet: No.",
+    "sampleUtterances": [
+      {
+        "utterance": "What LLM do you use?"
+      },
+      {
+        "utterance": "Which large language model powers this application?"
+      },
+      {
+        "utterance": "Are you using a proprietary LLM or an open-source one?"
+      },
+      {
+        "utterance": "What version of the LLM is currently deployed?"
+      },
+      {
+        "utterance": "How does your LLM compare to others in terms of accuracy and reasoning?"
+      },
+      {
+        "utterance": "What kind of tasks is your LLM best suited for?"
+      },
+      {
+        "utterance": "Does your LLM support multi-language queries effectively?"
+      },
+      {
+        "utterance": "Does the LLM store or learn from my conversations?"
+      },
+      {
+        "utterance": "Is my data secure when I interact with you?"
+      },
+      {
+        "utterance": "How is my data handled when I use this chatbot?"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "I'm IvvY Assist InnovyQ's IT helpdesk bot!  I'm powered by InnovyQ's internal AI  infrastructure  but what matters most  is how I can help you, not what's under  the hood!"
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "AboutBotVersion",
+    "description": "Imported from Intents_20_List.xlsx. Original name: AboutBotVersion. Category: Bot & Session. Uses Lambda in source sheet: No.",
+    "sampleUtterances": [
+      {
+        "utterance": "How are you better than the previous bot version?"
+      },
+      {
+        "utterance": "What improvements have you made compared to the previous version?"
+      },
+      {
+        "utterance": "How are you different from the earlier bot?"
+      },
+      {
+        "utterance": "What new features do you offer now?"
+      },
+      {
+        "utterance": "What can you do that the old bot couldn\u2019t?"
+      },
+      {
+        "utterance": "How have you improved over the previous version?"
+      },
+      {
+        "utterance": "Why should I use you instead of the old bot?"
+      },
+      {
+        "utterance": "What enhancements have been added in this version?"
+      },
+      {
+        "utterance": "Are you more accurate than the previous bot?"
+      },
+      {
+        "utterance": "What makes this version better than before?"
+      },
+      {
+        "utterance": "How has your performance improved compared to the earlier bot?"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "IvvY Assist Capabilities"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Great question! Here's what I can do:"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Understand natural language \u2014 just describe your issue in plain English\nSearch our IT knowledge base for relevant answers\nRaise Jira tickets automatically\nConnect you to a live IT specialist\nAnalyze images of error screens\nFollow up on existing tickets"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "I'm continuously improving based on your feedback \u2014 so keep those star ratings coming."
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "About_Bot_Capabilities",
+    "description": "Imported from Intents_20_List.xlsx. Original name: About_Bot_Capabilities. Category: Other IT. Uses Lambda in source sheet: No.",
+    "sampleUtterances": [
+      {
+        "utterance": "What can you do for me?"
+      },
+      {
+        "utterance": "How are you useful?"
+      },
+      {
+        "utterance": "What services do you provide?"
+      },
+      {
+        "utterance": "What kind of help can I get here?"
+      },
+      {
+        "utterance": "How can this bot assist me?"
+      },
+      {
+        "utterance": "What issues can you solve?"
+      },
+      {
+        "utterance": "Why should I use you?"
+      },
+      {
+        "utterance": "What support can you offer?"
+      },
+      {
+        "utterance": "How do you make my work easier?"
+      },
+      {
+        "utterance": "How can you be of any use to me"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "How I Can Help"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "I'm your 24/7 IT assistant, here to make things quick and easy."
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Here\u2019s what I can do for you:"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "\u2022 Get instant answers to common IT questions\n\u2022 Raise support tickets in seconds\n\u2022 Search IT documentation for you\n\u2022 Connect you to a live specialist when needed\n\u2022 Analyze screenshots of errors"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Just describe your issue, and I'll help you resolve it quickly."
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "AccessDeniedError",
+    "description": "Imported from Intents_20_List.xlsx. Original name: AccessDeniedError. Category: Software & Access. Uses Lambda in source sheet: No.",
+    "sampleUtterances": [
+      {
+        "utterance": "I can't access Workday. I continue to get \"access denied, unable to authenticate\" or \"access denied, device is not enrolled\"."
+      },
+      {
+        "utterance": "I need on access denied error"
+      },
+      {
+        "utterance": "I am unable to Login to Oracle ERP getting below error."
+      },
+      {
+        "utterance": "I am not able to authenticate into several apps on my InnovyQ owned PC. Receiving the following error:"
+      },
+      {
+        "utterance": "Need help on below error"
+      },
+      {
+        "utterance": "I am unable to login, getting access denied error message"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Kindly mention the error details."
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "AccessforCamtasia",
+    "description": "Imported from Intents_20_List.xlsx. Original name: AccessforCamtasia. Category: Software & Access. Uses Lambda in source sheet: Yes.",
+    "sampleUtterances": [
+      {
+        "utterance": "Who shall help with access for the link camtasia?"
+      },
+      {
+        "utterance": "requesting software license (Camtasia)?"
+      },
+      {
+        "utterance": "How to raise access for camtasia?"
+      },
+      {
+        "utterance": "how do we get the Camtasia license?"
+      },
+      {
+        "utterance": "Can anyone please provide access to Camtasia?"
+      },
+      {
+        "utterance": "I am trying to obtain Camtasia licenses for my team"
+      },
+      {
+        "utterance": "I need Camtasia for my role"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "(Lambda handles response)"
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "AccesstoOpsgenie",
+    "description": "Imported from Intents_20_List.xlsx. Original name: AccesstoOpsgenie. Category: Software & Access. Uses Lambda in source sheet: Yes.",
+    "sampleUtterances": [
+      {
+        "utterance": "How to get access to Opsgenie"
+      },
+      {
+        "utterance": "Need access to Opsgenie"
+      },
+      {
+        "utterance": "Access to Opsgenie"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "(Lambda handles response)"
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "AccessToPCQ",
+    "description": "Imported from Intents_20_List.xlsx. Original name: Access to PCQ. Category: Software & Access. Uses Lambda in source sheet: Yes.",
+    "sampleUtterances": [
+      {
+        "utterance": "PCQ account"
+      },
+      {
+        "utterance": "Log in to PCQ"
+      },
+      {
+        "utterance": "need access to PCQ"
+      },
+      {
+        "utterance": "Access to PCQ"
+      },
+      {
+        "utterance": "Issues while using PCQ"
+      }
+    ],
+    "intentDisplayName": "Access to PCQ",
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "(Lambda handles response)"
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "AccessToIkbInnovyQCom",
+    "description": "Imported from Intents_20_List.xlsx. Original name: Access to ikb.InnovyQ.com. Category: Software & Access. Uses Lambda in source sheet: Yes.",
+    "sampleUtterances": [
+      {
+        "utterance": "can you give me access to https://ikb.InnovyQ.com"
+      },
+      {
+        "utterance": "Unable to access any articles at ikb.InnovyQ.com"
+      },
+      {
+        "utterance": "Need access to ikb.InnovyQ.com SR Tickets"
+      },
+      {
+        "utterance": "lost SRS permission IKB"
+      },
+      {
+        "utterance": "KB SRS access denied"
+      },
+      {
+        "utterance": "annot access SRS from IKB"
+      }
+    ],
+    "intentDisplayName": "Access to ikb.InnovyQ.com",
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "(Lambda handles response)"
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "AccessToUemGpcloudserviceCom",
+    "description": "Imported from Intents_20_List.xlsx. Original name: Access to uem.gpcloudservice.com. Category: Software & Access. Uses Lambda in source sheet: Yes.",
+    "sampleUtterances": [
+      {
+        "utterance": "how can I connect to VPN uem.gpcloudservice.com? What is the credentials to use?"
+      },
+      {
+        "utterance": "My airwatch.local credential password is expired (for connecting vpn: uem.gpcloudservice.com. Could you please help to reset the password"
+      },
+      {
+        "utterance": "unable to connect to uem.gpcloudservice.com,"
+      },
+      {
+        "utterance": "can't connect GP to uem.gpcloudservice.com"
+      },
+      {
+        "utterance": "uem.gpcloudservice.com, can anyone help provide access to connect to the following VPN: uem.gpcloudservice.com"
+      }
+    ],
+    "intentDisplayName": "Access to uem.gpcloudservice.com",
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "(Lambda handles response)"
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "ActivationOfWindows11OnVDI",
+    "description": "Imported from Intents_20_List.xlsx. Original name: ActivationOfWindows11OnVDI. Category: VDI & Virtual Desktop. Uses Lambda in source sheet: No.",
+    "sampleUtterances": [
+      {
+        "utterance": "How do I activate Windows 11 on VDI?"
+      },
+      {
+        "utterance": "What is the process to activate Windows 11 on VDI?"
+      },
+      {
+        "utterance": "Can you help with activating Windows 11 on VDI?"
+      },
+      {
+        "utterance": "I need to activate Windows 11 on VDI"
+      },
+      {
+        "utterance": "Activate Windows 11 on VDI"
+      },
+      {
+        "utterance": "How to fix Windows 11 activation issues on VDI?"
+      },
+      {
+        "utterance": "Why am I not able to activate Windows 11 on VDI?"
+      },
+      {
+        "utterance": "Activate windows 11 watermark on VDI"
+      }
+    ]
+  },
+  {
+    "intentName": "ActiveDirectoryTasks",
+    "description": "Imported from Intents_20_List.xlsx. Original name: ActiveDirectoryTasks. Category: Other IT. Uses Lambda in source sheet: No.",
+    "sampleUtterances": [
+      {
+        "utterance": "We checked that group name is not properly created in the ADAM. Can you please take a took?"
+      },
+      {
+        "utterance": "add members to ad group"
+      },
+      {
+        "utterance": "new AD group creation"
+      },
+      {
+        "utterance": "remove ad group"
+      },
+      {
+        "utterance": "create a new security group"
+      },
+      {
+        "utterance": "delete security group"
+      },
+      {
+        "utterance": "group creation on Active directory"
+      },
+      {
+        "utterance": "add members to active directory group"
+      },
+      {
+        "utterance": "We checked that group name is not properly created in ADAM \u2014 please take a look"
+      }
+    ]
+  },
+  {
+    "intentName": "AddCo-hostZoomMeeting",
+    "description": "Imported from Intents_20_List.xlsx. Original name: AddCo-hostZoomMeeting. Category: Software & Access. Uses Lambda in source sheet: No.",
+    "sampleUtterances": [
+      {
+        "utterance": "How to add Co-host in zoom meeting"
+      },
+      {
+        "utterance": "need to add Co-host in zoom meeting invite"
+      },
+      {
+        "utterance": "After creating a Zoom invite, can't I add a co-host"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Add Alternative Host in Zoom"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Please follow the steps below:"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "*Step 1:* Log in to login. InnovyQ.com"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "*Step 2:* Launch the *Zoom* application"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "*Step 3:* Go to *Meetings*\n\n*Step 4:* Click on the *Upcoming* tab\n\n*Step 5:* Select the meeting you want to edit\n\n*Step 6:* Scroll down and click *Edit*\n\n*Step 7:* Scroll down and click *Show* under *Options*\n\n*Step 8:* Add *Alternative Hosts*"
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "AddLegalName",
+    "description": "Imported from Intents_20_List.xlsx. Original name: AddLegalName. Category: Other IT. Uses Lambda in source sheet: No.",
+    "sampleUtterances": [
+      {
+        "utterance": "Where do I raise a ticket for legal name change"
+      },
+      {
+        "utterance": "I want you to change to use my Legal name change"
+      },
+      {
+        "utterance": "Need to change legal name"
+      },
+      {
+        "utterance": "what is the process to change the legal name change"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Legal Name Change"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "To proceed further, please raise request through the HR Request Portal using the link below."
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "<https://InnovyQ.atlassian.net/servicedesk/customer/portal/33|HR Request Portal>"
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  },
+  {
+    "intentName": "AddPrinter",
+    "description": "Imported from Intents_20_List.xlsx. Original name: AddPrinter. Category: Other IT. Uses Lambda in source sheet: No.",
+    "sampleUtterances": [
+      {
+        "utterance": "Add a new printer to my computer"
+      },
+      {
+        "utterance": "Set up a printer on my device"
+      },
+      {
+        "utterance": "Guide me through adding a printer"
+      },
+      {
+        "utterance": "Help me configure a printer"
+      },
+      {
+        "utterance": "Install a printer on my system"
+      },
+      {
+        "utterance": "How can I add printer in MAC Laptop?"
+      },
+      {
+        "utterance": "Can you help me with the settings to add printer?"
+      },
+      {
+        "utterance": "Can you share me the steps for adding printers to my PC?"
+      },
+      {
+        "utterance": "Need color print"
+      },
+      {
+        "utterance": "I want to take a printout"
+      },
+      {
+        "utterance": "how do i print?"
+      },
+      {
+        "utterance": "what is secure print?"
+      },
+      {
+        "utterance": "I need a print out"
+      },
+      {
+        "utterance": "print my doc"
+      },
+      {
+        "utterance": "printer"
+      },
+      {
+        "utterance": "how to use printer"
+      },
+      {
+        "utterance": "print using printer"
+      },
+      {
+        "utterance": "I need help with configuring a printer"
+      },
+      {
+        "utterance": "Take a printout"
+      },
+      {
+        "utterance": "Printer config for InnovyQ FTE"
+      },
+      {
+        "utterance": "Printer config for Contractor"
+      },
+      {
+        "utterance": "Can you help me with setting up my printer on my Mac laptop?"
+      },
+      {
+        "utterance": "I need to set up a print on my Mac Laptop to print some documents for a meeting"
+      },
+      {
+        "utterance": "how do I print"
+      },
+      {
+        "utterance": "printing not working"
+      },
+      {
+        "utterance": "Printer"
+      },
+      {
+        "utterance": "Add Printer"
+      },
+      {
+        "utterance": "Please help me with instructions to use Regus 11th floor printer"
+      },
+      {
+        "utterance": "How to add printer to MacBook? Identify printer in Regus 11th floor"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Secure Print - Source Portal Guide"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "Please refer to the page using the link below:"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "<https://source. InnovyQ.com/site/af56629c-ad70-4cc1-ba47-17ccbd847f70/page/a2ba3cfd-d375-4cf0-ade1-27df7b271a90|View source Page>"
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
+  }
+]

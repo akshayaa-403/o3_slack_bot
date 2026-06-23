@@ -89,3 +89,51 @@ Worker Lambda role needs:
 }
 ==================
 23/06/2026
+You usually do not need a new alias. You already have:
+prod -> Version 2
+TestBotAlias -> Draft version
+Best practice: keep using prod, but update it to point to a new bot version.
+Step 1: Create New Bot Version
+Go to Amazon Lex.
+Open bot: o3_slack_bot.
+Left menu → Bot versions.
+Click Create version.
+Select the built Draft locale: English (US).
+Add description, for example:
+Loaded 21 IVY support intents from Intents_20_List.xlsx
+Click Create.
+You will get something like:
+Version 3
+Step 2: Update Existing prod Alias
+Left menu → Aliases.
+Click prod.
+Click Edit.
+Find Associated version.
+Change it from:
+Version 2
+to:
+Version 3
+Save.
+Now Slack will use the new intents if your worker Lambda BOT_ALIAS_ID points to the prod alias ID.
+Step 3: Check Worker Lambda
+Open Lambda.
+Open o3-slack-worker.
+Go to Configuration → Environment variables.
+Check:
+BOT_ALIAS_ID
+If that alias ID is the prod alias ID, you are done.
+If You Really Want To Create A New Alias
+Lex → o3_slack_bot.
+Left menu → Aliases.
+Click Create alias.
+Alias name:
+ivy-support-v3
+Associated version:
+Version 3
+Save.
+Copy the new Alias ID.
+Lambda → o3-slack-worker → Environment variables.
+Set:
+BOT_ALIAS_ID=<new alias id>
+Deploy/save Lambda config.
+Test Slack.
