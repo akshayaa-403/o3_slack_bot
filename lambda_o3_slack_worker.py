@@ -12,6 +12,7 @@ AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
 lex = boto3.client("lexv2-runtime", region_name=AWS_REGION)
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 scheduler = boto3.client("scheduler", region_name=AWS_REGION)
+lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 
 BOT_ID = os.environ["BOT_ID"]
 BOT_ALIAS_ID = os.environ["BOT_ALIAS_ID"]
@@ -26,6 +27,20 @@ TIMEOUT_HANDLER_ARN = os.environ.get("TIMEOUT_HANDLER_ARN")
 SCHEDULER_ROLE_ARN = os.environ.get("SCHEDULER_ROLE_ARN")
 SCHEDULER_GROUP_NAME = os.environ.get("SCHEDULER_GROUP_NAME", "default")
 SCHEDULER_NAME_PREFIX = os.environ.get("SCHEDULER_NAME_PREFIX", "o3-slack-timeout")
+ENABLE_CLAUDE_FALLBACK = os.environ.get("ENABLE_CLAUDE_FALLBACK", "false").lower() == "true"
+CLAUDE_FALLBACK_FUNCTION = os.environ.get("CLAUDE_FALLBACK_FUNCTION")
+CLAUDE_FALLBACK_INTENTS = {
+    intent_name.strip()
+    for intent_name in os.environ.get(
+        "CLAUDE_FALLBACK_INTENTS",
+        "FallbackIntent,AMAZON.FallbackIntent,FallbackToLLM"
+    ).split(",")
+    if intent_name.strip()
+}
+CLAUDE_FAILURE_REPLY = os.environ.get(
+    "CLAUDE_FAILURE_REPLY",
+    "I could not resolve this automatically. This should be moved to ticket creation once Jira is connected."
+)
 EMPTY_USER_TEXT_REPLY = os.environ.get("EMPTY_USER_TEXT_REPLY", "Hi, how can I help?")
 EMPTY_LEX_REPLY = os.environ.get(
     "EMPTY_LEX_REPLY",
@@ -239,6 +254,55 @@ def delete_timeout_schedule(session_id, phase):
         })
 
 
+def should_use_claude_fallback(text, lex_intent, lex_state, lex_reply_empty):
+    if not ENABLE_CLAUDE_FALLBACK or not text:
+        return False
+
+    return (
+        lex_state == "Failed"
+        or lex_reply_empty
+        or lex_intent in CLAUDE_FALLBACK_INTENTS
+    )
+
+
+def invoke_claude_fallback(payload):
+    if not CLAUDE_FALLBACK_FUNCTION:
+        return {
+            "ok": False,
+            "error": "missing_claude_fallback_function"
+        }
+
+    response = lambda_client.invoke(
+        FunctionName=CLAUDE_FALLBACK_FUNCTION,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(payload).encode("utf-8")
+    )
+
+    raw_payload = response.get("Payload").read().decode("utf-8")
+
+    if response.get("FunctionError"):
+        return {
+            "ok": False,
+            "error": raw_payload or response.get("FunctionError")
+        }
+
+    if not raw_payload:
+        return {
+            "ok": False,
+            "error": "empty_claude_lambda_response"
+        }
+
+    try:
+        return json.loads(raw_payload)
+
+    except json.JSONDecodeError:
+        return {
+            "ok": False,
+            "error": "invalid_claude_lambda_response",
+            "raw_response": raw_payload
+        }
+
+
 def get_lex_reply(messages):
     replies = []
 
@@ -249,14 +313,14 @@ def get_lex_reply(messages):
             replies.append(content)
 
     if replies:
-        return "\n".join(replies)
+        return "\n".join(replies), False
 
     log_json({
         "level": "WARN",
         "message": "empty_lex_reply"
     })
 
-    return EMPTY_LEX_REPLY
+    return EMPTY_LEX_REPLY, True
 
 
 def process_record(record):
@@ -302,14 +366,80 @@ def process_record(record):
         lex_intent = intent.get("name", "UNKNOWN")
         lex_state = intent.get("state", "UNKNOWN")
         lex_slots = simplify_slots(intent.get("slots", {}))
-        lex_reply = get_lex_reply(response.get("messages", []))
+        lex_reply, lex_reply_empty = get_lex_reply(response.get("messages", []))
     else:
         lex_intent = "EMPTY_MESSAGE"
         lex_state = "Ignored"
         lex_slots = {}
         lex_reply = EMPTY_USER_TEXT_REPLY
+        lex_reply_empty = False
+
+    response_source = "lex"
+    claude_fallback_attempted = False
+    claude_fallback_error = None
+    claude_model_id = None
+    next_action = None
+    jira_status = None
+
+    if should_use_claude_fallback(text, lex_intent, lex_state, lex_reply_empty):
+        claude_fallback_attempted = True
+        claude_payload = {
+            "event_id": event_id,
+            "session_id": session_id,
+            "channel": channel,
+            "channel_type": channel_type,
+            "routing_reason": routing_reason,
+            "user": user,
+            "text": text,
+            "raw_text": raw_text,
+            "lex": {
+                "intent": lex_intent,
+                "state": lex_state,
+                "slots": lex_slots,
+                "reply": lex_reply
+            },
+            "session": {
+                "conversation_status": get_conversation_status(lex_state)
+            }
+        }
+        claude_result = invoke_claude_fallback(claude_payload)
+        claude_model_id = claude_result.get("model_id")
+
+        if claude_result.get("ok") and (claude_result.get("reply") or "").strip():
+            lex_reply = claude_result["reply"].strip()
+            response_source = "claude"
+
+            log_json({
+                "level": "INFO",
+                "message": "claude_fallback_used",
+                "event_id": event_id,
+                "session_id": session_id,
+                "lex_intent": lex_intent,
+                "lex_state": lex_state,
+                "model_id": claude_model_id
+            })
+
+        else:
+            response_source = "claude_failed"
+            claude_fallback_error = claude_result.get("error", "unknown_claude_error")
+            next_action = "O3_CreateJiraTicket"
+            jira_status = "deferred"
+            lex_reply = CLAUDE_FAILURE_REPLY
+
+            log_json({
+                "level": "WARN",
+                "message": "claude_fallback_failed_defer_jira",
+                "event_id": event_id,
+                "session_id": session_id,
+                "lex_intent": lex_intent,
+                "lex_state": lex_state,
+                "error": claude_fallback_error
+            })
 
     conversation_status = get_conversation_status(lex_state)
+    if response_source in {"claude", "claude_failed"}:
+        conversation_status = "active"
+
     activity_at_dt = datetime.now(timezone.utc).replace(microsecond=0)
     updated_at = to_iso(activity_at_dt)
 
@@ -332,6 +462,8 @@ def process_record(record):
             last_user_text = :last_user_text,
             last_raw_user_text = :last_raw_user_text,
             last_bot_reply = :last_bot_reply,
+            response_source = :response_source,
+            claude_fallback_attempted = :claude_fallback_attempted,
             last_ts = :last_ts,
             last_activity_at = :last_activity_at,
             event_type = :event_type,
@@ -355,6 +487,8 @@ def process_record(record):
         ":last_user_text": text,
         ":last_raw_user_text": raw_text,
         ":last_bot_reply": lex_reply,
+        ":response_source": response_source,
+        ":claude_fallback_attempted": claude_fallback_attempted,
         ":last_ts": ts,
         ":last_activity_at": updated_at,
         ":event_type": event_type,
@@ -372,26 +506,73 @@ def process_record(record):
         ":one": 1
     }
 
+    remove_attributes = []
+
     if timeout_state:
         update_expression += """
             ,
             timeout_due_at = :timeout_due_at,
             timeout_token = :timeout_token,
             timeout_schedule_name = :timeout_schedule_name
-            REMOVE timeout_prompt_started_at, timeout_prompted_at,
-                timeout_close_due_at, timeout_closed_at
         """
         expression_attribute_values.update({
             ":timeout_due_at": timeout_state["timeout_due_at"],
             ":timeout_token": timeout_state["timeout_token"],
             ":timeout_schedule_name": timeout_state["timeout_schedule_name"]
         })
+        remove_attributes.extend([
+            "timeout_prompt_started_at",
+            "timeout_prompted_at",
+            "timeout_close_due_at",
+            "timeout_closed_at"
+        ])
     else:
+        remove_attributes.extend([
+            "timeout_due_at",
+            "timeout_token",
+            "timeout_schedule_name",
+            "timeout_prompt_started_at",
+            "timeout_prompted_at",
+            "timeout_close_due_at",
+            "timeout_closed_at"
+        ])
+
+    if next_action:
         update_expression += """
-            REMOVE timeout_due_at, timeout_token, timeout_schedule_name,
-                timeout_prompt_started_at, timeout_prompted_at,
-                timeout_close_due_at, timeout_closed_at
+            ,
+            next_action = :next_action,
+            jira_status = :jira_status
         """
+        expression_attribute_values.update({
+            ":next_action": next_action,
+            ":jira_status": jira_status
+        })
+    else:
+        remove_attributes.extend([
+            "next_action",
+            "jira_status"
+        ])
+
+    if claude_fallback_error:
+        update_expression += """
+            ,
+            claude_fallback_error = :claude_fallback_error
+        """
+        expression_attribute_values[":claude_fallback_error"] = claude_fallback_error
+    else:
+        remove_attributes.append("claude_fallback_error")
+
+    if claude_model_id:
+        update_expression += """
+            ,
+            claude_model_id = :claude_model_id
+        """
+        expression_attribute_values[":claude_model_id"] = claude_model_id
+    else:
+        remove_attributes.append("claude_model_id")
+
+    if remove_attributes:
+        update_expression += " REMOVE " + ", ".join(remove_attributes)
 
     update_expression += """
         ADD
@@ -432,6 +613,10 @@ def process_record(record):
         "lex_intent": lex_intent,
         "lex_state": lex_state,
         "lex_slots": lex_slots,
+        "response_source": response_source,
+        "claude_fallback_attempted": claude_fallback_attempted,
+        "next_action": next_action,
+        "jira_status": jira_status,
         "timeout_status": "scheduled" if timeout_state else "inactive",
         "timeout_due_at": timeout_state["timeout_due_at"] if timeout_state else None,
         "reply_sent": True,

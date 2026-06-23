@@ -1,6 +1,6 @@
 # Project IVY Status
 
-Last updated: 2026-06-21
+Last updated: 2026-06-22
 
 This is the living implementation document for Project IVY. Update it whenever code, AWS wiring, architecture decisions, environment variables, or test behavior changes.
 
@@ -32,6 +32,7 @@ The diagram maps the current code approximately as:
 - `lambda_o3_slack_handler.py` -> `O3_slack_queue`
 - `lambda_o3_slack_worker.py` -> early version of `O3_slack_node_handler`
 - `lambda_o3_slack_timeout_handler.py` -> `O3_slack_timeout_handler`
+- `lambda_o3_claude_fallback.py` -> `Claude`
 
 ## Current Implementation
 
@@ -69,6 +70,8 @@ Responsibilities:
 - Refreshes a per-session EventBridge Scheduler prompt schedule after active user messages.
 - Resets stale timeout prompt/close fields when a user resumes an active session.
 - Sends Lex response back to Slack through `chat.postMessage`.
+- Invokes Claude fallback through Lambda when Lex fails, returns a fallback intent, or has no useful reply.
+- Stores `response_source`, `claude_fallback_attempted`, and optional Claude/Jira-deferred metadata in the session record.
 - Handles empty user text with a friendly fallback.
 - Handles empty Lex replies with a friendly fallback.
 - Supports SQS partial batch failure response through `batchItemFailures`.
@@ -76,7 +79,25 @@ Responsibilities:
 Current gap:
 
 - Worker is still a thin implementation of the diagram's `O3_slack_node_handler`.
-- It does not yet implement image handling, live agent handoff, Jira/Rovo, or LLM fallback.
+- It does not yet implement image handling, live agent handoff, Jira/Rovo, or router fulfillment.
+
+### Claude Fallback
+
+File: `lambda_o3_claude_fallback.py`
+
+Responsibilities:
+
+- Receives current-session fallback context from the Slack worker.
+- Calls Anthropic Claude through Amazon Bedrock `bedrock-runtime.invoke_model`.
+- Uses the Bedrock Claude Messages API request shape.
+- Returns a normalized reply to the worker when Claude succeeds.
+- Returns a structured failure response when Bedrock or Claude fails.
+
+Current behavior:
+
+- Claude runs only when Lex fails, returns a configured fallback intent, or has no useful reply.
+- If Claude succeeds, the Slack reply comes from Claude and the session stores `response_source=claude`.
+- If Claude fails, no Jira API is called yet; the session stores `next_action=O3_CreateJiraTicket` and `jira_status=deferred`.
 
 ### Slack Timeout Handler
 
@@ -128,6 +149,10 @@ Optional:
 - `SCHEDULER_ROLE_ARN`, required for timeout scheduling
 - `SCHEDULER_GROUP_NAME`, default `default`
 - `SCHEDULER_NAME_PREFIX`, default `o3-slack-timeout`
+- `ENABLE_CLAUDE_FALLBACK`, default `false`
+- `CLAUDE_FALLBACK_FUNCTION`, required when `ENABLE_CLAUDE_FALLBACK=true`
+- `CLAUDE_FALLBACK_INTENTS`, default `FallbackIntent,AMAZON.FallbackIntent,FallbackToLLM`
+- `CLAUDE_FAILURE_REPLY`, default `I could not resolve this automatically. This should be moved to ticket creation once Jira is connected.`
 - `EMPTY_USER_TEXT_REPLY`, default `Hi, how can I help?`
 - `EMPTY_LEX_REPLY`, default `I could not generate a response for that. Please try rephrasing your message.`
 
@@ -149,6 +174,22 @@ Optional:
 - `SCHEDULER_GROUP_NAME`, default `default`
 - `SCHEDULER_NAME_PREFIX`, default `o3-slack-timeout`
 - `SUMMARIZER_FUNCTION_NAME`, optional Lambda name or ARN for async summarizer invocation
+
+### Claude Fallback Lambda
+
+Optional:
+
+- `AWS_REGION`, default `ap-southeast-2`
+- `BEDROCK_MODEL_ID`, default `anthropic.claude-haiku-4-5-20251001-v1:0`
+- `CLAUDE_MAX_TOKENS`, default `500`
+- `CLAUDE_TEMPERATURE`, default `0.2`
+- `CLAUDE_SYSTEM_PROMPT`, default concise IVY support-assistant instructions
+
+IAM:
+
+- Claude fallback Lambda execution role needs `bedrock:InvokeModel` for the configured Bedrock model.
+- Worker Lambda execution role needs `lambda:InvokeFunction` on the Claude fallback Lambda.
+- Bedrock model access must be enabled in the same AWS region used by `AWS_REGION`.
 
 ### Timeout Environment Notes
 
@@ -188,13 +229,14 @@ Implemented from diagram:
 - `O3_slack_timeout_handler -> Slack timeout prompt`
 - `O3_slack_timeout_handler -> O3_slack_sessions`
 - `O3_slack_timeout_handler -> O3_slack_summarizer` optional async hook
+- `LEX -> Claude`
+- `Claude -> O3_CreateJiraTicket` deferred marker only
 
 Not implemented yet:
 
 - Actual `O3_slack_summarizer` implementation
 - `LEX -> O3_lambda_router`
 - `LEX -> O3_Escalation`
-- `LEX -> Claude`
 - `O3_lambda_router -> O3_CreateJiraTicket`
 - `O3_lambda_router -> O3_Image_rek`
 - `O3_lambda_router -> O3_live_agent`
@@ -205,7 +247,7 @@ Not implemented yet:
 
 Current known tests/checks:
 
-- Python syntax parsing passed for handler, worker, and timeout handler after recent edits.
+- Python syntax parsing passed for handler, worker, timeout handler, and Claude fallback after recent edits.
 - PDF architecture extraction was run with:
   - PyMuPDF
   - pdfplumber
@@ -239,24 +281,46 @@ Manual timeout-flow test:
 - Repeat without replying and confirm the close action sets `conversation_status=closed` and `timeout_status=closed`.
 - If `SUMMARIZER_FUNCTION_NAME` is configured, confirm the timeout handler invokes it asynchronously after closing.
 
+Manual Claude fallback test:
+
+- Enable Bedrock model access for the configured Claude model in the Lambda region.
+- Deploy `lambda_o3_claude_fallback.py`.
+- Set `ENABLE_CLAUDE_FALLBACK=true` and `CLAUDE_FALLBACK_FUNCTION` on the worker Lambda.
+- Confirm worker role can invoke the Claude fallback Lambda.
+- Confirm Claude fallback role can call `bedrock:InvokeModel`.
+- Send a Slack DM that Lex cannot answer.
+- Confirm worker logs show `claude_fallback_used` when Claude succeeds.
+- Confirm Slack receives Claude's answer and DynamoDB stores `response_source=claude`.
+- Temporarily break `CLAUDE_FALLBACK_FUNCTION` or Bedrock permission and confirm the session stores `next_action=O3_CreateJiraTicket`, `jira_status=deferred`, and `response_source=claude_failed`.
+
 ## Next Work
 
-Planned next phase: deploy and verify timeout flow in AWS, then begin Lex/router fulfillment.
+Planned next phase: deploy and verify Claude fallback in AWS, then begin Lex/router fulfillment and Jira implementation.
 
-Timeout deployment checks:
+Claude deployment checks:
 
-- Create or confirm the EventBridge Scheduler execution role can invoke `lambda_o3_slack_timeout_handler.py`.
-- Set `TIMEOUT_HANDLER_ARN` and `SCHEDULER_ROLE_ARN` on the worker Lambda.
-- Set `SLACK_BOT_TOKEN` and `SCHEDULER_ROLE_ARN` on the timeout handler Lambda.
-- Run the manual timeout-flow test above with short timeout values before restoring 15-minute and 5-minute defaults.
+- Enable Bedrock model access for `anthropic.claude-haiku-4-5-20251001-v1:0` in the Lambda region.
+- Deploy `lambda_o3_claude_fallback.py`.
+- Set `ENABLE_CLAUDE_FALLBACK=true` and `CLAUDE_FALLBACK_FUNCTION` on the worker Lambda.
+- Confirm the worker Lambda role can invoke the Claude fallback Lambda.
+- Confirm the Claude fallback Lambda role can call `bedrock:InvokeModel`.
+- Run the manual Claude fallback test above before starting router or Jira work.
 
-After timeout verification:
+After Claude verification:
 
 - Create `lambda_o3_router.py`.
 - Dispatch by Lex intent name.
 - Stub CreateJiraTicket, ImageRek, LiveAgent, and Escalation handlers.
+- Implement real `O3_CreateJiraTicket` in the Jira phase.
 
 ## Change Log
+
+### 2026-06-22
+
+- Added `lambda_o3_claude_fallback.py` for Bedrock Claude fallback.
+- Added worker-side Claude fallback invocation for Lex fallback, failed, or empty-reply cases.
+- Added session metadata for `response_source`, Claude fallback attempts, and Jira-deferred failure handling.
+- Documented Claude fallback environment variables, IAM, and manual AWS tests.
 
 ### 2026-06-21
 
