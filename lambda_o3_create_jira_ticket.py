@@ -1,0 +1,245 @@
+import base64
+import json
+import os
+import re
+import urllib.error
+import urllib.request
+
+import boto3
+
+AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
+JIRA_SECRET_ID = os.environ.get("JIRA_SECRET_ID")
+JIRA_PROJECT_KEY = os.environ.get("JIRA_PROJECT_KEY")
+JIRA_ISSUE_TYPE_NAME = os.environ.get("JIRA_ISSUE_TYPE_NAME", "Task")
+JIRA_LABELS = [
+    label.strip()
+    for label in os.environ.get("JIRA_LABELS", "project-ivy,o3-slack").split(",")
+    if label.strip()
+]
+JIRA_TIMEOUT_SECONDS = int(os.environ.get("JIRA_TIMEOUT_SECONDS", "15"))
+
+secretsmanager = boto3.client("secretsmanager", region_name=AWS_REGION)
+_jira_secret_cache = None
+
+
+INTENT_TITLES = {
+    "AWSaccount": "AWS account access",
+    "AWSRelatedQueries": "AWS related request",
+    "AccessforCamtasia": "Camtasia access",
+    "AccesstoOpsgenie": "Opsgenie access",
+    "AccessToPCQ": "PCQ access",
+    "AccessToIkbInnovyQCom": "ikb.InnovyQ.com access",
+    "AccessToUemGpcloudserviceCom": "uem.gpcloudservice.com access",
+    "CreateJiraTicket": "Support request",
+}
+
+
+def log_json(data):
+    print(json.dumps(data, default=str))
+
+
+def require_env(name, value):
+    if not value:
+        raise ValueError(f"Missing required environment variable: {name}")
+
+    return value
+
+
+def get_jira_secret():
+    global _jira_secret_cache
+
+    if _jira_secret_cache:
+        return _jira_secret_cache
+
+    secret_id = require_env("JIRA_SECRET_ID", JIRA_SECRET_ID)
+    response = secretsmanager.get_secret_value(SecretId=secret_id)
+    secret_string = response.get("SecretString")
+
+    if not secret_string:
+        raise ValueError("Jira secret must be stored as a JSON SecretString")
+
+    secret = json.loads(secret_string)
+    for key in ("site_url", "email", "api_token"):
+        if not secret.get(key):
+            raise ValueError(f"Jira secret is missing required key: {key}")
+
+    secret["site_url"] = secret["site_url"].rstrip("/")
+    _jira_secret_cache = secret
+    return secret
+
+
+def text_or_empty(value):
+    if value is None:
+        return ""
+
+    return str(value).strip()
+
+
+def shorten(text, limit):
+    text = re.sub(r"\s+", " ", text_or_empty(text))
+
+    if len(text) <= limit:
+        return text
+
+    return text[: limit - 3].rstrip() + "..."
+
+
+def humanize_intent(intent_name):
+    if intent_name in INTENT_TITLES:
+        return INTENT_TITLES[intent_name]
+
+    spaced = re.sub(r"(?<!^)(?=[A-Z])", " ", text_or_empty(intent_name))
+    return spaced or "Support request"
+
+
+def adf_paragraph(text):
+    return {
+        "type": "paragraph",
+        "content": [
+            {
+                "type": "text",
+                "text": text_or_empty(text) or "-"
+            }
+        ]
+    }
+
+
+def adf_description(event):
+    lex = event.get("lex", {}) or {}
+    slack = event.get("slack", {}) or {}
+    request_text = text_or_empty(event.get("text"))
+    raw_text = text_or_empty(event.get("raw_text"))
+
+    lines = [
+        f"Slack user: {text_or_empty(event.get('user')) or text_or_empty(slack.get('user'))}",
+        f"Slack channel: {text_or_empty(event.get('channel')) or text_or_empty(slack.get('channel'))}",
+        f"Session ID: {text_or_empty(event.get('session_id'))}",
+        f"Matched Lex intent: {text_or_empty(lex.get('intent'))}",
+        f"Routing source: Project IVY Slack bot",
+        "",
+        "Original user request:",
+        request_text or raw_text or "-",
+    ]
+
+    return {
+        "version": 1,
+        "type": "doc",
+        "content": [adf_paragraph(line) for line in lines]
+    }
+
+
+def build_issue_payload(event):
+    require_env("JIRA_PROJECT_KEY", JIRA_PROJECT_KEY)
+
+    lex = event.get("lex", {}) or {}
+    intent_name = text_or_empty(lex.get("intent"))
+    request_text = text_or_empty(event.get("text")) or text_or_empty(event.get("raw_text"))
+    action_title = humanize_intent(intent_name)
+    summary_tail = shorten(request_text, 100) or "Support request"
+    summary = shorten(f"[Project IVY] {action_title} - {summary_tail}", 255)
+
+    fields = {
+        "project": {
+            "key": JIRA_PROJECT_KEY
+        },
+        "summary": summary,
+        "issuetype": {
+            "name": JIRA_ISSUE_TYPE_NAME
+        },
+        "description": adf_description(event),
+    }
+
+    if JIRA_LABELS:
+        fields["labels"] = JIRA_LABELS
+
+    return {
+        "fields": fields
+    }
+
+
+def jira_auth_header(secret):
+    raw_token = f"{secret['email']}:{secret['api_token']}".encode("utf-8")
+    encoded = base64.b64encode(raw_token).decode("utf-8")
+    return f"Basic {encoded}"
+
+
+def create_jira_issue(event):
+    secret = get_jira_secret()
+    url = f"{secret['site_url']}/rest/api/3/issue"
+    payload = build_issue_payload(event)
+
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Authorization": jira_auth_header(secret),
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    with urllib.request.urlopen(request, timeout=JIRA_TIMEOUT_SECONDS) as response:
+        response_payload = json.loads(response.read().decode("utf-8"))
+
+    issue_key = response_payload.get("key")
+    if not issue_key:
+        raise ValueError("Jira create issue response did not include an issue key")
+
+    return {
+        "issue_id": response_payload.get("id"),
+        "ticket_key": issue_key,
+        "ticket_url": f"{secret['site_url']}/browse/{issue_key}",
+    }
+
+
+def error_response(error, code="jira_create_failed"):
+    return {
+        "ok": False,
+        "error": str(error),
+        "error_code": code,
+    }
+
+
+def lambda_handler(event, context):
+    log_json({
+        "level": "INFO",
+        "message": "jira_create_received",
+        "session_id": event.get("session_id"),
+        "intent": (event.get("lex") or {}).get("intent"),
+    })
+
+    try:
+        issue = create_jira_issue(event)
+
+        log_json({
+            "level": "INFO",
+            "message": "jira_create_completed",
+            "session_id": event.get("session_id"),
+            "ticket_key": issue["ticket_key"],
+        })
+
+        return {
+            "ok": True,
+            **issue,
+        }
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        log_json({
+            "level": "ERROR",
+            "message": "jira_create_http_error",
+            "session_id": event.get("session_id"),
+            "status": e.code,
+            "body": body,
+        })
+        return error_response(f"Jira HTTP {e.code}: {body}", "jira_http_error")
+
+    except Exception as e:
+        log_json({
+            "level": "ERROR",
+            "message": "jira_create_failed",
+            "session_id": event.get("session_id"),
+            "error": str(e),
+        })
+        return error_response(e)

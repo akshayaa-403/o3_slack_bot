@@ -16,12 +16,12 @@ DEFAULT_REPLY = os.environ.get(
     "DEFAULT_ROUTER_REPLY",
     "I understood the request, but that action is not wired yet."
 )
-JIRA_DEFERRED_REPLY = os.environ.get(
-    "JIRA_DEFERRED_REPLY",
-    "I identified this as a request that should become a Jira ticket. Jira is not connected yet, so I have marked it for ticket creation once Jira is wired."
+JIRA_CONFIRMATION_REPLY = os.environ.get(
+    "JIRA_CONFIRMATION_REPLY",
+    "I can create a Jira ticket for this request. Reply yes to create it, or no to cancel."
 )
 
-JIRA_DEFERRED_INTENTS = {
+JIRA_TICKET_INTENTS = {
     "AWSaccount",
     "AWSRelatedQueries",
     "AccessforCamtasia",
@@ -34,16 +34,16 @@ JIRA_DEFERRED_INTENTS = {
 INTENT_ROUTES = {
     **{
         intent_name: {
-            "action": "jira_deferred",
-            "stub_reply": JIRA_DEFERRED_REPLY
+            "action": "jira_confirmation",
+            "stub_reply": JIRA_CONFIRMATION_REPLY
         }
-        for intent_name in JIRA_DEFERRED_INTENTS
+        for intent_name in JIRA_TICKET_INTENTS
     },
     "CreateJiraTicket": {
-        "action": "jira_deferred",
+        "action": "jira_confirmation",
         "function_env": "CREATE_JIRA_TICKET_FUNCTION",
         "function_name": CREATE_JIRA_TICKET_FUNCTION,
-        "stub_reply": JIRA_DEFERRED_REPLY
+        "stub_reply": JIRA_CONFIRMATION_REPLY
     },
     "ImageRek": {
         "action": "invoke_or_stub",
@@ -145,12 +145,14 @@ def lex_close_response(intent, session_attributes, message, state="Fulfilled"):
     }
 
 
-def with_jira_deferred_attributes(session_attributes):
+def with_jira_confirmation_attributes(session_attributes, event, intent_name):
     updated = dict(session_attributes)
     updated.update({
         "response_source": "router",
         "next_action": "O3_CreateJiraTicket",
-        "jira_status": "deferred"
+        "jira_status": "pending_confirmation",
+        "jira_intent_name": intent_name,
+        "jira_request_text": event.get("inputTranscript", "")
     })
     return updated
 
@@ -191,15 +193,15 @@ def route_intent(event):
         })
         return lex_close_response(intent, session_attributes, DEFAULT_REPLY)
 
-    if route.get("action") == "jira_deferred":
+    if route.get("action") == "jira_confirmation":
         log_json({
             "level": "INFO",
-            "message": "router_jira_deferred",
+            "message": "router_jira_confirmation_requested",
             "intent_name": intent_name
         })
         return lex_close_response(
             intent,
-            with_jira_deferred_attributes(session_attributes),
+            with_jira_confirmation_attributes(session_attributes, event, intent_name),
             route["stub_reply"]
         )
 

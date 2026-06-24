@@ -1,6 +1,6 @@
 # Project IVY Status
 
-Last updated: 2026-06-23
+Last updated: 2026-06-24
 
 This is the living implementation document for Project IVY. Update it whenever code, AWS wiring, architecture decisions, environment variables, or test behavior changes.
 
@@ -34,6 +34,7 @@ The diagram maps the current code approximately as:
 - `lambda_o3_slack_timeout_handler.py` -> `O3_slack_timeout_handler`
 - `lambda_o3_claude_fallback.py` -> `Claude`
 - `lambda_o3_router.py` -> `O3_lambda_router`
+- `lambda_o3_create_jira_ticket.py` -> `O3_CreateJiraTicket`
 
 ## Current Implementation
 
@@ -72,6 +73,8 @@ Responsibilities:
 - Resets stale timeout prompt/close fields when a user resumes an active session.
 - Sends Lex response back to Slack through `chat.postMessage`.
 - Reads Lex fulfillment `sessionAttributes` from the router and stores action metadata in the session record.
+- Handles pending Jira ticket confirmations before calling Lex.
+- Invokes the CreateJiraTicket Lambda only after the user confirms ticket creation.
 - Invokes Claude fallback through Lambda when Lex fails, returns a fallback intent, or has no useful reply.
 - Stores `response_source`, `claude_fallback_attempted`, and optional Claude/Jira-deferred metadata in the session record.
 - Handles empty user text with a friendly fallback.
@@ -81,7 +84,7 @@ Responsibilities:
 Current gap:
 
 - Worker is still a thin implementation of the diagram's `O3_slack_node_handler`.
-- It does not yet implement image handling, live agent handoff, Jira/Rovo, or real Jira fulfillment.
+- It does not yet implement image handling, live agent handoff, Rovo enrichment, or escalation.
 
 ### Lex Intent Import
 
@@ -118,21 +121,40 @@ Current behavior:
 - If Claude succeeds, the Slack reply comes from Claude and the session stores `response_source=claude`.
 - If Claude fails, no Jira API is called yet; the session stores `next_action=O3_CreateJiraTicket` and `jira_status=deferred`.
 
-### Router Stub
+### Router / Jira Confirmation
 
 File: `lambda_o3_router.py`
 
 Responsibilities:
 
 - Receives Lex fulfillment events for imported action-style intents.
-- Routes the real imported `Uses Lambda = Yes` intent names to a Jira-deferred stub.
-- Returns a Lex `Close` response with `response_source=router`, `next_action=O3_CreateJiraTicket`, and `jira_status=deferred`.
-- Does not call Jira, Rovo, image recognition, live-agent, or escalation services yet.
+- Routes the real imported `Uses Lambda = Yes` intent names to the Jira confirmation flow.
+- Returns a Lex `Close` response with `response_source=router`, `next_action=O3_CreateJiraTicket`, and `jira_status=pending_confirmation`.
+- Stores `jira_intent_name` and `jira_request_text` in Lex session attributes for the worker.
+- Does not call Jira directly; the worker performs confirmation and invokes the CreateJiraTicket Lambda.
 
 Current behavior:
 
-- The router handles `AWSaccount`, `AWSRelatedQueries`, `AccessforCamtasia`, `AccesstoOpsgenie`, `AccessToPCQ`, `AccessToIkbInnovyQCom`, and `AccessToUemGpcloudserviceCom` as deferred Jira-ticket actions.
+- The router handles `AWSaccount`, `AWSRelatedQueries`, `AccessforCamtasia`, `AccesstoOpsgenie`, `AccessToPCQ`, `AccessToIkbInnovyQCom`, and `AccessToUemGpcloudserviceCom` as Jira ticket actions that require user confirmation.
 - Claude fallback remains separate and only runs when Lex fails, falls back, or returns no useful reply.
+
+### Jira Ticket Creation
+
+File: `lambda_o3_create_jira_ticket.py`
+
+Responsibilities:
+
+- Reads Jira Cloud credentials from AWS Secrets Manager.
+- Creates Jira issues through Jira Cloud REST API v3.
+- Builds Jira issue descriptions using Atlassian Document Format.
+- Returns normalized `ticket_key` and `ticket_url` to the worker.
+
+Current behavior:
+
+- Worker asks the user to reply yes/no after a routed action intent.
+- `yes` invokes the CreateJiraTicket Lambda and stores `jira_status=created`, `jira_ticket_key`, and `jira_ticket_url`.
+- `no` stores `jira_status=cancelled` without calling Jira.
+- Unclear replies keep `jira_status=pending_confirmation` and ask for yes/no again.
 
 ### Slack Timeout Handler
 
@@ -188,8 +210,17 @@ Optional:
 - `CLAUDE_FALLBACK_FUNCTION`, required when `ENABLE_CLAUDE_FALLBACK=true`
 - `CLAUDE_FALLBACK_INTENTS`, default `FallbackIntent,AMAZON.FallbackIntent,FallbackToLLM`
 - `CLAUDE_FAILURE_REPLY`, default `I could not resolve this automatically. This should be moved to ticket creation once Jira is connected.`
+- `CREATE_JIRA_TICKET_FUNCTION`, required for confirmed Jira ticket creation
+- `JIRA_UNCLEAR_CONFIRMATION_REPLY`, default `Please reply yes to create the Jira ticket, or no to cancel.`
+- `JIRA_CANCELLED_REPLY`, default `Cancelled. I did not create a Jira ticket.`
+- `JIRA_CREATE_FAILED_REPLY`, default `I could not create the Jira ticket. Please try again later or contact support.`
 - `EMPTY_USER_TEXT_REPLY`, default `Hi, how can I help?`
 - `EMPTY_LEX_REPLY`, default `I could not generate a response for that. Please try rephrasing your message.`
+
+IAM:
+
+- Worker Lambda execution role needs `dynamodb:GetItem` and `dynamodb:UpdateItem` on `O3_slack_sessions`.
+- Worker Lambda execution role needs `lambda:InvokeFunction` on the CreateJiraTicket Lambda.
 
 ### Router Lambda
 
@@ -197,8 +228,36 @@ Optional:
 
 - `AWS_REGION`, default `ap-southeast-2`
 - `DEFAULT_ROUTER_REPLY`, default `I understood the request, but that action is not wired yet.`
-- `JIRA_DEFERRED_REPLY`, default router response for imported action intents before Jira is wired.
+- `JIRA_CONFIRMATION_REPLY`, default confirmation prompt for imported action intents.
 - `CREATE_JIRA_TICKET_FUNCTION`, `IMAGE_REK_FUNCTION`, `LIVE_AGENT_FUNCTION`, `ESCALATION_FUNCTION`, and `LLM_FALLBACK_FUNCTION` are reserved for later phases.
+
+### CreateJiraTicket Lambda
+
+Required:
+
+- `JIRA_SECRET_ID`
+- `JIRA_PROJECT_KEY`
+
+Optional:
+
+- `AWS_REGION`, default `ap-southeast-2`
+- `JIRA_ISSUE_TYPE_NAME`, default `Task`
+- `JIRA_LABELS`, default `project-ivy,o3-slack`
+- `JIRA_TIMEOUT_SECONDS`, default `15`
+
+Jira secret JSON:
+
+```json
+{
+  "site_url": "https://your-domain.atlassian.net",
+  "email": "jira-service-account@example.com",
+  "api_token": "atlassian-api-token"
+}
+```
+
+IAM:
+
+- CreateJiraTicket Lambda execution role needs `secretsmanager:GetSecretValue` for `JIRA_SECRET_ID`.
 
 ### Timeout Handler Lambda
 
@@ -274,7 +333,8 @@ Implemented from diagram:
 - `O3_slack_timeout_handler -> O3_slack_sessions`
 - `O3_slack_timeout_handler -> O3_slack_summarizer` optional async hook
 - `LEX -> O3_lambda_router`
-- `O3_lambda_router -> O3_CreateJiraTicket` deferred marker only
+- `O3_lambda_router -> O3_CreateJiraTicket` through worker confirmation
+- `O3_CreateJiraTicket -> Jira`
 - `LEX -> Claude`
 - `Claude -> O3_CreateJiraTicket` deferred marker only
 
@@ -282,10 +342,9 @@ Not implemented yet:
 
 - Actual `O3_slack_summarizer` implementation
 - `LEX -> O3_Escalation`
-- Real `O3_lambda_router -> O3_CreateJiraTicket`
 - `O3_lambda_router -> O3_Image_rek`
 - `O3_lambda_router -> O3_live_agent`
-- `O3_CreateJiraTicket -> Jira + Rovo`
+- `O3_CreateJiraTicket -> Rovo`
 - live-agent/on-call tables and locks
 
 ## Testing Notes
@@ -338,30 +397,47 @@ Manual Claude fallback test:
 - Confirm Slack receives Claude's answer and DynamoDB stores `response_source=claude`.
 - Temporarily break `CLAUDE_FALLBACK_FUNCTION` or Bedrock permission and confirm the session stores `next_action=O3_CreateJiraTicket`, `jira_status=deferred`, and `response_source=claude_failed`.
 
-Manual router stub test:
+Manual router/Jira confirmation test:
 
 - Deploy `lambda_o3_router.py` and attach it as the Lex fulfillment Lambda for the alias locale.
+- Deploy `lambda_o3_create_jira_ticket.py`.
+- Create the Jira secret in Secrets Manager.
+- Set `CREATE_JIRA_TICKET_FUNCTION` on the worker Lambda.
 - Re-run `load_lex_intents_from_excel.py` with `--lambda-mode marked`.
 - Send a routed action phrase such as `I need access to PCQ`.
-- Confirm router logs show `router_event_received` and `router_jira_deferred`.
-- Confirm Slack receives the Jira-deferred stub reply.
-- Confirm DynamoDB stores `response_source=router`, `next_action=O3_CreateJiraTicket`, and `jira_status=deferred`.
+- Confirm router logs show `router_event_received` and `router_jira_confirmation_requested`.
+- Confirm Slack asks for yes/no ticket creation confirmation.
+- Confirm DynamoDB stores `response_source=router`, `next_action=O3_CreateJiraTicket`, and `jira_status=pending_confirmation`.
+- Reply `no` and confirm `jira_status=cancelled` and no Jira ticket is created.
+- Repeat and reply `yes`; confirm Jira ticket creation and `jira_status=created`, `jira_ticket_key`, and `jira_ticket_url`.
 - Send a static FAQ phrase such as `reset adam password` and confirm it still stores `response_source=lex`.
 - Send an unknown phrase and confirm Claude fallback still stores `response_source=claude`.
 
 ## Next Work
 
-Planned next phase: implement real `O3_CreateJiraTicket`.
+Planned next phase: deploy and verify real `O3_CreateJiraTicket`, then decide whether to add Rovo enrichment, image recognition, or live-agent handoff.
 
-Jira phase targets:
+Jira deployment checks:
 
-- Add Jira API configuration and IAM/secret handling.
-- Create Jira tickets from router-deferred action intents.
-- Store Jira ticket key/link/status in `O3_slack_sessions`.
-- Reply to Slack with the created ticket key and link.
+- Create Jira service account API token.
+- Store Jira secret in Secrets Manager.
+- Deploy `lambda_o3_create_jira_ticket.py`.
+- Set CreateJiraTicket Lambda env vars.
+- Add worker `CREATE_JIRA_TICKET_FUNCTION`.
+- Add IAM permissions for worker invoke and CreateJiraTicket secret read.
+- Run the manual router/Jira confirmation test above.
 - Keep image recognition, live-agent handoff, and escalation as later phases.
 
 ## Change Log
+
+### 2026-06-24
+
+- Added `lambda_o3_create_jira_ticket.py` for Jira Cloud issue creation.
+- Changed router action intents from deferred stubs to yes/no Jira confirmation prompts.
+- Added worker-side Jira confirmation handling before Lex fallback.
+- Added worker invocation of CreateJiraTicket Lambda after user confirmation.
+- Added session metadata for `jira_status=created|cancelled|create_failed`, `jira_ticket_key`, `jira_ticket_url`, and `jira_error`.
+- Documented Jira Secrets Manager configuration, IAM, and manual tests.
 
 ### 2026-06-23
 

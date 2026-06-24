@@ -137,3 +137,5 @@ Set:
 BOT_ALIAS_ID=<new alias id>
 Deploy/save Lambda config.
 Test Slack.
+=================
+24/6/26
