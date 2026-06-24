@@ -152,9 +152,13 @@ Responsibilities:
 Current behavior:
 
 - Worker asks the user to reply yes/no after a routed action intent.
-- `yes` invokes the CreateJiraTicket Lambda and stores `jira_status=created`, `jira_ticket_key`, and `jira_ticket_url`.
+- `yes` first acquires a DynamoDB conditional lock by moving `jira_status=pending_confirmation` to `jira_status=creating`, then invokes the CreateJiraTicket Lambda.
+- Successful creation stores `jira_status=created`, `jira_ticket_key`, `jira_ticket_url`, `jira_request_id`, and Jira timing metadata.
+- Duplicate `yes` replies do not create another Jira ticket; they return the existing ticket link or an in-progress message.
+- Stale `creating` sessions are marked failed/manual-check-needed instead of automatically creating a second ticket.
 - `no` stores `jira_status=cancelled` without calling Jira.
 - Unclear replies keep `jira_status=pending_confirmation` and ask for yes/no again.
+- Jira API failures return safe Slack messages while detailed diagnostics remain in CloudWatch/session metadata.
 
 ### Slack Timeout Handler
 
@@ -214,6 +218,13 @@ Optional:
 - `JIRA_UNCLEAR_CONFIRMATION_REPLY`, default `Please reply yes to create the Jira ticket, or no to cancel.`
 - `JIRA_CANCELLED_REPLY`, default `Cancelled. I did not create a Jira ticket.`
 - `JIRA_CREATE_FAILED_REPLY`, default `I could not create the Jira ticket. Please try again later or contact support.`
+- `JIRA_CREATE_CONFIG_FAILED_REPLY`, default `Jira ticket creation is not configured correctly.`
+- `JIRA_CREATE_PERMISSION_FAILED_REPLY`, default `I could not create the Jira ticket because Jira rejected the request. Please check Jira permissions or project settings.`
+- `JIRA_CREATE_TIMEOUT_REPLY`, default `Jira did not respond in time. Please try again later.`
+- `JIRA_CREATE_IN_PROGRESS_REPLY`, default `Jira ticket creation is already in progress. Please wait a moment.`
+- `JIRA_CREATE_STALE_REPLY`, default stale/manual-check-needed message.
+- `JIRA_CREATING_STALE_SECONDS`, default `300`
+- `JIRA_CREATED_DUPLICATE_WINDOW_SECONDS`, default `600`
 - `EMPTY_USER_TEXT_REPLY`, default `Hi, how can I help?`
 - `EMPTY_LEX_REPLY`, default `I could not generate a response for that. Please try rephrasing your message.`
 
@@ -409,13 +420,14 @@ Manual router/Jira confirmation test:
 - Confirm Slack asks for yes/no ticket creation confirmation.
 - Confirm DynamoDB stores `response_source=router`, `next_action=O3_CreateJiraTicket`, and `jira_status=pending_confirmation`.
 - Reply `no` and confirm `jira_status=cancelled` and no Jira ticket is created.
-- Repeat and reply `yes`; confirm Jira ticket creation and `jira_status=created`, `jira_ticket_key`, and `jira_ticket_url`.
+- Repeat and reply `yes`; confirm Jira ticket creation and `jira_status=created`, `jira_ticket_key`, `jira_ticket_url`, and `jira_request_id`.
+- Reply `yes` again and confirm no duplicate Jira issue is created; Slack should return the existing ticket or in-progress reply.
 - Send a static FAQ phrase such as `reset adam password` and confirm it still stores `response_source=lex`.
 - Send an unknown phrase and confirm Claude fallback still stores `response_source=claude`.
 
 ## Next Work
 
-Planned next phase: deploy and verify real `O3_CreateJiraTicket`, then decide whether to add Rovo enrichment, image recognition, or live-agent handoff.
+Planned next phase: verify duplicate protection and Jira hardening in AWS, then start Rovo enrichment.
 
 Jira deployment checks:
 
@@ -437,6 +449,9 @@ Jira deployment checks:
 - Added worker-side Jira confirmation handling before Lex fallback.
 - Added worker invocation of CreateJiraTicket Lambda after user confirmation.
 - Added session metadata for `jira_status=created|cancelled|create_failed`, `jira_ticket_key`, `jira_ticket_url`, and `jira_error`.
+- Added DynamoDB-backed Jira creation lock with `jira_status=creating` to prevent duplicate tickets from retries or duplicate confirmations.
+- Added durable Jira request metadata: `jira_request_id`, requested/confirmed/started/created timestamps, `jira_error_code`, and `last_jira_ticket_*`.
+- Hardened Jira Lambda errors so Slack gets safe category-specific messages while CloudWatch retains detailed diagnostics.
 - Documented Jira Secrets Manager configuration, IAM, and manual tests.
 
 ### 2026-06-23

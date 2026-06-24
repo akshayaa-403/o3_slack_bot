@@ -55,6 +55,28 @@ JIRA_CREATE_FAILED_REPLY = os.environ.get(
     "JIRA_CREATE_FAILED_REPLY",
     "I could not create the Jira ticket. Please try again later or contact support."
 )
+JIRA_CREATE_CONFIG_FAILED_REPLY = os.environ.get(
+    "JIRA_CREATE_CONFIG_FAILED_REPLY",
+    "Jira ticket creation is not configured correctly."
+)
+JIRA_CREATE_PERMISSION_FAILED_REPLY = os.environ.get(
+    "JIRA_CREATE_PERMISSION_FAILED_REPLY",
+    "I could not create the Jira ticket because Jira rejected the request. Please check Jira permissions or project settings."
+)
+JIRA_CREATE_TIMEOUT_REPLY = os.environ.get(
+    "JIRA_CREATE_TIMEOUT_REPLY",
+    "Jira did not respond in time. Please try again later."
+)
+JIRA_CREATE_IN_PROGRESS_REPLY = os.environ.get(
+    "JIRA_CREATE_IN_PROGRESS_REPLY",
+    "Jira ticket creation is already in progress. Please wait a moment."
+)
+JIRA_CREATE_STALE_REPLY = os.environ.get(
+    "JIRA_CREATE_STALE_REPLY",
+    "A Jira ticket creation was already started but did not finish cleanly. I will not create a second ticket automatically. Please check Jira or contact support."
+)
+JIRA_CREATING_STALE_SECONDS = int(os.environ.get("JIRA_CREATING_STALE_SECONDS", "300"))
+JIRA_CREATED_DUPLICATE_WINDOW_SECONDS = int(os.environ.get("JIRA_CREATED_DUPLICATE_WINDOW_SECONDS", "600"))
 EMPTY_USER_TEXT_REPLY = os.environ.get("EMPTY_USER_TEXT_REPLY", "Hi, how can I help?")
 EMPTY_LEX_REPLY = os.environ.get(
     "EMPTY_LEX_REPLY",
@@ -94,6 +116,27 @@ def to_iso(dt):
 
 def ttl_epoch():
     return int(time.time()) + SESSION_TTL_SECONDS
+
+
+def parse_iso_datetime(value):
+    if not value:
+        return None
+
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+
+    except ValueError:
+        return None
+
+
+def make_jira_request_id(session_id, event_id, intent_name, request_text):
+    raw = "|".join([
+        session_id or "",
+        event_id or "",
+        intent_name or "",
+        request_text or ""
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
 def log_json(data):
@@ -345,27 +388,45 @@ def invoke_create_jira_ticket(payload):
     if not CREATE_JIRA_TICKET_FUNCTION:
         return {
             "ok": False,
-            "error": "missing_create_jira_ticket_function"
+            "error": "missing_create_jira_ticket_function",
+            "error_code": "missing_create_jira_ticket_function"
         }
 
-    response = lambda_client.invoke(
-        FunctionName=CREATE_JIRA_TICKET_FUNCTION,
-        InvocationType="RequestResponse",
-        Payload=json.dumps(payload).encode("utf-8")
-    )
+    try:
+        response = lambda_client.invoke(
+            FunctionName=CREATE_JIRA_TICKET_FUNCTION,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload).encode("utf-8")
+        )
+
+    except ClientError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "jira_lambda_invoke_failed"
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "jira_lambda_invoke_failed"
+        }
 
     raw_payload = response.get("Payload").read().decode("utf-8")
 
     if response.get("FunctionError"):
         return {
             "ok": False,
-            "error": raw_payload or response.get("FunctionError")
+            "error": raw_payload or response.get("FunctionError"),
+            "error_code": "jira_lambda_function_error"
         }
 
     if not raw_payload:
         return {
             "ok": False,
-            "error": "empty_create_jira_response"
+            "error": "empty_create_jira_response",
+            "error_code": "invalid_create_jira_response"
         }
 
     try:
@@ -375,6 +436,7 @@ def invoke_create_jira_ticket(payload):
         return {
             "ok": False,
             "error": "invalid_create_jira_response",
+            "error_code": "invalid_create_jira_response",
             "raw_response": raw_payload
         }
 
@@ -392,6 +454,41 @@ def has_pending_jira_confirmation(session_item):
     return (
         session_item.get("next_action") == "O3_CreateJiraTicket"
         and session_item.get("jira_status") == "pending_confirmation"
+    )
+
+
+def jira_status_is_recent(session_item, timestamp_field, max_age_seconds):
+    started_at = parse_iso_datetime(session_item.get(timestamp_field))
+
+    if not started_at:
+        return False
+
+    age = datetime.now(timezone.utc) - started_at
+    return age.total_seconds() <= max_age_seconds
+
+
+def has_jira_confirmation_state(session_item, text):
+    if has_pending_jira_confirmation(session_item):
+        return True
+
+    jira_status = session_item.get("jira_status")
+    decision = classify_jira_confirmation(text)
+
+    if (
+        session_item.get("next_action") == "O3_CreateJiraTicket"
+        and jira_status == "creating"
+    ):
+        return True
+
+    return (
+        jira_status == "created"
+        and decision == "yes"
+        and bool(session_item.get("jira_ticket_key") or session_item.get("last_jira_ticket_key"))
+        and jira_status_is_recent(
+            session_item,
+            "jira_created_at",
+            JIRA_CREATED_DUPLICATE_WINDOW_SECONDS
+        )
     )
 
 
@@ -423,6 +520,159 @@ def jira_ticket_reply(ticket_key, ticket_url):
     return "Created the Jira ticket."
 
 
+def existing_jira_ticket_reply(ticket_key, ticket_url):
+    if ticket_key and ticket_url:
+        return f"Jira ticket already created {ticket_key}: {ticket_url}"
+
+    if ticket_key:
+        return f"Jira ticket already created {ticket_key}."
+
+    return "Jira ticket already created."
+
+
+def jira_failure_reply(jira_result):
+    error_code = jira_result.get("error_code")
+    status = jira_result.get("status")
+
+    if error_code in {"jira_configuration_error", "missing_create_jira_ticket_function"}:
+        return JIRA_CREATE_CONFIG_FAILED_REPLY
+
+    if error_code in {"jira_network_error", "jira_timeout"}:
+        return JIRA_CREATE_TIMEOUT_REPLY
+
+    if error_code in {"jira_auth_or_permission_error", "jira_project_or_permission_error"}:
+        return JIRA_CREATE_PERMISSION_FAILED_REPLY
+
+    if status in {401, 403, 404}:
+        return JIRA_CREATE_PERMISSION_FAILED_REPLY
+
+    return JIRA_CREATE_FAILED_REPLY
+
+
+def jira_creation_is_stale(session_item):
+    create_started_at = parse_iso_datetime(session_item.get("jira_create_started_at"))
+
+    if not create_started_at:
+        return True
+
+    age = datetime.now(timezone.utc) - create_started_at
+    return age.total_seconds() > JIRA_CREATING_STALE_SECONDS
+
+
+def acquire_jira_creation_lock(session_id, jira_request_id, event_id, now_iso):
+    try:
+        sessions_table.update_item(
+            Key={
+                "session_id": session_id
+            },
+            UpdateExpression="""
+                SET
+                    jira_status = :creating,
+                    jira_request_id = :jira_request_id,
+                    jira_confirm_event_id = :event_id,
+                    jira_confirmed_at = :now,
+                    jira_create_started_at = :now,
+                    updated_at = :now
+                REMOVE
+                    jira_error,
+                    jira_error_code,
+                    jira_error_status
+            """,
+            ConditionExpression="""
+                next_action = :next_action
+                AND jira_status = :pending_confirmation
+            """,
+            ExpressionAttributeValues={
+                ":creating": "creating",
+                ":jira_request_id": jira_request_id,
+                ":event_id": event_id or "unknown-event",
+                ":now": now_iso,
+                ":next_action": "O3_CreateJiraTicket",
+                ":pending_confirmation": "pending_confirmation"
+            }
+        )
+
+        log_json({
+            "level": "INFO",
+            "message": "jira_creation_lock_acquired",
+            "session_id": session_id,
+            "jira_request_id": jira_request_id
+        })
+        return True
+
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            log_json({
+                "level": "INFO",
+                "message": "jira_creation_lock_conflict",
+                "session_id": session_id,
+                "jira_request_id": jira_request_id
+            })
+            return False
+
+        raise
+
+
+def existing_jira_state_result(session_item, base_result):
+    ticket_key = session_item.get("jira_ticket_key") or session_item.get("last_jira_ticket_key")
+    ticket_url = session_item.get("jira_ticket_url") or session_item.get("last_jira_ticket_url")
+    jira_status = session_item.get("jira_status")
+    preserved_metadata = {
+        "jira_request_id": session_item.get("jira_request_id") or base_result.get("jira_request_id"),
+        "jira_requested_at": session_item.get("jira_requested_at") or base_result.get("jira_requested_at"),
+        "jira_confirmed_at": session_item.get("jira_confirmed_at"),
+        "jira_create_started_at": session_item.get("jira_create_started_at"),
+        "jira_created_at": session_item.get("jira_created_at"),
+        "last_jira_ticket_key": session_item.get("last_jira_ticket_key"),
+        "last_jira_ticket_url": session_item.get("last_jira_ticket_url"),
+        "last_jira_created_at": session_item.get("last_jira_created_at"),
+    }
+
+    if jira_status == "created":
+        return {
+            **base_result,
+            **preserved_metadata,
+            "lex_state": "Fulfilled",
+            "response_source": "jira",
+            "next_action": None,
+            "jira_status": "created",
+            "jira_ticket_key": ticket_key,
+            "jira_ticket_url": ticket_url,
+            "last_jira_ticket_key": ticket_key,
+            "last_jira_ticket_url": ticket_url,
+            "last_jira_created_at": session_item.get("jira_created_at") or session_item.get("last_jira_created_at"),
+            "reply": existing_jira_ticket_reply(ticket_key, ticket_url),
+        }
+
+    if jira_status == "creating" and jira_creation_is_stale(session_item):
+        return {
+            **base_result,
+            **preserved_metadata,
+            "lex_state": "Failed",
+            "response_source": "jira",
+            "next_action": None,
+            "jira_status": "create_failed",
+            "jira_error": "stale_jira_creation",
+            "jira_error_code": "stale_jira_creation",
+            "reply": JIRA_CREATE_STALE_REPLY,
+        }
+
+    if jira_status == "creating":
+        return {
+            **base_result,
+            **preserved_metadata,
+            "lex_state": "InProgress",
+            "response_source": "jira",
+            "jira_status": "creating",
+            "reply": JIRA_CREATE_IN_PROGRESS_REPLY,
+        }
+
+    return {
+        **base_result,
+        "reply": JIRA_UNCLEAR_CONFIRMATION_REPLY,
+    }
+
+
 def build_jira_payload(session_item, body, session_id, text, raw_text):
     intent_name = (
         session_item.get("jira_intent_name")
@@ -438,6 +688,9 @@ def build_jira_payload(session_item, body, session_id, text, raw_text):
     request_raw_text = session_item.get("last_raw_user_text") or request_text
 
     return {
+        "jira_request_id": session_item.get("jira_request_id"),
+        "jira_requested_at": session_item.get("jira_requested_at"),
+        "jira_confirmed_at": session_item.get("jira_confirmed_at"),
         "event_id": body.get("event_id"),
         "session_id": session_id,
         "channel": body.get("channel"),
@@ -460,6 +713,7 @@ def build_jira_payload(session_item, body, session_id, text, raw_text):
 
 def handle_jira_confirmation(session_item, body, session_id, text, raw_text):
     decision = classify_jira_confirmation(text)
+    now_iso = to_iso(datetime.now(timezone.utc))
     intent_name = (
         session_item.get("jira_intent_name")
         or session_item.get("lex_intent")
@@ -471,6 +725,16 @@ def handle_jira_confirmation(session_item, body, session_id, text, raw_text):
         or raw_text
         or text
     )
+    jira_request_id = (
+        session_item.get("jira_request_id")
+        or make_jira_request_id(
+            session_id,
+            session_item.get("last_event_id"),
+            intent_name,
+            request_text
+        )
+    )
+    jira_requested_at = session_item.get("jira_requested_at") or session_item.get("updated_at") or now_iso
 
     base_result = {
         "lex_intent": intent_name,
@@ -481,10 +745,23 @@ def handle_jira_confirmation(session_item, body, session_id, text, raw_text):
         "jira_status": "pending_confirmation",
         "jira_intent_name": intent_name,
         "jira_request_text": request_text,
+        "jira_request_id": jira_request_id,
+        "jira_requested_at": jira_requested_at,
+        "jira_confirmed_at": None,
+        "jira_create_started_at": None,
+        "jira_created_at": None,
         "jira_ticket_key": None,
         "jira_ticket_url": None,
         "jira_error": None,
+        "jira_error_code": None,
+        "jira_error_status": None,
+        "last_jira_ticket_key": None,
+        "last_jira_ticket_url": None,
+        "last_jira_created_at": None,
     }
+
+    if session_item.get("jira_status") in {"creating", "created"}:
+        return existing_jira_state_result(session_item, base_result)
 
     if decision == "no":
         return {
@@ -502,20 +779,43 @@ def handle_jira_confirmation(session_item, body, session_id, text, raw_text):
             "reply": JIRA_UNCLEAR_CONFIRMATION_REPLY,
         }
 
+    if not acquire_jira_creation_lock(
+        session_id,
+        jira_request_id,
+        body.get("event_id"),
+        now_iso
+    ):
+        return existing_jira_state_result(get_session_item(session_id), base_result)
+
+    locked_session = {
+        **session_item,
+        "jira_request_id": jira_request_id,
+        "jira_requested_at": jira_requested_at,
+        "jira_confirmed_at": now_iso,
+        "jira_create_started_at": now_iso
+    }
     jira_result = invoke_create_jira_ticket(
-        build_jira_payload(session_item, body, session_id, text, raw_text)
+        build_jira_payload(locked_session, body, session_id, text, raw_text)
     )
 
     if jira_result.get("ok"):
         ticket_key = jira_result.get("ticket_key")
         ticket_url = jira_result.get("ticket_url")
+        jira_created_at = to_iso(datetime.now(timezone.utc))
         return {
             **base_result,
             "lex_state": "Fulfilled",
             "response_source": "jira",
+            "next_action": None,
             "jira_status": "created",
+            "jira_confirmed_at": now_iso,
+            "jira_create_started_at": now_iso,
+            "jira_created_at": jira_created_at,
             "jira_ticket_key": ticket_key,
             "jira_ticket_url": ticket_url,
+            "last_jira_ticket_key": ticket_key,
+            "last_jira_ticket_url": ticket_url,
+            "last_jira_created_at": jira_created_at,
             "reply": jira_ticket_reply(ticket_key, ticket_url),
         }
 
@@ -523,9 +823,14 @@ def handle_jira_confirmation(session_item, body, session_id, text, raw_text):
         **base_result,
         "lex_state": "Failed",
         "response_source": "jira",
+        "next_action": None,
         "jira_status": "create_failed",
+        "jira_confirmed_at": now_iso,
+        "jira_create_started_at": now_iso,
         "jira_error": jira_result.get("error", "unknown_jira_error"),
-        "reply": JIRA_CREATE_FAILED_REPLY,
+        "jira_error_code": jira_result.get("error_code", "jira_create_failed"),
+        "jira_error_status": jira_result.get("status"),
+        "reply": jira_failure_reply(jira_result),
     }
 
 
@@ -586,12 +891,22 @@ def process_record(record):
     jira_status = None
     jira_intent_name = None
     jira_request_text = None
+    jira_request_id = None
+    jira_requested_at = None
+    jira_confirmed_at = None
+    jira_create_started_at = None
+    jira_created_at = None
     jira_ticket_key = None
     jira_ticket_url = None
     jira_error = None
+    jira_error_code = None
+    jira_error_status = None
+    last_jira_ticket_key = None
+    last_jira_ticket_url = None
+    last_jira_created_at = None
     jira_confirmation_handled = False
 
-    if has_pending_jira_confirmation(existing_session):
+    if has_jira_confirmation_state(existing_session, text):
         jira_confirmation_handled = True
         confirmation_result = handle_jira_confirmation(
             existing_session,
@@ -612,9 +927,19 @@ def process_record(record):
         jira_status = confirmation_result["jira_status"]
         jira_intent_name = confirmation_result["jira_intent_name"]
         jira_request_text = confirmation_result["jira_request_text"]
+        jira_request_id = confirmation_result["jira_request_id"]
+        jira_requested_at = confirmation_result["jira_requested_at"]
+        jira_confirmed_at = confirmation_result["jira_confirmed_at"]
+        jira_create_started_at = confirmation_result["jira_create_started_at"]
+        jira_created_at = confirmation_result["jira_created_at"]
         jira_ticket_key = confirmation_result["jira_ticket_key"]
         jira_ticket_url = confirmation_result["jira_ticket_url"]
         jira_error = confirmation_result["jira_error"]
+        jira_error_code = confirmation_result["jira_error_code"]
+        jira_error_status = confirmation_result["jira_error_status"]
+        last_jira_ticket_key = confirmation_result["last_jira_ticket_key"]
+        last_jira_ticket_url = confirmation_result["last_jira_ticket_url"]
+        last_jira_created_at = confirmation_result["last_jira_created_at"]
 
         log_json({
             "level": "INFO",
@@ -623,7 +948,9 @@ def process_record(record):
             "session_id": session_id,
             "decision": classify_jira_confirmation(text),
             "jira_status": jira_status,
-            "jira_ticket_key": jira_ticket_key
+            "jira_request_id": jira_request_id,
+            "jira_ticket_key": jira_ticket_key,
+            "jira_error_code": jira_error_code
         })
 
     elif text:
@@ -730,11 +1057,20 @@ def process_record(record):
     conversation_status = get_conversation_status(lex_state)
     if response_source in {"claude", "claude_failed"}:
         conversation_status = "active"
-    if jira_status == "pending_confirmation":
+    if jira_status in {"pending_confirmation", "creating"}:
         conversation_status = "active"
 
     activity_at_dt = datetime.now(timezone.utc).replace(microsecond=0)
     updated_at = to_iso(activity_at_dt)
+
+    if jira_status == "pending_confirmation":
+        jira_request_id = jira_request_id or make_jira_request_id(
+            session_id,
+            event_id,
+            jira_intent_name or lex_intent,
+            jira_request_text or text
+        )
+        jira_requested_at = jira_requested_at or updated_at
 
     timeout_state = None
     if conversation_status == "active":
@@ -868,6 +1204,51 @@ def process_record(record):
     else:
         remove_attributes.append("jira_request_text")
 
+    if jira_request_id:
+        update_expression += """
+            ,
+            jira_request_id = :jira_request_id
+        """
+        expression_attribute_values[":jira_request_id"] = jira_request_id
+    else:
+        remove_attributes.append("jira_request_id")
+
+    if jira_requested_at:
+        update_expression += """
+            ,
+            jira_requested_at = :jira_requested_at
+        """
+        expression_attribute_values[":jira_requested_at"] = jira_requested_at
+    else:
+        remove_attributes.append("jira_requested_at")
+
+    if jira_confirmed_at:
+        update_expression += """
+            ,
+            jira_confirmed_at = :jira_confirmed_at
+        """
+        expression_attribute_values[":jira_confirmed_at"] = jira_confirmed_at
+    else:
+        remove_attributes.append("jira_confirmed_at")
+
+    if jira_create_started_at:
+        update_expression += """
+            ,
+            jira_create_started_at = :jira_create_started_at
+        """
+        expression_attribute_values[":jira_create_started_at"] = jira_create_started_at
+    else:
+        remove_attributes.append("jira_create_started_at")
+
+    if jira_created_at:
+        update_expression += """
+            ,
+            jira_created_at = :jira_created_at
+        """
+        expression_attribute_values[":jira_created_at"] = jira_created_at
+    else:
+        remove_attributes.append("jira_created_at")
+
     if jira_ticket_key:
         update_expression += """
             ,
@@ -895,6 +1276,45 @@ def process_record(record):
     else:
         remove_attributes.append("jira_error")
 
+    if jira_error_code:
+        update_expression += """
+            ,
+            jira_error_code = :jira_error_code
+        """
+        expression_attribute_values[":jira_error_code"] = jira_error_code
+    else:
+        remove_attributes.append("jira_error_code")
+
+    if jira_error_status:
+        update_expression += """
+            ,
+            jira_error_status = :jira_error_status
+        """
+        expression_attribute_values[":jira_error_status"] = jira_error_status
+    else:
+        remove_attributes.append("jira_error_status")
+
+    if last_jira_ticket_key:
+        update_expression += """
+            ,
+            last_jira_ticket_key = :last_jira_ticket_key
+        """
+        expression_attribute_values[":last_jira_ticket_key"] = last_jira_ticket_key
+
+    if last_jira_ticket_url:
+        update_expression += """
+            ,
+            last_jira_ticket_url = :last_jira_ticket_url
+        """
+        expression_attribute_values[":last_jira_ticket_url"] = last_jira_ticket_url
+
+    if last_jira_created_at:
+        update_expression += """
+            ,
+            last_jira_created_at = :last_jira_created_at
+        """
+        expression_attribute_values[":last_jira_created_at"] = last_jira_created_at
+
     if claude_fallback_error:
         update_expression += """
             ,
@@ -912,6 +1332,8 @@ def process_record(record):
         expression_attribute_values[":claude_model_id"] = claude_model_id
     else:
         remove_attributes.append("claude_model_id")
+
+    remove_attributes = list(dict.fromkeys(remove_attributes))
 
     if remove_attributes:
         update_expression += " REMOVE " + ", ".join(remove_attributes)
@@ -960,9 +1382,11 @@ def process_record(record):
         "next_action": next_action,
         "jira_status": jira_status,
         "jira_intent_name": jira_intent_name,
+        "jira_request_id": jira_request_id,
         "jira_ticket_key": jira_ticket_key,
         "jira_ticket_url": jira_ticket_url,
         "jira_error": jira_error,
+        "jira_error_code": jira_error_code,
         "timeout_status": "scheduled" if timeout_state else "inactive",
         "timeout_due_at": timeout_state["timeout_due_at"] if timeout_state else None,
         "reply_sent": True,
