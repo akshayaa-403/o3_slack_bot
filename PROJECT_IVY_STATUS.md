@@ -1,6 +1,6 @@
 # Project IVY Status
 
-Last updated: 2026-06-22
+Last updated: 2026-06-23
 
 This is the living implementation document for Project IVY. Update it whenever code, AWS wiring, architecture decisions, environment variables, or test behavior changes.
 
@@ -33,6 +33,7 @@ The diagram maps the current code approximately as:
 - `lambda_o3_slack_worker.py` -> early version of `O3_slack_node_handler`
 - `lambda_o3_slack_timeout_handler.py` -> `O3_slack_timeout_handler`
 - `lambda_o3_claude_fallback.py` -> `Claude`
+- `lambda_o3_router.py` -> `O3_lambda_router`
 
 ## Current Implementation
 
@@ -70,6 +71,7 @@ Responsibilities:
 - Refreshes a per-session EventBridge Scheduler prompt schedule after active user messages.
 - Resets stale timeout prompt/close fields when a user resumes an active session.
 - Sends Lex response back to Slack through `chat.postMessage`.
+- Reads Lex fulfillment `sessionAttributes` from the router and stores action metadata in the session record.
 - Invokes Claude fallback through Lambda when Lex fails, returns a fallback intent, or has no useful reply.
 - Stores `response_source`, `claude_fallback_attempted`, and optional Claude/Jira-deferred metadata in the session record.
 - Handles empty user text with a friendly fallback.
@@ -79,7 +81,24 @@ Responsibilities:
 Current gap:
 
 - Worker is still a thin implementation of the diagram's `O3_slack_node_handler`.
-- It does not yet implement image handling, live agent handoff, Jira/Rovo, or router fulfillment.
+- It does not yet implement image handling, live agent handoff, Jira/Rovo, or real Jira fulfillment.
+
+### Lex Intent Import
+
+File: `load_lex_intents_from_excel.py`
+
+Responsibilities:
+
+- Reads `Intents_20_List.xlsx` and loads each row group as a separate Lex V2 intent.
+- Cleans static FAQ responses into readable Lex message groups.
+- Sanitizes Excel intent names that are not Lex-safe.
+- Skips slot-placeholder utterances such as `{DirectoryTask}` for the FAQ import path.
+- Supports `--lambda-mode marked` to enable Lex fulfillment on rows marked `Uses Lambda = Yes`.
+
+Current behavior:
+
+- The initial 21 IVY support intents have been loaded and tested.
+- The 7 imported intents marked `Uses Lambda = Yes` are intended to route to `lambda_o3_router.py`.
 
 ### Claude Fallback
 
@@ -98,6 +117,22 @@ Current behavior:
 - Claude runs only when Lex fails, returns a configured fallback intent, or has no useful reply.
 - If Claude succeeds, the Slack reply comes from Claude and the session stores `response_source=claude`.
 - If Claude fails, no Jira API is called yet; the session stores `next_action=O3_CreateJiraTicket` and `jira_status=deferred`.
+
+### Router Stub
+
+File: `lambda_o3_router.py`
+
+Responsibilities:
+
+- Receives Lex fulfillment events for imported action-style intents.
+- Routes the real imported `Uses Lambda = Yes` intent names to a Jira-deferred stub.
+- Returns a Lex `Close` response with `response_source=router`, `next_action=O3_CreateJiraTicket`, and `jira_status=deferred`.
+- Does not call Jira, Rovo, image recognition, live-agent, or escalation services yet.
+
+Current behavior:
+
+- The router handles `AWSaccount`, `AWSRelatedQueries`, `AccessforCamtasia`, `AccesstoOpsgenie`, `AccessToPCQ`, `AccessToIkbInnovyQCom`, and `AccessToUemGpcloudserviceCom` as deferred Jira-ticket actions.
+- Claude fallback remains separate and only runs when Lex fails, falls back, or returns no useful reply.
 
 ### Slack Timeout Handler
 
@@ -155,6 +190,15 @@ Optional:
 - `CLAUDE_FAILURE_REPLY`, default `I could not resolve this automatically. This should be moved to ticket creation once Jira is connected.`
 - `EMPTY_USER_TEXT_REPLY`, default `Hi, how can I help?`
 - `EMPTY_LEX_REPLY`, default `I could not generate a response for that. Please try rephrasing your message.`
+
+### Router Lambda
+
+Optional:
+
+- `AWS_REGION`, default `ap-southeast-2`
+- `DEFAULT_ROUTER_REPLY`, default `I understood the request, but that action is not wired yet.`
+- `JIRA_DEFERRED_REPLY`, default router response for imported action intents before Jira is wired.
+- `CREATE_JIRA_TICKET_FUNCTION`, `IMAGE_REK_FUNCTION`, `LIVE_AGENT_FUNCTION`, `ESCALATION_FUNCTION`, and `LLM_FALLBACK_FUNCTION` are reserved for later phases.
 
 ### Timeout Handler Lambda
 
@@ -229,15 +273,16 @@ Implemented from diagram:
 - `O3_slack_timeout_handler -> Slack timeout prompt`
 - `O3_slack_timeout_handler -> O3_slack_sessions`
 - `O3_slack_timeout_handler -> O3_slack_summarizer` optional async hook
+- `LEX -> O3_lambda_router`
+- `O3_lambda_router -> O3_CreateJiraTicket` deferred marker only
 - `LEX -> Claude`
 - `Claude -> O3_CreateJiraTicket` deferred marker only
 
 Not implemented yet:
 
 - Actual `O3_slack_summarizer` implementation
-- `LEX -> O3_lambda_router`
 - `LEX -> O3_Escalation`
-- `O3_lambda_router -> O3_CreateJiraTicket`
+- Real `O3_lambda_router -> O3_CreateJiraTicket`
 - `O3_lambda_router -> O3_Image_rek`
 - `O3_lambda_router -> O3_live_agent`
 - `O3_CreateJiraTicket -> Jira + Rovo`
@@ -293,27 +338,38 @@ Manual Claude fallback test:
 - Confirm Slack receives Claude's answer and DynamoDB stores `response_source=claude`.
 - Temporarily break `CLAUDE_FALLBACK_FUNCTION` or Bedrock permission and confirm the session stores `next_action=O3_CreateJiraTicket`, `jira_status=deferred`, and `response_source=claude_failed`.
 
+Manual router stub test:
+
+- Deploy `lambda_o3_router.py` and attach it as the Lex fulfillment Lambda for the alias locale.
+- Re-run `load_lex_intents_from_excel.py` with `--lambda-mode marked`.
+- Send a routed action phrase such as `I need access to PCQ`.
+- Confirm router logs show `router_event_received` and `router_jira_deferred`.
+- Confirm Slack receives the Jira-deferred stub reply.
+- Confirm DynamoDB stores `response_source=router`, `next_action=O3_CreateJiraTicket`, and `jira_status=deferred`.
+- Send a static FAQ phrase such as `reset adam password` and confirm it still stores `response_source=lex`.
+- Send an unknown phrase and confirm Claude fallback still stores `response_source=claude`.
+
 ## Next Work
 
-Planned next phase: deploy and verify Claude fallback in AWS, then begin Lex/router fulfillment and Jira implementation.
+Planned next phase: implement real `O3_CreateJiraTicket`.
 
-Claude deployment checks:
+Jira phase targets:
 
-- Enable Bedrock model access for `anthropic.claude-haiku-4-5-20251001-v1:0` in the Lambda region.
-- Deploy `lambda_o3_claude_fallback.py`.
-- Set `ENABLE_CLAUDE_FALLBACK=true` and `CLAUDE_FALLBACK_FUNCTION` on the worker Lambda.
-- Confirm the worker Lambda role can invoke the Claude fallback Lambda.
-- Confirm the Claude fallback Lambda role can call `bedrock:InvokeModel`.
-- Run the manual Claude fallback test above before starting router or Jira work.
-
-After Claude verification:
-
-- Create `lambda_o3_router.py`.
-- Dispatch by Lex intent name.
-- Stub CreateJiraTicket, ImageRek, LiveAgent, and Escalation handlers.
-- Implement real `O3_CreateJiraTicket` in the Jira phase.
+- Add Jira API configuration and IAM/secret handling.
+- Create Jira tickets from router-deferred action intents.
+- Store Jira ticket key/link/status in `O3_slack_sessions`.
+- Reply to Slack with the created ticket key and link.
+- Keep image recognition, live-agent handoff, and escalation as later phases.
 
 ## Change Log
+
+### 2026-06-23
+
+- Loaded and tested the initial 21 IVY support intents from `Intents_20_List.xlsx`.
+- Added Lex intent loader support for cleaned responses, Lex-safe intent names, skipped slot placeholders, and marked fulfillment hooks.
+- Implemented router stubs for the imported `Uses Lambda = Yes` intents.
+- Added worker support for router-returned Lex `sessionAttributes` so sessions store `response_source=router`, `next_action=O3_CreateJiraTicket`, and `jira_status=deferred`.
+- Documented router-stub AWS wiring and manual tests.
 
 ### 2026-06-22
 

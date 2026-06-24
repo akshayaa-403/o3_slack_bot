@@ -362,6 +362,7 @@ def process_record(record):
 
         session_state = response.get("sessionState", {})
         intent = session_state.get("intent", {})
+        lex_session_attributes = session_state.get("sessionAttributes", {}) or {}
 
         lex_intent = intent.get("name", "UNKNOWN")
         lex_state = intent.get("state", "UNKNOWN")
@@ -371,6 +372,7 @@ def process_record(record):
         lex_intent = "EMPTY_MESSAGE"
         lex_state = "Ignored"
         lex_slots = {}
+        lex_session_attributes = {}
         lex_reply = EMPTY_USER_TEXT_REPLY
         lex_reply_empty = False
 
@@ -381,7 +383,22 @@ def process_record(record):
     next_action = None
     jira_status = None
 
-    if should_use_claude_fallback(text, lex_intent, lex_state, lex_reply_empty):
+    if lex_session_attributes.get("response_source") == "router":
+        response_source = "router"
+        next_action = lex_session_attributes.get("next_action") or None
+        jira_status = lex_session_attributes.get("jira_status") or None
+
+        log_json({
+            "level": "INFO",
+            "message": "worker_router_metadata_received",
+            "event_id": event_id,
+            "session_id": session_id,
+            "lex_intent": lex_intent,
+            "next_action": next_action,
+            "jira_status": jira_status
+        })
+
+    if response_source != "router" and should_use_claude_fallback(text, lex_intent, lex_state, lex_reply_empty):
         claude_fallback_attempted = True
         claude_payload = {
             "event_id": event_id,

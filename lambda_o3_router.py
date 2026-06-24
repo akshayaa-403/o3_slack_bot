@@ -16,29 +16,55 @@ DEFAULT_REPLY = os.environ.get(
     "DEFAULT_ROUTER_REPLY",
     "I understood the request, but that action is not wired yet."
 )
+JIRA_DEFERRED_REPLY = os.environ.get(
+    "JIRA_DEFERRED_REPLY",
+    "I identified this as a request that should become a Jira ticket. Jira is not connected yet, so I have marked it for ticket creation once Jira is wired."
+)
+
+JIRA_DEFERRED_INTENTS = {
+    "AWSaccount",
+    "AWSRelatedQueries",
+    "AccessforCamtasia",
+    "AccesstoOpsgenie",
+    "AccessToPCQ",
+    "AccessToIkbInnovyQCom",
+    "AccessToUemGpcloudserviceCom",
+}
 
 INTENT_ROUTES = {
+    **{
+        intent_name: {
+            "action": "jira_deferred",
+            "stub_reply": JIRA_DEFERRED_REPLY
+        }
+        for intent_name in JIRA_DEFERRED_INTENTS
+    },
     "CreateJiraTicket": {
+        "action": "jira_deferred",
         "function_env": "CREATE_JIRA_TICKET_FUNCTION",
         "function_name": CREATE_JIRA_TICKET_FUNCTION,
-        "stub_reply": "I can help create a Jira ticket. That integration is not wired yet."
+        "stub_reply": JIRA_DEFERRED_REPLY
     },
     "ImageRek": {
+        "action": "invoke_or_stub",
         "function_env": "IMAGE_REK_FUNCTION",
         "function_name": IMAGE_REK_FUNCTION,
         "stub_reply": "I can help analyze the image. That integration is not wired yet."
     },
     "LiveAgent": {
+        "action": "invoke_or_stub",
         "function_env": "LIVE_AGENT_FUNCTION",
         "function_name": LIVE_AGENT_FUNCTION,
         "stub_reply": "I can help connect you to a live agent. That handoff is not wired yet."
     },
     "Escalation": {
+        "action": "invoke_or_stub",
         "function_env": "ESCALATION_FUNCTION",
         "function_name": ESCALATION_FUNCTION,
         "stub_reply": "I can help escalate this request. That escalation path is not wired yet."
     },
     "FallbackToLLM": {
+        "action": "invoke_or_stub",
         "function_env": "LLM_FALLBACK_FUNCTION",
         "function_name": LLM_FALLBACK_FUNCTION,
         "stub_reply": "I can hand this to the fallback assistant. That integration is not wired yet."
@@ -119,6 +145,16 @@ def lex_close_response(intent, session_attributes, message, state="Fulfilled"):
     }
 
 
+def with_jira_deferred_attributes(session_attributes):
+    updated = dict(session_attributes)
+    updated.update({
+        "response_source": "router",
+        "next_action": "O3_CreateJiraTicket",
+        "jira_status": "deferred"
+    })
+    return updated
+
+
 def normalize_downstream_reply(result, fallback):
     if not isinstance(result, dict):
         return fallback
@@ -154,6 +190,18 @@ def route_intent(event):
             "intent_name": intent_name
         })
         return lex_close_response(intent, session_attributes, DEFAULT_REPLY)
+
+    if route.get("action") == "jira_deferred":
+        log_json({
+            "level": "INFO",
+            "message": "router_jira_deferred",
+            "intent_name": intent_name
+        })
+        return lex_close_response(
+            intent,
+            with_jira_deferred_attributes(session_attributes),
+            route["stub_reply"]
+        )
 
     function_name = route["function_name"]
     if not function_name:
