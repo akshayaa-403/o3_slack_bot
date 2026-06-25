@@ -40,9 +40,11 @@ CLAUDE_FALLBACK_INTENTS = {
 }
 CLAUDE_FAILURE_REPLY = os.environ.get(
     "CLAUDE_FAILURE_REPLY",
-    "I could not resolve this automatically. This should be moved to ticket creation once Jira is connected."
+    "I could not resolve this automatically. Do you want me to create a Jira ticket? Reply yes to create it, or no to cancel."
 )
 CREATE_JIRA_TICKET_FUNCTION = os.environ.get("CREATE_JIRA_TICKET_FUNCTION")
+ENABLE_ROVO_ENRICHMENT = os.environ.get("ENABLE_ROVO_ENRICHMENT", "false").lower() == "true"
+ROVO_ENRICHMENT_FUNCTION = os.environ.get("ROVO_ENRICHMENT_FUNCTION")
 JIRA_UNCLEAR_CONFIRMATION_REPLY = os.environ.get(
     "JIRA_UNCLEAR_CONFIRMATION_REPLY",
     "Please reply yes to create the Jira ticket, or no to cancel."
@@ -441,6 +443,57 @@ def invoke_create_jira_ticket(payload):
         }
 
 
+def invoke_rovo_enrichment(payload):
+    if not ENABLE_ROVO_ENRICHMENT:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "disabled"
+        }
+
+    if not ROVO_ENRICHMENT_FUNCTION:
+        return {
+            "ok": False,
+            "error": "missing_rovo_enrichment_function",
+            "error_code": "missing_rovo_enrichment_function"
+        }
+
+    try:
+        response = lambda_client.invoke(
+            FunctionName=ROVO_ENRICHMENT_FUNCTION,
+            InvocationType="Event",
+            Payload=json.dumps(payload).encode("utf-8")
+        )
+
+    except ClientError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "rovo_lambda_invoke_failed"
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "rovo_lambda_invoke_failed"
+        }
+
+    status_code = response.get("StatusCode")
+    if status_code and 200 <= int(status_code) < 300:
+        return {
+            "ok": True,
+            "status_code": status_code
+        }
+
+    return {
+        "ok": False,
+        "error": f"Unexpected Rovo Lambda invoke status: {status_code}",
+        "error_code": "rovo_lambda_invoke_rejected",
+        "status_code": status_code
+    }
+
+
 def get_session_item(session_id):
     response = sessions_table.get_item(
         Key={
@@ -508,6 +561,21 @@ def classify_jira_confirmation(text):
         return "no"
 
     return "unclear"
+
+
+def ensure_jira_confirmation_prompt(reply):
+    prompt = (reply or "").strip()
+
+    if (
+        re.search(r"\byes\b", prompt, flags=re.IGNORECASE)
+        and re.search(r"\bno\b", prompt, flags=re.IGNORECASE)
+    ):
+        return prompt
+
+    if not prompt:
+        return "Do you want me to create a Jira ticket? Reply yes to create it, or no to cancel."
+
+    return f"{prompt} Reply yes to create a Jira ticket, or no to cancel."
 
 
 def jira_ticket_reply(ticket_key, ticket_url):
@@ -711,6 +779,81 @@ def build_jira_payload(session_item, body, session_id, text, raw_text):
     }
 
 
+def build_rovo_payload(
+    body,
+    session_id,
+    lex_intent,
+    lex_state,
+    lex_slots,
+    jira_request_id,
+    jira_requested_at,
+    jira_created_at,
+    jira_ticket_key,
+    jira_ticket_url,
+    jira_request_text,
+    raw_text
+):
+    request_text = jira_request_text or raw_text or body.get("text") or ""
+
+    return {
+        "jira_request_id": jira_request_id,
+        "jira_requested_at": jira_requested_at,
+        "jira_created_at": jira_created_at,
+        "ticket_key": jira_ticket_key,
+        "ticket_url": jira_ticket_url,
+        "session_id": session_id,
+        "channel": body.get("channel"),
+        "user": body.get("user"),
+        "text": request_text,
+        "raw_text": raw_text or request_text,
+        "lex": {
+            "intent": lex_intent,
+            "state": lex_state,
+            "slots": lex_slots or {}
+        },
+        "slack": {
+            "channel": body.get("channel"),
+            "user": body.get("user"),
+            "event_ts": body.get("ts")
+        }
+    }
+
+
+def mark_rovo_invoke_failed(session_id, error, error_code):
+    failed_at = to_iso(datetime.now(timezone.utc))
+
+    try:
+        sessions_table.update_item(
+            Key={
+                "session_id": session_id
+            },
+            UpdateExpression="""
+                SET
+                    rovo_status = :failed,
+                    rovo_error = :error,
+                    rovo_error_code = :error_code,
+                    rovo_enriched_at = :failed_at,
+                    updated_at = :failed_at
+            """,
+            ExpressionAttributeValues={
+                ":failed": "failed",
+                ":error": error,
+                ":error_code": error_code,
+                ":failed_at": failed_at
+            }
+        )
+
+    except Exception as e:
+        log_json({
+            "level": "ERROR",
+            "message": "rovo_invoke_failure_update_failed",
+            "session_id": session_id,
+            "error": str(e),
+            "original_error": error,
+            "original_error_code": error_code
+        })
+
+
 def handle_jira_confirmation(session_item, body, session_id, text, raw_text):
     decision = classify_jira_confirmation(text)
     now_iso = to_iso(datetime.now(timezone.utc))
@@ -758,6 +901,12 @@ def handle_jira_confirmation(session_item, body, session_id, text, raw_text):
         "last_jira_ticket_key": None,
         "last_jira_ticket_url": None,
         "last_jira_created_at": None,
+        "rovo_status": None,
+        "rovo_requested_at": None,
+        "rovo_enriched_at": None,
+        "rovo_error": None,
+        "rovo_error_code": None,
+        "rovo_should_invoke": False,
     }
 
     if session_item.get("jira_status") in {"creating", "created"}:
@@ -816,6 +965,8 @@ def handle_jira_confirmation(session_item, body, session_id, text, raw_text):
             "last_jira_ticket_key": ticket_key,
             "last_jira_ticket_url": ticket_url,
             "last_jira_created_at": jira_created_at,
+            "rovo_status": "pending" if ENABLE_ROVO_ENRICHMENT else None,
+            "rovo_should_invoke": ENABLE_ROVO_ENRICHMENT,
             "reply": jira_ticket_reply(ticket_key, ticket_url),
         }
 
@@ -904,6 +1055,12 @@ def process_record(record):
     last_jira_ticket_key = None
     last_jira_ticket_url = None
     last_jira_created_at = None
+    rovo_status = None
+    rovo_requested_at = None
+    rovo_enriched_at = None
+    rovo_error = None
+    rovo_error_code = None
+    rovo_should_invoke = False
     jira_confirmation_handled = False
 
     if has_jira_confirmation_state(existing_session, text):
@@ -940,6 +1097,12 @@ def process_record(record):
         last_jira_ticket_key = confirmation_result["last_jira_ticket_key"]
         last_jira_ticket_url = confirmation_result["last_jira_ticket_url"]
         last_jira_created_at = confirmation_result["last_jira_created_at"]
+        rovo_status = confirmation_result["rovo_status"]
+        rovo_requested_at = confirmation_result["rovo_requested_at"]
+        rovo_enriched_at = confirmation_result["rovo_enriched_at"]
+        rovo_error = confirmation_result["rovo_error"]
+        rovo_error_code = confirmation_result["rovo_error_code"]
+        rovo_should_invoke = confirmation_result["rovo_should_invoke"]
 
         log_json({
             "level": "INFO",
@@ -1041,12 +1204,14 @@ def process_record(record):
             response_source = "claude_failed"
             claude_fallback_error = claude_result.get("error", "unknown_claude_error")
             next_action = "O3_CreateJiraTicket"
-            jira_status = "deferred"
-            lex_reply = CLAUDE_FAILURE_REPLY
+            jira_status = "pending_confirmation"
+            jira_intent_name = lex_intent or "ClaudeFallback"
+            jira_request_text = text
+            lex_reply = ensure_jira_confirmation_prompt(CLAUDE_FAILURE_REPLY)
 
             log_json({
                 "level": "WARN",
-                "message": "claude_fallback_failed_defer_jira",
+                "message": "claude_fallback_failed_pending_jira_confirmation",
                 "event_id": event_id,
                 "session_id": session_id,
                 "lex_intent": lex_intent,
@@ -1071,6 +1236,9 @@ def process_record(record):
             jira_request_text or text
         )
         jira_requested_at = jira_requested_at or updated_at
+
+    if rovo_should_invoke and rovo_status == "pending":
+        rovo_requested_at = rovo_requested_at or updated_at
 
     timeout_state = None
     if conversation_status == "active":
@@ -1315,6 +1483,50 @@ def process_record(record):
         """
         expression_attribute_values[":last_jira_created_at"] = last_jira_created_at
 
+    if rovo_status:
+        update_expression += """
+            ,
+            rovo_status = :rovo_status
+        """
+        expression_attribute_values[":rovo_status"] = rovo_status
+
+    if rovo_requested_at:
+        update_expression += """
+            ,
+            rovo_requested_at = :rovo_requested_at
+        """
+        expression_attribute_values[":rovo_requested_at"] = rovo_requested_at
+
+    if rovo_enriched_at:
+        update_expression += """
+            ,
+            rovo_enriched_at = :rovo_enriched_at
+        """
+        expression_attribute_values[":rovo_enriched_at"] = rovo_enriched_at
+
+    if rovo_error:
+        update_expression += """
+            ,
+            rovo_error = :rovo_error
+        """
+        expression_attribute_values[":rovo_error"] = rovo_error
+
+    if rovo_error_code:
+        update_expression += """
+            ,
+            rovo_error_code = :rovo_error_code
+        """
+        expression_attribute_values[":rovo_error_code"] = rovo_error_code
+
+    if rovo_status == "pending":
+        remove_attributes.extend([
+            "rovo_enriched_at",
+            "rovo_error",
+            "rovo_error_code",
+            "rovo_summary",
+            "rovo_comment_id"
+        ])
+
     if claude_fallback_error:
         update_expression += """
             ,
@@ -1356,6 +1568,55 @@ def process_record(record):
         ExpressionAttributeValues=expression_attribute_values
     )
 
+    if rovo_should_invoke:
+        rovo_payload = build_rovo_payload(
+            body,
+            session_id,
+            lex_intent,
+            lex_state,
+            lex_slots,
+            jira_request_id,
+            jira_requested_at,
+            jira_created_at,
+            jira_ticket_key,
+            jira_ticket_url,
+            jira_request_text,
+            raw_text
+        )
+        rovo_result = invoke_rovo_enrichment(rovo_payload)
+
+        if rovo_result.get("ok"):
+            log_json({
+                "level": "INFO",
+                "message": "rovo_enrichment_invoked",
+                "event_id": event_id,
+                "session_id": session_id,
+                "jira_request_id": jira_request_id,
+                "ticket_key": jira_ticket_key,
+                "skipped": rovo_result.get("skipped", False)
+            })
+
+        else:
+            mark_rovo_invoke_failed(
+                session_id,
+                rovo_result.get("error", "unknown_rovo_invoke_error"),
+                rovo_result.get("error_code", "rovo_lambda_invoke_failed")
+            )
+            rovo_status = "failed"
+            rovo_error = rovo_result.get("error", "unknown_rovo_invoke_error")
+            rovo_error_code = rovo_result.get("error_code", "rovo_lambda_invoke_failed")
+
+            log_json({
+                "level": "ERROR",
+                "message": "rovo_enrichment_invoke_failed",
+                "event_id": event_id,
+                "session_id": session_id,
+                "jira_request_id": jira_request_id,
+                "ticket_key": jira_ticket_key,
+                "error": rovo_error,
+                "error_code": rovo_error_code
+            })
+
     if timeout_state:
         refresh_timeout_schedule(session_id, timeout_state)
     else:
@@ -1387,6 +1648,9 @@ def process_record(record):
         "jira_ticket_url": jira_ticket_url,
         "jira_error": jira_error,
         "jira_error_code": jira_error_code,
+        "rovo_status": rovo_status,
+        "rovo_error": rovo_error,
+        "rovo_error_code": rovo_error_code,
         "timeout_status": "scheduled" if timeout_state else "inactive",
         "timeout_due_at": timeout_state["timeout_due_at"] if timeout_state else None,
         "reply_sent": True,

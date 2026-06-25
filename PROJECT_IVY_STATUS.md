@@ -35,6 +35,7 @@ The diagram maps the current code approximately as:
 - `lambda_o3_claude_fallback.py` -> `Claude`
 - `lambda_o3_router.py` -> `O3_lambda_router`
 - `lambda_o3_create_jira_ticket.py` -> `O3_CreateJiraTicket`
+- `lambda_o3_rovo_enrichment.py` -> `Rovo` enrichment path
 
 ## Current Implementation
 
@@ -75,8 +76,9 @@ Responsibilities:
 - Reads Lex fulfillment `sessionAttributes` from the router and stores action metadata in the session record.
 - Handles pending Jira ticket confirmations before calling Lex.
 - Invokes the CreateJiraTicket Lambda only after the user confirms ticket creation.
+- Optionally invokes the Rovo enrichment Lambda asynchronously after successful Jira ticket creation.
 - Invokes Claude fallback through Lambda when Lex fails, returns a fallback intent, or has no useful reply.
-- Stores `response_source`, `claude_fallback_attempted`, and optional Claude/Jira-deferred metadata in the session record.
+- Stores `response_source`, `claude_fallback_attempted`, and optional Claude-to-Jira confirmation metadata in the session record.
 - Handles empty user text with a friendly fallback.
 - Handles empty Lex replies with a friendly fallback.
 - Supports SQS partial batch failure response through `batchItemFailures`.
@@ -84,7 +86,7 @@ Responsibilities:
 Current gap:
 
 - Worker is still a thin implementation of the diagram's `O3_slack_node_handler`.
-- It does not yet implement image handling, live agent handoff, Rovo enrichment, or escalation.
+- It does not yet implement image handling, live agent handoff, full Forge Rovo agent integration, or escalation.
 
 ### Lex Intent Import
 
@@ -119,7 +121,7 @@ Current behavior:
 
 - Claude runs only when Lex fails, returns a configured fallback intent, or has no useful reply.
 - If Claude succeeds, the Slack reply comes from Claude and the session stores `response_source=claude`.
-- If Claude fails, no Jira API is called yet; the session stores `next_action=O3_CreateJiraTicket` and `jira_status=deferred`.
+- If Claude fails, no Jira API is called yet; the session stores `next_action=O3_CreateJiraTicket`, `jira_status=pending_confirmation`, and asks the user to reply yes/no before creating a ticket.
 
 ### Router / Jira Confirmation
 
@@ -159,6 +161,24 @@ Current behavior:
 - `no` stores `jira_status=cancelled` without calling Jira.
 - Unclear replies keep `jira_status=pending_confirmation` and ask for yes/no again.
 - Jira API failures return safe Slack messages while detailed diagnostics remain in CloudWatch/session metadata.
+
+### Rovo Enrichment
+
+File: `lambda_o3_rovo_enrichment.py`
+
+Responsibilities:
+
+- Receives an async enrichment payload after Jira ticket creation.
+- Generates a v1 Project IVY enrichment summary and suggested next actions.
+- Adds the enrichment as a Jira comment through Jira Cloud REST API v3.
+- Updates `o3_slack_sessions` with `rovo_status=completed|failed`.
+
+Current behavior:
+
+- Worker stores `rovo_status=pending` and invokes this Lambda asynchronously when `ENABLE_ROVO_ENRICHMENT=true`.
+- Slack replies are not blocked by enrichment.
+- If enrichment fails, `jira_status=created` remains unchanged and only `rovo_status` becomes `failed`.
+- This implements the AWS-side diagram path `O3_CreateJiraTicket -> Rovo`; full Atlassian Forge `rovo:agent` / `action` integration remains a later phase.
 
 ### Slack Timeout Handler
 
@@ -213,8 +233,10 @@ Optional:
 - `ENABLE_CLAUDE_FALLBACK`, default `false`
 - `CLAUDE_FALLBACK_FUNCTION`, required when `ENABLE_CLAUDE_FALLBACK=true`
 - `CLAUDE_FALLBACK_INTENTS`, default `FallbackIntent,AMAZON.FallbackIntent,FallbackToLLM`
-- `CLAUDE_FAILURE_REPLY`, default `I could not resolve this automatically. This should be moved to ticket creation once Jira is connected.`
+- `CLAUDE_FAILURE_REPLY`, default `I could not resolve this automatically. Do you want me to create a Jira ticket? Reply yes to create it, or no to cancel.`
 - `CREATE_JIRA_TICKET_FUNCTION`, required for confirmed Jira ticket creation
+- `ENABLE_ROVO_ENRICHMENT`, default `false`
+- `ROVO_ENRICHMENT_FUNCTION`, required when `ENABLE_ROVO_ENRICHMENT=true`
 - `JIRA_UNCLEAR_CONFIRMATION_REPLY`, default `Please reply yes to create the Jira ticket, or no to cancel.`
 - `JIRA_CANCELLED_REPLY`, default `Cancelled. I did not create a Jira ticket.`
 - `JIRA_CREATE_FAILED_REPLY`, default `I could not create the Jira ticket. Please try again later or contact support.`
@@ -232,6 +254,7 @@ IAM:
 
 - Worker Lambda execution role needs `dynamodb:GetItem` and `dynamodb:UpdateItem` on `O3_slack_sessions`.
 - Worker Lambda execution role needs `lambda:InvokeFunction` on the CreateJiraTicket Lambda.
+- Worker Lambda execution role needs `lambda:InvokeFunction` on the RovoEnrichment Lambda when `ENABLE_ROVO_ENRICHMENT=true`.
 
 ### Router Lambda
 
@@ -269,6 +292,25 @@ Jira secret JSON:
 IAM:
 
 - CreateJiraTicket Lambda execution role needs `secretsmanager:GetSecretValue` for `JIRA_SECRET_ID`.
+
+### RovoEnrichment Lambda
+
+Required:
+
+- `JIRA_SECRET_ID`
+
+Optional:
+
+- `AWS_REGION`, default `ap-southeast-2`
+- `DYNAMODB_TABLE`, default `o3_slack_sessions`
+- `ROVO_MODE`, default `stub`
+- `ROVO_COMMENT_PREFIX`, default `Project IVY enrichment`
+- `ROVO_TIMEOUT_SECONDS`, default `15`
+
+IAM:
+
+- RovoEnrichment Lambda execution role needs `secretsmanager:GetSecretValue` for `JIRA_SECRET_ID`.
+- RovoEnrichment Lambda execution role needs `dynamodb:UpdateItem` on `O3_slack_sessions`.
 
 ### Timeout Handler Lambda
 
@@ -346,8 +388,9 @@ Implemented from diagram:
 - `LEX -> O3_lambda_router`
 - `O3_lambda_router -> O3_CreateJiraTicket` through worker confirmation
 - `O3_CreateJiraTicket -> Jira`
+- `O3_CreateJiraTicket -> Rovo` v1 async enrichment
 - `LEX -> Claude`
-- `Claude -> O3_CreateJiraTicket` deferred marker only
+- `Claude -> O3_CreateJiraTicket` through worker yes/no confirmation
 
 Not implemented yet:
 
@@ -355,7 +398,7 @@ Not implemented yet:
 - `LEX -> O3_Escalation`
 - `O3_lambda_router -> O3_Image_rek`
 - `O3_lambda_router -> O3_live_agent`
-- `O3_CreateJiraTicket -> Rovo`
+- Full Atlassian Forge `rovo:agent` / `action` integration
 - live-agent/on-call tables and locks
 
 ## Testing Notes
@@ -406,7 +449,7 @@ Manual Claude fallback test:
 - Send a Slack DM that Lex cannot answer.
 - Confirm worker logs show `claude_fallback_used` when Claude succeeds.
 - Confirm Slack receives Claude's answer and DynamoDB stores `response_source=claude`.
-- Temporarily break `CLAUDE_FALLBACK_FUNCTION` or Bedrock permission and confirm the session stores `next_action=O3_CreateJiraTicket`, `jira_status=deferred`, and `response_source=claude_failed`.
+- Temporarily break `CLAUDE_FALLBACK_FUNCTION` or Bedrock permission and confirm Slack asks for Jira confirmation while the session stores `next_action=O3_CreateJiraTicket`, `jira_status=pending_confirmation`, and `response_source=claude_failed`.
 
 Manual router/Jira confirmation test:
 
@@ -422,6 +465,8 @@ Manual router/Jira confirmation test:
 - Reply `no` and confirm `jira_status=cancelled` and no Jira ticket is created.
 - Repeat and reply `yes`; confirm Jira ticket creation and `jira_status=created`, `jira_ticket_key`, `jira_ticket_url`, and `jira_request_id`.
 - Reply `yes` again and confirm no duplicate Jira issue is created; Slack should return the existing ticket or in-progress reply.
+- With `ENABLE_ROVO_ENRICHMENT=true`, confirm Jira receives a `Project IVY enrichment` comment and DynamoDB moves from `rovo_status=pending` to `completed`.
+- Temporarily break Jira comment permission and confirm `rovo_status=failed` while `jira_status=created` stays unchanged.
 - Send a static FAQ phrase such as `reset adam password` and confirm it still stores `response_source=lex`.
 - Send an unknown phrase and confirm Claude fallback still stores `response_source=claude`.
 
@@ -434,9 +479,12 @@ Jira deployment checks:
 - Create Jira service account API token.
 - Store Jira secret in Secrets Manager.
 - Deploy `lambda_o3_create_jira_ticket.py`.
+- Deploy `lambda_o3_rovo_enrichment.py`.
 - Set CreateJiraTicket Lambda env vars.
 - Add worker `CREATE_JIRA_TICKET_FUNCTION`.
+- Add worker `ENABLE_ROVO_ENRICHMENT=true` and `ROVO_ENRICHMENT_FUNCTION`.
 - Add IAM permissions for worker invoke and CreateJiraTicket secret read.
+- Add IAM permissions for RovoEnrichment secret read and session update.
 - Run the manual router/Jira confirmation test above.
 - Keep image recognition, live-agent handoff, and escalation as later phases.
 
@@ -452,6 +500,9 @@ Jira deployment checks:
 - Added DynamoDB-backed Jira creation lock with `jira_status=creating` to prevent duplicate tickets from retries or duplicate confirmations.
 - Added durable Jira request metadata: `jira_request_id`, requested/confirmed/started/created timestamps, `jira_error_code`, and `last_jira_ticket_*`.
 - Hardened Jira Lambda errors so Slack gets safe category-specific messages while CloudWatch retains detailed diagnostics.
+- Added `lambda_o3_rovo_enrichment.py` for the diagram's `O3_CreateJiraTicket -> Rovo` enrichment path.
+- Added optional worker async invoke for Rovo enrichment after successful Jira ticket creation.
+- Added Rovo session metadata: `rovo_status`, `rovo_requested_at`, `rovo_enriched_at`, `rovo_error`, and `rovo_error_code`.
 - Documented Jira Secrets Manager configuration, IAM, and manual tests.
 
 ### 2026-06-23
@@ -466,7 +517,7 @@ Jira deployment checks:
 
 - Added `lambda_o3_claude_fallback.py` for Bedrock Claude fallback.
 - Added worker-side Claude fallback invocation for Lex fallback, failed, or empty-reply cases.
-- Added session metadata for `response_source`, Claude fallback attempts, and Jira-deferred failure handling.
+- Added session metadata for `response_source`, Claude fallback attempts, and Claude-to-Jira confirmation handling.
 - Documented Claude fallback environment variables, IAM, and manual AWS tests.
 
 ### 2026-06-21

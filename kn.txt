@@ -139,3 +139,14 @@ Deploy/save Lambda config.
 Test Slack.
 =================
 24/6/26
+Project IVY enrichment
+
+Request type: PCQ access
+User request: I need access to PCQ
+
+Jira ticket already created O3-4: https://innovyq.atlassian.net/browse/O3-4
+Suggested next actions:
+- Verify the user has manager approval.
+- Check whether the user already has PCQ group membership.
+- Assign to the access management queue.
+- Ask user for business justification if missing.
