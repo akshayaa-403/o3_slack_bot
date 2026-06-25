@@ -29,6 +29,7 @@ SCHEDULER_ROLE_ARN = os.environ.get("SCHEDULER_ROLE_ARN")
 SCHEDULER_GROUP_NAME = os.environ.get("SCHEDULER_GROUP_NAME", "default")
 SCHEDULER_NAME_PREFIX = os.environ.get("SCHEDULER_NAME_PREFIX", "o3-slack-timeout")
 ENABLE_CLAUDE_FALLBACK = os.environ.get("ENABLE_CLAUDE_FALLBACK", "false").lower() == "true"
+AUTO_CLAUDE_FALLBACK_ENABLED = os.environ.get("AUTO_CLAUDE_FALLBACK_ENABLED", "false").lower() == "true"
 CLAUDE_FALLBACK_FUNCTION = os.environ.get("CLAUDE_FALLBACK_FUNCTION")
 CLAUDE_FALLBACK_INTENTS = {
     intent_name.strip()
@@ -84,6 +85,43 @@ EMPTY_LEX_REPLY = os.environ.get(
     "EMPTY_LEX_REPLY",
     "I could not generate a response for that. Please try rephrasing your message."
 )
+LEX_ASSISTANCE_PROMPT_TEXT = os.environ.get(
+    "LEX_ASSISTANCE_PROMPT_TEXT",
+    "Was this helpful?"
+)
+LEX_ASSISTANCE_CLOSED_REPLY = os.environ.get(
+    "LEX_ASSISTANCE_CLOSED_REPLY",
+    "Okay, I will close this for now."
+)
+LEX_ASSISTANCE_DETAILS_PROMPT_TEXT = os.environ.get(
+    "LEX_ASSISTANCE_DETAILS_PROMPT_TEXT",
+    "What still failed? Please include the error message or the step where you are blocked."
+)
+CLAUDE_FINAL_ACTION_PROMPT_TEXT = os.environ.get(
+    "CLAUDE_FINAL_ACTION_PROMPT_TEXT",
+    "Would you like live agent support or a Jira ticket?"
+)
+CLAUDE_UNRESOLVED_REPLY = os.environ.get(
+    "CLAUDE_UNRESOLVED_REPLY",
+    "I could not resolve this automatically."
+)
+LIVE_AGENT_DEFERRED_REPLY = os.environ.get(
+    "LIVE_AGENT_DEFERRED_REPLY",
+    "I have marked this for live agent support. Live-agent handoff is not wired yet."
+)
+
+NEXT_ACTION_CREATE_JIRA_TICKET = "O3_CreateJiraTicket"
+NEXT_ACTION_CLAUDE_ASSISTANCE = "O3_ClaudeFurtherAssistance"
+NEXT_ACTION_FINAL_SUPPORT_OPTIONS = "O3_FinalSupportOptions"
+NEXT_ACTION_LIVE_AGENT_SUPPORT = "O3_LiveAgentSupport"
+
+ACTION_ID_ASSISTANCE_YES = "ivy_assistance_yes"
+ACTION_ID_ASSISTANCE_NO = "ivy_assistance_no"
+ACTION_ID_ASSISTANCE_SOLVED = "ivy_assistance_solved"
+ACTION_ID_ASSISTANCE_NEED_MORE_HELP = "ivy_assistance_need_more_help"
+ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET = "ivy_assistance_create_jira_ticket"
+ACTION_ID_LIVE_AGENT_SUPPORT = "ivy_live_agent_support"
+ACTION_ID_CREATE_JIRA_TICKET = "ivy_create_jira_ticket"
 
 JIRA_CONFIRM_YES = {
     "yes",
@@ -145,13 +183,18 @@ def log_json(data):
     print(json.dumps(data, default=str))
 
 
-def send_slack_message(channel, text):
+def send_slack_message(channel, text, blocks=None):
     url = "https://slack.com/api/chat.postMessage"
 
-    data = json.dumps({
+    message = {
         "channel": channel,
         "text": text
-    }).encode("utf-8")
+    }
+
+    if blocks:
+        message["blocks"] = blocks
+
+    data = json.dumps(message).encode("utf-8")
 
     req = urllib.request.Request(
         url,
@@ -170,6 +213,120 @@ def send_slack_message(channel, text):
         raise Exception(f"Slack API error: {result.get('error')}")
 
     return result
+
+
+def slack_mrkdwn(text, limit=2900):
+    value = (text or "").strip()
+
+    if len(value) <= limit:
+        return value
+
+    return value[:limit - 3].rstrip() + "..."
+
+
+def assistance_reply_text(lex_reply):
+    return f"{(lex_reply or '').strip()}\n\n{LEX_ASSISTANCE_PROMPT_TEXT}"
+
+
+def assistance_blocks(lex_reply):
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": slack_mrkdwn(lex_reply)
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": LEX_ASSISTANCE_PROMPT_TEXT
+            }
+        },
+        {
+            "type": "actions",
+            "block_id": "ivy_assistance_actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Solved"
+                    },
+                    "action_id": ACTION_ID_ASSISTANCE_SOLVED,
+                    "value": "solved"
+                },
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Need more help"
+                    },
+                    "action_id": ACTION_ID_ASSISTANCE_NEED_MORE_HELP,
+                    "value": "need_more_help"
+                },
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Create Jira ticket"
+                    },
+                    "style": "primary",
+                    "action_id": ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET,
+                    "value": "create_jira_ticket"
+                }
+            ]
+        }
+    ]
+
+
+def final_support_reply_text(reply):
+    return f"{(reply or '').strip()}\n\n{CLAUDE_FINAL_ACTION_PROMPT_TEXT}"
+
+
+def final_support_blocks(reply):
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": slack_mrkdwn(reply)
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": CLAUDE_FINAL_ACTION_PROMPT_TEXT
+            }
+        },
+        {
+            "type": "actions",
+            "block_id": "ivy_final_support_actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Live agent support"
+                    },
+                    "action_id": ACTION_ID_LIVE_AGENT_SUPPORT,
+                    "value": "live_agent_support"
+                },
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Create Jira ticket"
+                    },
+                    "style": "primary",
+                    "action_id": ACTION_ID_CREATE_JIRA_TICKET,
+                    "value": "create_jira_ticket"
+                }
+            ]
+        }
+    ]
 
 
 def simplify_slot(slot):
@@ -505,8 +662,29 @@ def get_session_item(session_id):
 
 def has_pending_jira_confirmation(session_item):
     return (
-        session_item.get("next_action") == "O3_CreateJiraTicket"
+        session_item.get("next_action") == NEXT_ACTION_CREATE_JIRA_TICKET
         and session_item.get("jira_status") == "pending_confirmation"
+    )
+
+
+def has_pending_assistance_confirmation(session_item):
+    return (
+        session_item.get("next_action") == NEXT_ACTION_CLAUDE_ASSISTANCE
+        and session_item.get("assistance_status") == "pending_confirmation"
+    )
+
+
+def has_pending_assistance_details(session_item):
+    return (
+        session_item.get("next_action") == NEXT_ACTION_CLAUDE_ASSISTANCE
+        and session_item.get("assistance_status") == "awaiting_details"
+    )
+
+
+def has_pending_final_support_options(session_item):
+    return (
+        session_item.get("next_action") == NEXT_ACTION_FINAL_SUPPORT_OPTIONS
+        and session_item.get("support_options_status") == "pending"
     )
 
 
@@ -779,6 +957,17 @@ def build_jira_payload(session_item, body, session_id, text, raw_text):
     }
 
 
+def split_rovo_support_text(text):
+    value = (text or "").strip()
+    marker = "\n\nUser follow-up:\n"
+
+    if value.startswith("Original question:\n") and marker in value:
+        original, followup = value[len("Original question:\n"):].split(marker, 1)
+        return original.strip(), followup.strip()
+
+    return value, ""
+
+
 def build_rovo_payload(
     body,
     session_id,
@@ -791,9 +980,19 @@ def build_rovo_payload(
     jira_ticket_key,
     jira_ticket_url,
     jira_request_text,
-    raw_text
+    raw_text,
+    support_original_text_value=None,
+    support_raw_text_value=None,
+    support_lex_reply=None,
+    support_claude_reply=None,
+    support_claude_error=None,
 ):
-    request_text = jira_request_text or raw_text or body.get("text") or ""
+    support_original, user_followup = split_rovo_support_text(support_original_text_value)
+    support_raw, raw_followup = split_rovo_support_text(support_raw_text_value)
+    original_request = support_original or jira_request_text or raw_text or body.get("text") or ""
+    original_raw_request = support_raw or raw_text or original_request
+    request_text = jira_request_text or original_request
+    followup_text = user_followup or raw_followup
 
     return {
         "jira_request_id": jira_request_id,
@@ -805,7 +1004,18 @@ def build_rovo_payload(
         "channel": body.get("channel"),
         "user": body.get("user"),
         "text": request_text,
-        "raw_text": raw_text or request_text,
+        "raw_text": raw_text or original_raw_request or request_text,
+        "request": {
+            "original_text": original_request,
+            "raw_text": original_raw_request,
+            "user_followup": followup_text,
+            "jira_request_text": jira_request_text or request_text,
+        },
+        "answers": {
+            "lex_answer_shown": support_lex_reply,
+            "claude_answer": support_claude_reply,
+            "claude_error": support_claude_error,
+        },
         "lex": {
             "intent": lex_intent,
             "state": lex_state,
@@ -852,6 +1062,510 @@ def mark_rovo_invoke_failed(session_id, error, error_code):
             "original_error": error,
             "original_error_code": error_code
         })
+
+
+def base_interactive_result(session_item):
+    return {
+        "lex_intent": session_item.get("lex_intent") or "INTERACTIVE_ACTION",
+        "lex_state": "InProgress",
+        "lex_slots": session_item.get("lex_slots", {}),
+        "response_source": "interactive_action",
+        "next_action": None,
+        "reply": "That action is no longer active. Please send a new message.",
+        "blocks": None,
+        "jira_status": None,
+        "jira_intent_name": None,
+        "jira_request_text": None,
+        "jira_request_id": None,
+        "jira_requested_at": None,
+        "jira_confirmed_at": None,
+        "jira_create_started_at": None,
+        "jira_created_at": None,
+        "jira_ticket_key": None,
+        "jira_ticket_url": None,
+        "jira_error": None,
+        "jira_error_code": None,
+        "jira_error_status": None,
+        "last_jira_ticket_key": None,
+        "last_jira_ticket_url": None,
+        "last_jira_created_at": None,
+        "rovo_status": None,
+        "rovo_requested_at": None,
+        "rovo_enriched_at": None,
+        "rovo_error": None,
+        "rovo_error_code": None,
+        "rovo_should_invoke": False,
+        "claude_fallback_attempted": False,
+        "claude_fallback_error": None,
+        "claude_model_id": None,
+        "assistance_status": None,
+        "assistance_original_text": None,
+        "assistance_raw_text": None,
+        "assistance_lex_intent": None,
+        "assistance_lex_state": None,
+        "assistance_lex_slots": None,
+        "assistance_lex_reply": None,
+        "assistance_requested_at": None,
+        "assistance_closed_at": None,
+        "assistance_resolved_at": None,
+        "support_options_status": None,
+        "support_original_text": None,
+        "support_raw_text": None,
+        "support_lex_intent": None,
+        "support_lex_state": None,
+        "support_lex_slots": None,
+        "support_lex_reply": None,
+        "support_claude_reply": None,
+        "support_claude_error": None,
+        "support_requested_at": None,
+        "support_resolved_at": None,
+        "live_agent_status": None,
+        "live_agent_requested_at": None,
+    }
+
+
+def build_assistance_claude_payload(session_item, body, session_id, followup_text=None, followup_raw_text=None):
+    original_text = (
+        session_item.get("assistance_original_text")
+        or session_item.get("last_user_text")
+        or ""
+    )
+    raw_text = (
+        session_item.get("assistance_raw_text")
+        or session_item.get("last_raw_user_text")
+        or original_text
+    )
+    lex_reply = (
+        session_item.get("assistance_lex_reply")
+        or session_item.get("last_bot_reply")
+        or ""
+    )
+    user_followup = (followup_text or session_item.get("assistance_followup_text") or original_text).strip()
+    raw_followup = followup_raw_text or session_item.get("assistance_followup_raw_text") or user_followup
+
+    return {
+        "event_id": body.get("event_id"),
+        "session_id": session_id,
+        "channel": body.get("channel"),
+        "channel_type": body.get("channel_type"),
+        "routing_reason": "lex_assistance_details",
+        "user": body.get("user"),
+        "text": user_followup,
+        "raw_text": raw_followup,
+        "lex": {
+            "intent": session_item.get("assistance_lex_intent") or session_item.get("lex_intent"),
+            "state": session_item.get("assistance_lex_state") or session_item.get("lex_state"),
+            "slots": session_item.get("assistance_lex_slots") or session_item.get("lex_slots", {}),
+            "reply": slack_mrkdwn(lex_reply, 900)
+        },
+        "assistance": {
+            "original_question": original_text,
+            "user_followup": user_followup,
+            "lex_answer_summary": slack_mrkdwn(lex_reply, 900)
+        },
+        "session": {
+            "conversation_status": "active",
+            "trigger": "lex_assistance_details"
+        }
+    }
+
+
+def support_original_text(session_item):
+    return (
+        session_item.get("support_original_text")
+        or session_item.get("assistance_original_text")
+        or session_item.get("jira_request_text")
+        or session_item.get("last_user_text")
+        or ""
+    )
+
+
+def support_raw_text(session_item):
+    return (
+        session_item.get("support_raw_text")
+        or session_item.get("assistance_raw_text")
+        or session_item.get("last_raw_user_text")
+        or support_original_text(session_item)
+    )
+
+
+def build_support_jira_request_text(session_item):
+    parts = []
+    original_text = support_original_text(session_item)
+    lex_reply = session_item.get("support_lex_reply") or session_item.get("assistance_lex_reply")
+    claude_reply = session_item.get("support_claude_reply")
+    claude_error = session_item.get("support_claude_error")
+
+    if original_text:
+        parts.append(f"User request:\n{original_text}")
+
+    if lex_reply:
+        parts.append(f"Lex answer already shown:\n{lex_reply}")
+
+    if claude_reply:
+        parts.append(f"Claude follow-up answer:\n{claude_reply}")
+    elif claude_error:
+        parts.append(f"Claude follow-up result:\nUnable to resolve automatically ({claude_error}).")
+
+    return "\n\n".join(parts) or original_text or "User requested support from IVY."
+
+
+def build_final_support_result(session_item, claude_result, now_iso):
+    result = base_interactive_result(session_item)
+    original_text = (
+        session_item.get("assistance_original_text")
+        or session_item.get("support_original_text")
+        or session_item.get("last_user_text")
+        or ""
+    )
+    raw_text = (
+        session_item.get("assistance_raw_text")
+        or session_item.get("support_raw_text")
+        or session_item.get("last_raw_user_text")
+        or original_text
+    )
+    followup_text = session_item.get("assistance_followup_text")
+    followup_raw_text = session_item.get("assistance_followup_raw_text") or followup_text
+    lex_reply = (
+        session_item.get("assistance_lex_reply")
+        or session_item.get("support_lex_reply")
+        or session_item.get("last_bot_reply")
+        or ""
+    )
+    claude_reply = (claude_result.get("reply") or "").strip()
+    claude_ok = bool(claude_result.get("ok") and claude_reply)
+    final_answer = claude_reply if claude_ok else CLAUDE_UNRESOLVED_REPLY
+    support_text = original_text
+    support_raw = raw_text
+
+    if followup_text:
+        support_text = "\n\n".join([
+            f"Original question:\n{original_text}",
+            f"User follow-up:\n{followup_text}"
+        ])
+        support_raw = "\n\n".join([
+            f"Original question:\n{raw_text}",
+            f"User follow-up:\n{followup_raw_text}"
+        ])
+
+    result.update({
+        "lex_intent": session_item.get("assistance_lex_intent") or session_item.get("lex_intent") or "ClaudeAssistance",
+        "lex_state": "Fulfilled" if claude_ok else "Failed",
+        "lex_slots": session_item.get("assistance_lex_slots") or session_item.get("lex_slots", {}),
+        "response_source": "claude" if claude_ok else "claude_failed",
+        "next_action": NEXT_ACTION_FINAL_SUPPORT_OPTIONS,
+        "reply": final_support_reply_text(final_answer),
+        "blocks": final_support_blocks(final_answer),
+        "claude_fallback_attempted": True,
+        "claude_fallback_error": None if claude_ok else claude_result.get("error", "unknown_claude_error"),
+        "claude_model_id": claude_result.get("model_id"),
+        "assistance_resolved_at": now_iso,
+        "support_options_status": "pending",
+        "support_original_text": support_text,
+        "support_raw_text": support_raw,
+        "support_lex_intent": session_item.get("assistance_lex_intent") or session_item.get("lex_intent"),
+        "support_lex_state": session_item.get("assistance_lex_state") or session_item.get("lex_state"),
+        "support_lex_slots": session_item.get("assistance_lex_slots") or session_item.get("lex_slots", {}),
+        "support_lex_reply": lex_reply,
+        "support_claude_reply": claude_reply if claude_ok else None,
+        "support_claude_error": None if claude_ok else claude_result.get("error", "unknown_claude_error"),
+        "support_requested_at": now_iso,
+    })
+    return result
+
+
+def acquire_support_jira_creation_lock(session_id, jira_request_id, event_id, now_iso):
+    try:
+        sessions_table.update_item(
+            Key={
+                "session_id": session_id
+            },
+            UpdateExpression="""
+                SET
+                    next_action = :jira_next_action,
+                    support_options_status = :creating_jira,
+                    jira_status = :creating,
+                    jira_request_id = :jira_request_id,
+                    jira_confirm_event_id = :event_id,
+                    jira_confirmed_at = :now,
+                    jira_create_started_at = :now,
+                    updated_at = :now
+                REMOVE
+                    jira_error,
+                    jira_error_code,
+                    jira_error_status
+            """,
+            ConditionExpression="""
+                (
+                    next_action = :support_next_action
+                    AND support_options_status = :support_pending
+                )
+                OR (
+                    next_action = :assistance_next_action
+                    AND assistance_status IN (:assistance_pending_confirmation, :awaiting_details)
+                )
+            """,
+            ExpressionAttributeValues={
+                ":jira_next_action": NEXT_ACTION_CREATE_JIRA_TICKET,
+                ":support_next_action": NEXT_ACTION_FINAL_SUPPORT_OPTIONS,
+                ":assistance_next_action": NEXT_ACTION_CLAUDE_ASSISTANCE,
+                ":creating_jira": "creating_jira",
+                ":creating": "creating",
+                ":jira_request_id": jira_request_id,
+                ":event_id": event_id or "unknown-event",
+                ":now": now_iso,
+                ":support_pending": "pending",
+                ":assistance_pending_confirmation": "pending_confirmation",
+                ":awaiting_details": "awaiting_details"
+            }
+        )
+
+        log_json({
+            "level": "INFO",
+            "message": "support_jira_creation_lock_acquired",
+            "session_id": session_id,
+            "jira_request_id": jira_request_id
+        })
+        return True
+
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            log_json({
+                "level": "INFO",
+                "message": "support_jira_creation_lock_conflict",
+                "session_id": session_id,
+                "jira_request_id": jira_request_id
+            })
+            return False
+
+        raise
+
+
+def handle_support_create_jira(session_item, body, session_id, now_iso):
+    result = base_interactive_result(session_item)
+    intent_name = (
+        session_item.get("support_lex_intent")
+        or session_item.get("assistance_lex_intent")
+        or session_item.get("lex_intent")
+        or "ClaudeAssistance"
+    )
+    request_text = build_support_jira_request_text(session_item)
+    jira_request_id = (
+        session_item.get("jira_request_id")
+        or make_jira_request_id(
+            session_id,
+            session_item.get("last_event_id") or body.get("event_id"),
+            intent_name,
+            request_text
+        )
+    )
+    jira_requested_at = (
+        session_item.get("jira_requested_at")
+        or session_item.get("support_requested_at")
+        or now_iso
+    )
+
+    result.update({
+        "lex_intent": intent_name,
+        "lex_state": "InProgress",
+        "lex_slots": session_item.get("support_lex_slots") or session_item.get("lex_slots", {}),
+        "response_source": "jira",
+        "next_action": NEXT_ACTION_CREATE_JIRA_TICKET,
+        "jira_status": "creating",
+        "jira_intent_name": intent_name,
+        "jira_request_text": request_text,
+        "jira_request_id": jira_request_id,
+        "jira_requested_at": jira_requested_at,
+        "jira_confirmed_at": now_iso,
+        "jira_create_started_at": now_iso,
+        "support_options_status": "creating_jira",
+        "support_original_text": session_item.get("support_original_text"),
+        "support_raw_text": session_item.get("support_raw_text"),
+        "support_lex_intent": session_item.get("support_lex_intent"),
+        "support_lex_state": session_item.get("support_lex_state"),
+        "support_lex_slots": session_item.get("support_lex_slots"),
+        "support_lex_reply": session_item.get("support_lex_reply"),
+        "support_claude_reply": session_item.get("support_claude_reply"),
+        "support_claude_error": session_item.get("support_claude_error"),
+        "support_requested_at": session_item.get("support_requested_at") or jira_requested_at,
+    })
+
+    if session_item.get("jira_status") in {"creating", "created"}:
+        return existing_jira_state_result(session_item, result)
+
+    if not (
+        has_pending_final_support_options(session_item)
+        or has_pending_assistance_confirmation(session_item)
+        or has_pending_assistance_details(session_item)
+    ):
+        result.update({
+            "lex_state": "Ignored",
+            "response_source": "interactive_stale",
+            "next_action": None,
+            "jira_status": None,
+            "reply": "That Jira ticket action is no longer active. Please send a new message."
+        })
+        return result
+
+    if not acquire_support_jira_creation_lock(
+        session_id,
+        jira_request_id,
+        body.get("event_id"),
+        now_iso
+    ):
+        latest_session = get_session_item(session_id)
+        if latest_session.get("jira_status") in {"creating", "created"}:
+            return existing_jira_state_result(latest_session, result)
+
+        result.update({
+            "lex_state": "Ignored",
+            "response_source": "interactive_stale",
+            "next_action": None,
+            "jira_status": None,
+            "reply": "That Jira ticket action is no longer active. Please send a new message."
+        })
+        return result
+
+    locked_session = {
+        **session_item,
+        "jira_request_id": jira_request_id,
+        "jira_requested_at": jira_requested_at,
+        "jira_confirmed_at": now_iso,
+        "jira_create_started_at": now_iso,
+        "jira_intent_name": intent_name,
+        "jira_request_text": request_text,
+        "last_raw_user_text": support_raw_text(session_item)
+    }
+    jira_result = invoke_create_jira_ticket(
+        build_jira_payload(
+            locked_session,
+            body,
+            session_id,
+            body.get("action_value") or body.get("text") or "create_jira_ticket",
+            support_raw_text(session_item)
+        )
+    )
+
+    if jira_result.get("ok"):
+        ticket_key = jira_result.get("ticket_key")
+        ticket_url = jira_result.get("ticket_url")
+        jira_created_at = to_iso(datetime.now(timezone.utc))
+        result.update({
+            "lex_state": "Fulfilled",
+            "next_action": None,
+            "jira_status": "created",
+            "jira_created_at": jira_created_at,
+            "jira_ticket_key": ticket_key,
+            "jira_ticket_url": ticket_url,
+            "last_jira_ticket_key": ticket_key,
+            "last_jira_ticket_url": ticket_url,
+            "last_jira_created_at": jira_created_at,
+            "rovo_status": "pending" if ENABLE_ROVO_ENRICHMENT else None,
+            "rovo_should_invoke": ENABLE_ROVO_ENRICHMENT,
+            "support_options_status": "jira_created",
+            "support_resolved_at": jira_created_at,
+            "reply": jira_ticket_reply(ticket_key, ticket_url),
+        })
+        return result
+
+    result.update({
+        "lex_state": "Failed",
+        "next_action": None,
+        "jira_status": "create_failed",
+        "jira_error": jira_result.get("error", "unknown_jira_error"),
+        "jira_error_code": jira_result.get("error_code", "jira_create_failed"),
+        "jira_error_status": jira_result.get("status"),
+        "support_options_status": "jira_create_failed",
+        "support_resolved_at": now_iso,
+        "reply": jira_failure_reply(jira_result),
+    })
+    return result
+
+
+def handle_interactive_action(session_item, body, session_id):
+    action_id = body.get("action_id")
+    now_iso = to_iso(datetime.now(timezone.utc))
+    result = base_interactive_result(session_item)
+
+    if action_id in {ACTION_ID_ASSISTANCE_NO, ACTION_ID_ASSISTANCE_SOLVED}:
+        if not (
+            has_pending_assistance_confirmation(session_item)
+            or has_pending_assistance_details(session_item)
+        ):
+            return result
+
+        result.update({
+            "lex_state": "Fulfilled",
+            "response_source": "assistance_closed",
+            "reply": LEX_ASSISTANCE_CLOSED_REPLY,
+            "assistance_status": "closed",
+            "assistance_closed_at": now_iso,
+        })
+        return result
+
+    if action_id in {ACTION_ID_ASSISTANCE_YES, ACTION_ID_ASSISTANCE_NEED_MORE_HELP}:
+        if not has_pending_assistance_confirmation(session_item):
+            return result
+
+        result.update({
+            "lex_state": "InProgress",
+            "response_source": "assistance_details_requested",
+            "next_action": NEXT_ACTION_CLAUDE_ASSISTANCE,
+            "reply": LEX_ASSISTANCE_DETAILS_PROMPT_TEXT,
+            "assistance_status": "awaiting_details",
+            "assistance_original_text": session_item.get("assistance_original_text") or session_item.get("last_user_text"),
+            "assistance_raw_text": session_item.get("assistance_raw_text") or session_item.get("last_raw_user_text"),
+            "assistance_lex_intent": session_item.get("assistance_lex_intent") or session_item.get("lex_intent"),
+            "assistance_lex_state": session_item.get("assistance_lex_state") or session_item.get("lex_state"),
+            "assistance_lex_slots": session_item.get("assistance_lex_slots") or session_item.get("lex_slots", {}),
+            "assistance_lex_reply": session_item.get("assistance_lex_reply") or session_item.get("last_bot_reply"),
+            "assistance_requested_at": session_item.get("assistance_requested_at") or now_iso,
+        })
+        return result
+
+    if action_id == ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET:
+        if not (
+            has_pending_assistance_confirmation(session_item)
+            or has_pending_assistance_details(session_item)
+        ):
+            return result
+
+        support_session = {
+            **session_item,
+            "support_original_text": session_item.get("assistance_original_text") or session_item.get("last_user_text"),
+            "support_raw_text": session_item.get("assistance_raw_text") or session_item.get("last_raw_user_text"),
+            "support_lex_intent": session_item.get("assistance_lex_intent") or session_item.get("lex_intent"),
+            "support_lex_state": session_item.get("assistance_lex_state") or session_item.get("lex_state"),
+            "support_lex_slots": session_item.get("assistance_lex_slots") or session_item.get("lex_slots", {}),
+            "support_lex_reply": session_item.get("assistance_lex_reply") or session_item.get("last_bot_reply"),
+            "support_requested_at": session_item.get("assistance_requested_at") or now_iso,
+        }
+        return handle_support_create_jira(support_session, body, session_id, now_iso)
+
+    if action_id == ACTION_ID_LIVE_AGENT_SUPPORT:
+        if not has_pending_final_support_options(session_item):
+            return result
+
+        result.update({
+            "lex_state": "Fulfilled",
+            "response_source": "live_agent",
+            "next_action": NEXT_ACTION_LIVE_AGENT_SUPPORT,
+            "reply": LIVE_AGENT_DEFERRED_REPLY,
+            "support_options_status": "live_agent_deferred",
+            "support_resolved_at": now_iso,
+            "live_agent_status": "deferred",
+            "live_agent_requested_at": now_iso,
+        })
+        return result
+
+    if action_id == ACTION_ID_CREATE_JIRA_TICKET:
+        return handle_support_create_jira(session_item, body, session_id, now_iso)
+
+    result.update({
+        "response_source": "interactive_unknown",
+        "reply": "I could not recognize that action. Please send a new message."
+    })
+    return result
 
 
 def handle_jira_confirmation(session_item, body, session_id, text, raw_text):
@@ -1017,6 +1731,9 @@ def process_record(record):
     event_type = body.get("event_type")
     channel_type = body.get("channel_type")
     routing_reason = body.get("routing_reason")
+    action_id = body.get("action_id")
+    action_value = body.get("action_value")
+    is_interactive_action = event_type == "interactive_action"
 
     session_id = f"{channel}:{user}"
     lex_session_id = session_id
@@ -1030,7 +1747,8 @@ def process_record(record):
         "channel_type": channel_type,
         "routing_reason": routing_reason,
         "user": user,
-        "text": text
+        "text": text,
+        "action_id": action_id
     })
 
     existing_session = get_session_item(session_id)
@@ -1061,9 +1779,182 @@ def process_record(record):
     rovo_error = None
     rovo_error_code = None
     rovo_should_invoke = False
+    assistance_status = None
+    assistance_original_text = None
+    assistance_raw_text = None
+    assistance_lex_intent = None
+    assistance_lex_state = None
+    assistance_lex_slots = None
+    assistance_lex_reply = None
+    assistance_requested_at = None
+    assistance_closed_at = None
+    assistance_resolved_at = None
+    support_options_status = None
+    support_original_text_value = None
+    support_raw_text_value = None
+    support_lex_intent = None
+    support_lex_state = None
+    support_lex_slots = None
+    support_lex_reply = None
+    support_claude_reply = None
+    support_claude_error = None
+    support_requested_at = None
+    support_resolved_at = None
+    live_agent_status = None
+    live_agent_requested_at = None
+    slack_blocks = None
     jira_confirmation_handled = False
+    interactive_action_handled = False
+    assistance_details_handled = False
 
-    if has_jira_confirmation_state(existing_session, text):
+    if is_interactive_action:
+        interactive_action_handled = True
+        interactive_result = handle_interactive_action(
+            existing_session,
+            body,
+            session_id
+        )
+
+        lex_intent = interactive_result["lex_intent"]
+        lex_state = interactive_result["lex_state"]
+        lex_slots = interactive_result["lex_slots"]
+        lex_reply = interactive_result["reply"]
+        slack_blocks = interactive_result.get("blocks")
+        lex_reply_empty = False
+        lex_session_attributes = {}
+        response_source = interactive_result["response_source"]
+        claude_fallback_attempted = interactive_result.get("claude_fallback_attempted", False)
+        claude_fallback_error = interactive_result.get("claude_fallback_error")
+        claude_model_id = interactive_result.get("claude_model_id")
+        next_action = interactive_result.get("next_action")
+        jira_status = interactive_result.get("jira_status")
+        jira_intent_name = interactive_result.get("jira_intent_name")
+        jira_request_text = interactive_result.get("jira_request_text")
+        jira_request_id = interactive_result.get("jira_request_id")
+        jira_requested_at = interactive_result.get("jira_requested_at")
+        jira_confirmed_at = interactive_result.get("jira_confirmed_at")
+        jira_create_started_at = interactive_result.get("jira_create_started_at")
+        jira_created_at = interactive_result.get("jira_created_at")
+        jira_ticket_key = interactive_result.get("jira_ticket_key")
+        jira_ticket_url = interactive_result.get("jira_ticket_url")
+        jira_error = interactive_result.get("jira_error")
+        jira_error_code = interactive_result.get("jira_error_code")
+        jira_error_status = interactive_result.get("jira_error_status")
+        last_jira_ticket_key = interactive_result.get("last_jira_ticket_key")
+        last_jira_ticket_url = interactive_result.get("last_jira_ticket_url")
+        last_jira_created_at = interactive_result.get("last_jira_created_at")
+        rovo_status = interactive_result.get("rovo_status")
+        rovo_requested_at = interactive_result.get("rovo_requested_at")
+        rovo_enriched_at = interactive_result.get("rovo_enriched_at")
+        rovo_error = interactive_result.get("rovo_error")
+        rovo_error_code = interactive_result.get("rovo_error_code")
+        rovo_should_invoke = interactive_result.get("rovo_should_invoke", False)
+        assistance_status = interactive_result.get("assistance_status")
+        assistance_original_text = interactive_result.get("assistance_original_text")
+        assistance_raw_text = interactive_result.get("assistance_raw_text")
+        assistance_lex_intent = interactive_result.get("assistance_lex_intent")
+        assistance_lex_state = interactive_result.get("assistance_lex_state")
+        assistance_lex_slots = interactive_result.get("assistance_lex_slots")
+        assistance_lex_reply = interactive_result.get("assistance_lex_reply")
+        assistance_requested_at = interactive_result.get("assistance_requested_at")
+        assistance_closed_at = interactive_result.get("assistance_closed_at")
+        assistance_resolved_at = interactive_result.get("assistance_resolved_at")
+        support_options_status = interactive_result.get("support_options_status")
+        support_original_text_value = interactive_result.get("support_original_text")
+        support_raw_text_value = interactive_result.get("support_raw_text")
+        support_lex_intent = interactive_result.get("support_lex_intent")
+        support_lex_state = interactive_result.get("support_lex_state")
+        support_lex_slots = interactive_result.get("support_lex_slots")
+        support_lex_reply = interactive_result.get("support_lex_reply")
+        support_claude_reply = interactive_result.get("support_claude_reply")
+        support_claude_error = interactive_result.get("support_claude_error")
+        support_requested_at = interactive_result.get("support_requested_at")
+        support_resolved_at = interactive_result.get("support_resolved_at")
+        live_agent_status = interactive_result.get("live_agent_status")
+        live_agent_requested_at = interactive_result.get("live_agent_requested_at")
+
+        log_json({
+            "level": "INFO",
+            "message": "interactive_action_handled",
+            "event_id": event_id,
+            "session_id": session_id,
+            "action_id": action_id,
+            "action_value": action_value,
+            "response_source": response_source,
+            "next_action": next_action,
+            "support_options_status": support_options_status,
+            "jira_status": jira_status
+        })
+
+    elif has_pending_assistance_details(existing_session) and text:
+        assistance_details_handled = True
+        claude_fallback_attempted = True
+
+        details_session = {
+            **existing_session,
+            "assistance_followup_text": text,
+            "assistance_followup_raw_text": raw_text,
+            "assistance_followup_at": to_iso(datetime.now(timezone.utc)),
+        }
+
+        if ENABLE_CLAUDE_FALLBACK:
+            claude_result = invoke_claude_fallback(
+                build_assistance_claude_payload(
+                    details_session,
+                    body,
+                    session_id,
+                    text,
+                    raw_text
+                )
+            )
+        else:
+            claude_result = {
+                "ok": False,
+                "error": "claude_fallback_disabled"
+            }
+
+        final_support_result = build_final_support_result(
+            details_session,
+            claude_result,
+            to_iso(datetime.now(timezone.utc))
+        )
+
+        lex_intent = final_support_result["lex_intent"]
+        lex_state = final_support_result["lex_state"]
+        lex_slots = final_support_result["lex_slots"]
+        lex_reply = final_support_result["reply"]
+        slack_blocks = final_support_result.get("blocks")
+        lex_reply_empty = False
+        lex_session_attributes = {}
+        response_source = final_support_result["response_source"]
+        claude_fallback_error = final_support_result.get("claude_fallback_error")
+        claude_model_id = final_support_result.get("claude_model_id")
+        next_action = final_support_result.get("next_action")
+        assistance_status = final_support_result.get("assistance_status")
+        assistance_resolved_at = final_support_result.get("assistance_resolved_at")
+        support_options_status = final_support_result.get("support_options_status")
+        support_original_text_value = final_support_result.get("support_original_text")
+        support_raw_text_value = final_support_result.get("support_raw_text")
+        support_lex_intent = final_support_result.get("support_lex_intent")
+        support_lex_state = final_support_result.get("support_lex_state")
+        support_lex_slots = final_support_result.get("support_lex_slots")
+        support_lex_reply = final_support_result.get("support_lex_reply")
+        support_claude_reply = final_support_result.get("support_claude_reply")
+        support_claude_error = final_support_result.get("support_claude_error")
+        support_requested_at = final_support_result.get("support_requested_at")
+
+        log_json({
+            "level": "INFO" if response_source == "claude" else "WARN",
+            "message": "assistance_details_claude_completed",
+            "event_id": event_id,
+            "session_id": session_id,
+            "lex_intent": lex_intent,
+            "response_source": response_source,
+            "model_id": claude_model_id,
+            "error": claude_fallback_error
+        })
+
+    elif has_jira_confirmation_state(existing_session, text):
         jira_confirmation_handled = True
         confirmation_result = handle_jira_confirmation(
             existing_session,
@@ -1159,11 +2050,15 @@ def process_record(record):
         })
 
     if (
-        not jira_confirmation_handled
+        AUTO_CLAUDE_FALLBACK_ENABLED
+        and not interactive_action_handled
+        and not assistance_details_handled
+        and not jira_confirmation_handled
         and response_source != "router"
         and should_use_claude_fallback(text, lex_intent, lex_state, lex_reply_empty)
     ):
         claude_fallback_attempted = True
+        original_lex_reply = lex_reply
         claude_payload = {
             "event_id": event_id,
             "session_id": session_id,
@@ -1184,45 +2079,96 @@ def process_record(record):
             }
         }
         claude_result = invoke_claude_fallback(claude_payload)
-        claude_model_id = claude_result.get("model_id")
+        final_support_session = {
+            **existing_session,
+            "assistance_original_text": text,
+            "assistance_raw_text": raw_text,
+            "assistance_lex_intent": lex_intent,
+            "assistance_lex_state": lex_state,
+            "assistance_lex_slots": lex_slots,
+            "assistance_lex_reply": original_lex_reply,
+            "lex_intent": lex_intent,
+            "lex_state": lex_state,
+            "lex_slots": lex_slots,
+            "last_user_text": text,
+            "last_raw_user_text": raw_text,
+        }
+        final_support_result = build_final_support_result(
+            final_support_session,
+            claude_result,
+            to_iso(datetime.now(timezone.utc))
+        )
 
-        if claude_result.get("ok") and (claude_result.get("reply") or "").strip():
-            lex_reply = claude_result["reply"].strip()
-            response_source = "claude"
+        lex_state = final_support_result["lex_state"]
+        lex_reply = final_support_result["reply"]
+        slack_blocks = final_support_result.get("blocks")
+        response_source = final_support_result["response_source"]
+        claude_fallback_error = final_support_result.get("claude_fallback_error")
+        claude_model_id = final_support_result.get("claude_model_id")
+        next_action = final_support_result.get("next_action")
+        assistance_resolved_at = final_support_result.get("assistance_resolved_at")
+        support_options_status = final_support_result.get("support_options_status")
+        support_original_text_value = final_support_result.get("support_original_text")
+        support_raw_text_value = final_support_result.get("support_raw_text")
+        support_lex_intent = final_support_result.get("support_lex_intent")
+        support_lex_state = final_support_result.get("support_lex_state")
+        support_lex_slots = final_support_result.get("support_lex_slots")
+        support_lex_reply = final_support_result.get("support_lex_reply")
+        support_claude_reply = final_support_result.get("support_claude_reply")
+        support_claude_error = final_support_result.get("support_claude_error")
+        support_requested_at = final_support_result.get("support_requested_at")
 
-            log_json({
-                "level": "INFO",
-                "message": "claude_fallback_used",
-                "event_id": event_id,
-                "session_id": session_id,
-                "lex_intent": lex_intent,
-                "lex_state": lex_state,
-                "model_id": claude_model_id
-            })
+        log_json({
+            "level": "INFO" if response_source == "claude" else "WARN",
+            "message": "claude_fallback_completed_with_final_options",
+            "event_id": event_id,
+            "session_id": session_id,
+            "lex_intent": lex_intent,
+            "lex_state": lex_state,
+            "response_source": response_source,
+            "model_id": claude_model_id,
+            "error": claude_fallback_error
+        })
 
-        else:
-            response_source = "claude_failed"
-            claude_fallback_error = claude_result.get("error", "unknown_claude_error")
-            next_action = "O3_CreateJiraTicket"
-            jira_status = "pending_confirmation"
-            jira_intent_name = lex_intent or "ClaudeFallback"
-            jira_request_text = text
-            lex_reply = ensure_jira_confirmation_prompt(CLAUDE_FAILURE_REPLY)
+    if (
+        not interactive_action_handled
+        and not assistance_details_handled
+        and not jira_confirmation_handled
+        and response_source == "lex"
+        and text
+        and lex_state != "Ignored"
+        and not next_action
+        and not jira_status
+    ):
+        original_lex_reply = lex_reply
+        lex_reply = assistance_reply_text(original_lex_reply)
+        slack_blocks = assistance_blocks(original_lex_reply)
+        next_action = NEXT_ACTION_CLAUDE_ASSISTANCE
+        assistance_status = "pending_confirmation"
+        assistance_original_text = text
+        assistance_raw_text = raw_text
+        assistance_lex_intent = lex_intent
+        assistance_lex_state = lex_state
+        assistance_lex_slots = lex_slots
+        assistance_lex_reply = original_lex_reply
 
-            log_json({
-                "level": "WARN",
-                "message": "claude_fallback_failed_pending_jira_confirmation",
-                "event_id": event_id,
-                "session_id": session_id,
-                "lex_intent": lex_intent,
-                "lex_state": lex_state,
-                "error": claude_fallback_error
-            })
+        log_json({
+            "level": "INFO",
+            "message": "lex_assistance_prompt_added",
+            "event_id": event_id,
+            "session_id": session_id,
+            "lex_intent": lex_intent,
+            "lex_state": lex_state
+        })
 
     conversation_status = get_conversation_status(lex_state)
     if response_source in {"claude", "claude_failed"}:
         conversation_status = "active"
     if jira_status in {"pending_confirmation", "creating"}:
+        conversation_status = "active"
+    if assistance_status in {"pending_confirmation", "awaiting_details"}:
+        conversation_status = "active"
+    if support_options_status in {"pending", "creating_jira"}:
         conversation_status = "active"
 
     activity_at_dt = datetime.now(timezone.utc).replace(microsecond=0)
@@ -1236,6 +2182,15 @@ def process_record(record):
             jira_request_text or text
         )
         jira_requested_at = jira_requested_at or updated_at
+
+    if assistance_status in {"pending_confirmation", "awaiting_details"}:
+        assistance_requested_at = assistance_requested_at or updated_at
+
+    if support_options_status == "pending":
+        support_requested_at = support_requested_at or updated_at
+
+    if live_agent_status == "deferred":
+        live_agent_requested_at = live_agent_requested_at or updated_at
 
     if rovo_should_invoke and rovo_status == "pending":
         rovo_requested_at = rovo_requested_at or updated_at
@@ -1545,6 +2500,43 @@ def process_record(record):
     else:
         remove_attributes.append("claude_model_id")
 
+    support_flow_attributes = {
+        "assistance_status": assistance_status,
+        "assistance_original_text": assistance_original_text,
+        "assistance_raw_text": assistance_raw_text,
+        "assistance_lex_intent": assistance_lex_intent,
+        "assistance_lex_state": assistance_lex_state,
+        "assistance_lex_slots": assistance_lex_slots,
+        "assistance_lex_reply": assistance_lex_reply,
+        "assistance_requested_at": assistance_requested_at,
+        "assistance_closed_at": assistance_closed_at,
+        "assistance_resolved_at": assistance_resolved_at,
+        "support_options_status": support_options_status,
+        "support_original_text": support_original_text_value,
+        "support_raw_text": support_raw_text_value,
+        "support_lex_intent": support_lex_intent,
+        "support_lex_state": support_lex_state,
+        "support_lex_slots": support_lex_slots,
+        "support_lex_reply": support_lex_reply,
+        "support_claude_reply": support_claude_reply,
+        "support_claude_error": support_claude_error,
+        "support_requested_at": support_requested_at,
+        "support_resolved_at": support_resolved_at,
+        "live_agent_status": live_agent_status,
+        "live_agent_requested_at": live_agent_requested_at,
+    }
+
+    for attribute_name, attribute_value in support_flow_attributes.items():
+        if attribute_value is not None:
+            value_name = f":{attribute_name}"
+            update_expression += f"""
+            ,
+            {attribute_name} = {value_name}
+        """
+            expression_attribute_values[value_name] = attribute_value
+        else:
+            remove_attributes.append(attribute_name)
+
     remove_attributes = list(dict.fromkeys(remove_attributes))
 
     if remove_attributes:
@@ -1581,7 +2573,12 @@ def process_record(record):
             jira_ticket_key,
             jira_ticket_url,
             jira_request_text,
-            raw_text
+            raw_text,
+            support_original_text_value,
+            support_raw_text_value,
+            support_lex_reply,
+            support_claude_reply,
+            support_claude_error,
         )
         rovo_result = invoke_rovo_enrichment(rovo_payload)
 
@@ -1623,7 +2620,7 @@ def process_record(record):
         delete_timeout_schedule(session_id, "prompt")
         delete_timeout_schedule(session_id, "close")
 
-    slack_response = send_slack_message(channel, lex_reply)
+    slack_response = send_slack_message(channel, lex_reply, slack_blocks)
 
     log_json({
         "level": "INFO",
@@ -1635,12 +2632,16 @@ def process_record(record):
         "routing_reason": routing_reason,
         "user": user,
         "text": text,
+        "action_id": action_id,
         "lex_intent": lex_intent,
         "lex_state": lex_state,
         "lex_slots": lex_slots,
         "response_source": response_source,
         "claude_fallback_attempted": claude_fallback_attempted,
         "next_action": next_action,
+        "assistance_status": assistance_status,
+        "support_options_status": support_options_status,
+        "live_agent_status": live_agent_status,
         "jira_status": jira_status,
         "jira_intent_name": jira_intent_name,
         "jira_request_id": jira_request_id,

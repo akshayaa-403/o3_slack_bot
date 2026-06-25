@@ -4,6 +4,7 @@ import os
 import hmac
 import hashlib
 import base64
+import urllib.parse
 import boto3
 from botocore.exceptions import ClientError
 
@@ -107,6 +108,109 @@ def clean_slack_text(text):
     return (text or "").strip()
 
 
+def parse_interactive_payload(raw_body):
+    parsed = urllib.parse.parse_qs(raw_body or "", keep_blank_values=True)
+    payload_values = parsed.get("payload")
+
+    if not payload_values:
+        return None
+
+    return json.loads(payload_values[0])
+
+
+def build_interactive_event_id(payload, action):
+    user = payload.get("user", {}) or {}
+    channel = payload.get("channel", {}) or {}
+    container = payload.get("container", {}) or {}
+    raw = "|".join([
+        payload.get("type", ""),
+        payload.get("trigger_id", ""),
+        user.get("id", ""),
+        channel.get("id", ""),
+        container.get("message_ts", ""),
+        action.get("action_id", ""),
+        action.get("action_ts", ""),
+        action.get("value", "")
+    ])
+    return "interactive-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def enqueue_interactive_action(payload):
+    actions = payload.get("actions") or []
+
+    if not actions:
+        log_json({
+            "level": "WARN",
+            "message": "interactive_payload_ignored",
+            "reason": "missing_actions"
+        })
+        return "missing actions"
+
+    action = actions[0]
+    user = payload.get("user", {}) or {}
+    channel = payload.get("channel", {}) or {}
+    message = payload.get("message", {}) or {}
+    container = payload.get("container", {}) or {}
+    action_id = action.get("action_id")
+    action_value = action.get("value") or action_id or ""
+    event_id = build_interactive_event_id(payload, action)
+    now = int(time.time())
+
+    try:
+        dedup_table.put_item(
+            Item={
+                "event_id": event_id,
+                "event_time": now,
+                "created_at": now,
+                "ttl": now + DEDUP_TTL_SECONDS
+            },
+            ConditionExpression="attribute_not_exists(event_id)"
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            log_json({
+                "level": "INFO",
+                "message": "duplicate_interactive_action_ignored",
+                "event_id": event_id,
+                "action_id": action_id
+            })
+            return "duplicate ignored"
+
+        raise
+
+    sqs.send_message(
+        QueueUrl=QUEUE_URL,
+        MessageBody=json.dumps({
+            "event_id": event_id,
+            "channel": channel.get("id"),
+            "text": action_value,
+            "raw_text": action_value,
+            "user": user.get("id"),
+            "ts": action.get("action_ts") or container.get("message_ts") or message.get("ts"),
+            "event_type": "interactive_action",
+            "channel_type": "im" if (channel.get("id") or "").startswith("D") else None,
+            "routing_reason": "interactive_action",
+            "action_id": action_id,
+            "action_value": action_value,
+            "callback_id": payload.get("callback_id") or action.get("block_id"),
+            "message_ts": container.get("message_ts") or message.get("ts"),
+            "response_url": payload.get("response_url"),
+            "trigger_id": payload.get("trigger_id")
+        })
+    )
+
+    log_json({
+        "level": "INFO",
+        "message": "interactive_action_enqueued",
+        "event_id": event_id,
+        "channel": channel.get("id"),
+        "user": user.get("id"),
+        "action_id": action_id,
+        "action_value": action_value
+    })
+    return "OK"
+
+
 def should_process_slack_event(slack_event):
     event_type = slack_event.get("type")
 
@@ -126,6 +230,15 @@ def lambda_handler(event, context):
         return {
             "statusCode": 401,
             "body": "invalid signature"
+        }
+
+    interactive_payload = parse_interactive_payload(raw_body)
+
+    if interactive_payload:
+        result = enqueue_interactive_action(interactive_payload)
+        return {
+            "statusCode": 200,
+            "body": result
         }
 
     body = json.loads(raw_body or "{}")

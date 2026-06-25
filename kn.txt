@@ -150,3 +150,17 @@ Suggested next actions:
 - Check whether the user already has PCQ group membership.
 - Assign to the access management queue.
 - Ask user for business justification if missing.
+==================
+25/6/2026
+| Case | Send This | Expected Bot Behavior | Expected Source |
+|---|---|---|---|
+| Lex FAQ | `How can I reset my InnovyQ ADAM account password?` | Returns ADAM KB/static answer | `response_source=lex` |
+| Lex FAQ | `What can this bot do?` | Returns bot capability answer | `response_source=lex` |
+| Jira request | `I need access to PCQ` | Asks yes/no for Jira ticket | `response_source=router`, `jira_status=pending_confirmation` |
+| Jira yes | `yes` | Creates Jira ticket and returns key/link | `response_source=jira`, `jira_status=created` |
+| Jira cancel | `I need Opsgenie access` then `no` | Cancels, no ticket created | `jira_status=cancelled` |
+| Unclear confirm | `I need access to Camtasia` then `maybe` | Repeats yes/no prompt | `jira_status=pending_confirmation` |
+| Duplicate protection | After ticket created, send `yes` again | Returns existing ticket / no duplicate | `jira_status=created` |
+| Claude success | `My VPN connects but internal apps fail with DNS_PROBE_FINISHED_NXDOMAIN. What should I check?` | Claude gives troubleshooting answer | `response_source=claude` |
+| Claude fail -> Jira | Temporarily break Claude, then send: `The ADAM portal shows a blank page after MFA and the KB does not mention this scenario.` | Bot asks to create Jira ticket | `response_source=claude_failed`, `jira_status=pending_confirmation` |
+| Jira failure handling | Temporarily use wrong Jira project key, then confirm `yes` | Safe failure message, no raw Jira error in Slack | `jira_status=create_failed` |
