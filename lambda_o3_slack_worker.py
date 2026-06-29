@@ -1064,6 +1064,37 @@ def mark_rovo_invoke_failed(session_id, error, error_code):
         })
 
 
+def store_rovo_slack_message_target(session_id, slack_ts, slack_text):
+    if not (session_id and slack_ts):
+        return
+
+    try:
+        sessions_table.update_item(
+            Key={
+                "session_id": session_id
+            },
+            UpdateExpression="""
+                SET
+                    rovo_slack_message_ts = :slack_ts,
+                    rovo_slack_original_text = :slack_text,
+                    updated_at = :updated_at
+            """,
+            ExpressionAttributeValues={
+                ":slack_ts": slack_ts,
+                ":slack_text": slack_text or "",
+                ":updated_at": to_iso(datetime.now(timezone.utc)),
+            }
+        )
+
+    except Exception as e:
+        log_json({
+            "level": "ERROR",
+            "message": "rovo_slack_target_update_failed",
+            "session_id": session_id,
+            "error": str(e),
+        })
+
+
 def base_interactive_result(session_item):
     return {
         "lex_intent": session_item.get("lex_intent") or "INTERACTIVE_ACTION",
@@ -2621,6 +2652,12 @@ def process_record(record):
         delete_timeout_schedule(session_id, "close")
 
     slack_response = send_slack_message(channel, lex_reply, slack_blocks)
+    if rovo_should_invoke and jira_ticket_key:
+        store_rovo_slack_message_target(
+            session_id,
+            slack_response.get("ts"),
+            lex_reply,
+        )
 
     log_json({
         "level": "INFO",
