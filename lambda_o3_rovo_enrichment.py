@@ -100,6 +100,14 @@ STOP_WORDS = {
     "you",
 }
 
+INTENT_SEARCH_ALIASES = {
+    "adamaccpswdreset": [
+        "ADAM Self Service Privileged Account Password Reset",
+        "ADM privileged account password reset",
+        "ADAM password reset",
+    ],
+}
+
 
 def to_iso(dt):
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
@@ -347,6 +355,14 @@ def tokenize_query(*values):
     return tokens
 
 
+def normalized_intent_key(intent_name):
+    return re.sub(r"[^a-z0-9]+", "", text_or_empty(intent_name).lower())
+
+
+def intent_search_aliases(intent_name):
+    return INTENT_SEARCH_ALIASES.get(normalized_intent_key(intent_name), [])
+
+
 def cql_quote(value):
     sanitized = re.sub(r"[^A-Za-z0-9\s._+-]", " ", text_or_empty(value))
     sanitized = compact_whitespace(sanitized)[:180]
@@ -356,11 +372,15 @@ def cql_quote(value):
 
 def build_search_query(context):
     intent_name = context["lex_intent"]
-    keyword_sources = [
-        context["original_text"],
-        context["user_followup"],
-        humanize_intent(intent_name),
-    ]
+    alias_sources = intent_search_aliases(intent_name)
+    if alias_sources:
+        keyword_sources = alias_sources
+    else:
+        keyword_sources = [
+            context["original_text"],
+            context["user_followup"],
+            humanize_intent(intent_name),
+        ]
 
     tokens = tokenize_query(*keyword_sources)
 
