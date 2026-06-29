@@ -1,6 +1,6 @@
 # Project IVY Status
 
-Last updated: 2026-06-24
+Last updated: 2026-06-29
 
 This is the living implementation document for Project IVY. Update it whenever code, AWS wiring, architecture decisions, environment variables, or test behavior changes.
 
@@ -36,6 +36,7 @@ The diagram maps the current code approximately as:
 - `lambda_o3_router.py` -> `O3_lambda_router`
 - `lambda_o3_create_jira_ticket.py` -> `O3_CreateJiraTicket`
 - `lambda_o3_rovo_enrichment.py` -> `Rovo` enrichment path
+- `lambda_o3_image_rek.py` -> `O3_Image_rek` / image-analysis path
 
 ## Current Implementation
 
@@ -77,8 +78,11 @@ Responsibilities:
 - Handles pending Jira ticket confirmations before calling Lex.
 - Invokes the CreateJiraTicket Lambda only after the user confirms ticket creation.
 - Optionally invokes the Rovo enrichment Lambda asynchronously after successful Jira ticket creation.
+- Detects Slack image uploads from DM `file_share` messages and invokes the ImageRek Lambda when `IMAGE_REK_FUNCTION` is configured.
+- Resolves image-derived issues in this order: Rekognition extraction, Lex, Bedrock Knowledge Base, Gemini fallback.
 - Invokes Claude fallback through Lambda when Lex fails, returns a fallback intent, or has no useful reply.
 - Stores `response_source`, `claude_fallback_attempted`, and optional Claude-to-Jira confirmation metadata in the session record.
+- Stores image-flow metadata in DynamoDB, including `image_status`, `image_resolution_source`, `image_requested_at`, `image_analyzed_at`, `image_error`, `image_error_code`, `image_summary`, and `image_files`.
 - Handles empty user text with a friendly fallback.
 - Handles empty Lex replies with a friendly fallback.
 - Supports SQS partial batch failure response through `batchItemFailures`.
@@ -86,7 +90,28 @@ Responsibilities:
 Current gap:
 
 - Worker is still a thin implementation of the diagram's `O3_slack_node_handler`.
-- It does not yet implement image handling, live agent handoff, full Forge Rovo agent integration, or escalation.
+- It does not yet implement live agent handoff, full Forge Rovo agent integration, escalation, or the full image KB/internal DB workflow.
+
+### Image Recognition
+
+File: `lambda_o3_image_rek.py`
+
+Responsibilities:
+
+- Receives Slack image file metadata from the Slack worker.
+- Downloads the private Slack image URL using the Slack bot token.
+- Optionally stores the uploaded image in S3 when `IMAGE_BUCKET` is configured.
+- Runs Amazon Rekognition text and label detection when `ENABLE_REKOGNITION=true`.
+- Returns image-derived context, detected text, labels, and optional S3 object metadata to the worker.
+
+Current behavior:
+
+- Slack handler now allows DM `file_share` messages and forwards simplified image metadata to SQS.
+- Worker extracts image context first, then calls Lex with the screenshot-derived issue text.
+- If Lex cannot resolve the issue, worker calls Bedrock Knowledge Base through `bedrock-agent-runtime.retrieve_and_generate`.
+- If Bedrock KB cannot produce a useful answer, worker calls Gemini as the final fallback.
+- If `IMAGE_REK_FUNCTION` is missing, the worker still records the image event and returns a configured unavailable reply.
+- This implements the `O3_Image_rek -> Lex/KB -> Gemini fallback` path. Dedicated `O3-image-internal-db` persistence is not implemented yet.
 
 ### Lex Intent Import
 
@@ -237,6 +262,15 @@ Optional:
 - `CREATE_JIRA_TICKET_FUNCTION`, required for confirmed Jira ticket creation
 - `ENABLE_ROVO_ENRICHMENT`, default `false`
 - `ROVO_ENRICHMENT_FUNCTION`, required when `ENABLE_ROVO_ENRICHMENT=true`
+- `IMAGE_REK_FUNCTION`, required for Slack image upload analysis
+- `IMAGE_ANALYSIS_UNAVAILABLE_REPLY`, default `I received the image, but image analysis is not configured yet.`
+- `BEDROCK_KNOWLEDGE_BASE_ID`, required for image Bedrock KB fallback
+- `BEDROCK_KB_MODEL_ARN`, required for image Bedrock KB fallback
+- `BEDROCK_KB_NUMBER_OF_RESULTS`, default `5`
+- `BEDROCK_KB_NO_ANSWER_MARKERS`, default no-answer marker list
+- `GEMINI_API_KEY`, required for Gemini fallback
+- `GEMINI_MODEL`, default `gemini-2.5-flash`
+- `GEMINI_TIMEOUT_SECONDS`, default `20`
 - `JIRA_UNCLEAR_CONFIRMATION_REPLY`, default `Please reply yes to create the Jira ticket, or no to cancel.`
 - `JIRA_CANCELLED_REPLY`, default `Cancelled. I did not create a Jira ticket.`
 - `JIRA_CREATE_FAILED_REPLY`, default `I could not create the Jira ticket. Please try again later or contact support.`
@@ -255,6 +289,8 @@ IAM:
 - Worker Lambda execution role needs `dynamodb:GetItem` and `dynamodb:UpdateItem` on `O3_slack_sessions`.
 - Worker Lambda execution role needs `lambda:InvokeFunction` on the CreateJiraTicket Lambda.
 - Worker Lambda execution role needs `lambda:InvokeFunction` on the RovoEnrichment Lambda when `ENABLE_ROVO_ENRICHMENT=true`.
+- Worker Lambda execution role needs `lambda:InvokeFunction` on the ImageRek Lambda when `IMAGE_REK_FUNCTION` is configured.
+- Worker Lambda execution role needs `bedrock:RetrieveAndGenerate` for the configured Bedrock Knowledge Base.
 
 ### Router Lambda
 
@@ -311,6 +347,27 @@ IAM:
 
 - RovoEnrichment Lambda execution role needs `secretsmanager:GetSecretValue` for `JIRA_SECRET_ID`.
 - RovoEnrichment Lambda execution role needs `dynamodb:UpdateItem` on `O3_slack_sessions`.
+
+### ImageRek Lambda
+
+Required:
+
+- `SLACK_BOT_TOKEN`
+
+Optional:
+
+- `AWS_REGION`, default `ap-southeast-2`
+- `IMAGE_BUCKET`, optional S3 bucket for storing Slack images before analysis
+- `IMAGE_PREFIX`, default `slack-images/`
+- `ENABLE_REKOGNITION`, default `true`
+- `MAX_INLINE_REKOGNITION_BYTES`, default `5000000`
+- `REKOGNITION_MAX_LABELS`, default `10`
+- `REKOGNITION_MIN_CONFIDENCE`, default `70`
+
+IAM:
+
+- ImageRek Lambda execution role needs `rekognition:DetectText` and `rekognition:DetectLabels` when `ENABLE_REKOGNITION=true`.
+- ImageRek Lambda execution role needs `s3:PutObject` on `IMAGE_BUCKET` when image storage is enabled.
 
 ### Timeout Handler Lambda
 
@@ -391,12 +448,16 @@ Implemented from diagram:
 - `O3_CreateJiraTicket -> Rovo` v1 async enrichment
 - `LEX -> Claude`
 - `Claude -> O3_CreateJiraTicket` through worker yes/no confirmation
+- `Slack image upload -> O3_slack_queue -> O3_slack_node_handler -> O3_Image_rek`
+- `O3_Image_rek -> Lex -> Bedrock Knowledge Base -> Gemini fallback`
+- `O3_Image_rek -> O3-image` optional S3 storage through `IMAGE_BUCKET`
 
 Not implemented yet:
 
 - Actual `O3_slack_summarizer` implementation
 - `LEX -> O3_Escalation`
-- `O3_lambda_router -> O3_Image_rek`
+- `O3_lambda_router -> O3_Image_rek` for text-only image-analysis intents
+- `O3_Image_rek -> O3-image-internal-db`
 - `O3_lambda_router -> O3_live_agent`
 - Full Atlassian Forge `rovo:agent` / `action` integration
 - live-agent/on-call tables and locks
@@ -406,6 +467,7 @@ Not implemented yet:
 Current known tests/checks:
 
 - Python syntax parsing passed for handler, worker, timeout handler, and Claude fallback after recent edits.
+- Python syntax parsing passed for handler, worker, and image recognition Lambda on 2026-06-29.
 - PDF architecture extraction was run with:
   - PyMuPDF
   - pdfplumber
@@ -470,9 +532,23 @@ Manual router/Jira confirmation test:
 - Send a static FAQ phrase such as `reset adam password` and confirm it still stores `response_source=lex`.
 - Send an unknown phrase and confirm Claude fallback still stores `response_source=claude`.
 
+Manual image test:
+
+- Deploy `lambda_o3_image_rek.py`.
+- Set `IMAGE_REK_FUNCTION` on the worker Lambda.
+- Confirm the worker role can invoke the ImageRek Lambda.
+- Confirm the ImageRek role can call Rekognition and can write to `IMAGE_BUCKET` if configured.
+- Upload a screenshot in a Slack DM to the bot.
+- Confirm handler logs show `image_file_count > 0`.
+- Confirm worker logs show `image_flow_completed`.
+- Confirm Slack receives the Lex answer when Lex can resolve the screenshot-derived issue.
+- Temporarily force Lex fallback and confirm Bedrock KB answers with `response_source=image_bedrock_kb`.
+- Temporarily force Bedrock KB no-answer and confirm Gemini answers with `response_source=image_gemini`.
+- Confirm DynamoDB stores `image_resolution_source=lex|bedrock_knowledge_base|gemini`, `image_status=completed|failed`, `image_files`, and `image_summary` or image error metadata.
+
 ## Next Work
 
-Planned next phase: verify duplicate protection and Jira hardening in AWS, then start Rovo enrichment.
+Planned next phase: deploy and verify the ImageRek -> Lex -> Bedrock KB -> Gemini path in AWS, then add internal image DB persistence.
 
 Jira deployment checks:
 
@@ -486,9 +562,23 @@ Jira deployment checks:
 - Add IAM permissions for worker invoke and CreateJiraTicket secret read.
 - Add IAM permissions for RovoEnrichment secret read and session update.
 - Run the manual router/Jira confirmation test above.
-- Keep image recognition, live-agent handoff, and escalation as later phases.
+- Deploy `lambda_o3_image_rek.py`.
+- Set worker `IMAGE_REK_FUNCTION`.
+- Add IAM permissions for worker image Lambda invoke and ImageRek Rekognition/S3 access.
+- Run the manual image test above.
+- Keep image internal DB persistence, live-agent handoff, and escalation as later phases.
 
 ## Change Log
+
+### 2026-06-29
+
+- Added Slack DM image upload handling for `file_share` messages.
+- Added worker-side ImageRek Lambda invocation for Slack image uploads.
+- Changed the image flow to use screenshot extraction first, Lex resolution second, Bedrock Knowledge Base third, and Gemini final fallback.
+- Changed Gemini fallback configuration to use only direct `GEMINI_API_KEY` environment variable.
+- Added image session metadata fields for status, resolution source, timing, source files, summary, and errors.
+- Added `lambda_o3_image_rek.py` to download private Slack images, optionally store them in S3, and run Rekognition text/label detection.
+- Documented ImageRek, Bedrock KB, and Gemini environment variables, IAM, architecture alignment, and manual tests.
 
 ### 2026-06-24
 

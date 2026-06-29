@@ -108,6 +108,40 @@ def clean_slack_text(text):
     return (text or "").strip()
 
 
+def is_image_file(file_info):
+    mimetype = (file_info.get("mimetype") or "").lower()
+    filetype = (file_info.get("filetype") or "").lower()
+
+    return (
+        mimetype.startswith("image/")
+        or filetype in {"jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"}
+    )
+
+
+def simplify_slack_file(file_info):
+    return {
+        "id": file_info.get("id"),
+        "name": file_info.get("name") or file_info.get("title"),
+        "title": file_info.get("title"),
+        "mimetype": file_info.get("mimetype"),
+        "filetype": file_info.get("filetype"),
+        "url_private": file_info.get("url_private"),
+        "url_private_download": file_info.get("url_private_download"),
+        "thumb_1024": file_info.get("thumb_1024"),
+        "size": file_info.get("size"),
+        "created": file_info.get("created"),
+        "user": file_info.get("user"),
+    }
+
+
+def extract_image_files(slack_event):
+    return [
+        simplify_slack_file(file_info)
+        for file_info in slack_event.get("files") or []
+        if is_image_file(file_info)
+    ]
+
+
 def parse_interactive_payload(raw_body):
     parsed = urllib.parse.parse_qs(raw_body or "", keep_blank_values=True)
     payload_values = parsed.get("payload")
@@ -266,7 +300,7 @@ def lambda_handler(event, context):
             "body": "ignore bot"
         }
 
-    if slack_event.get("subtype"):
+    if slack_event.get("subtype") and slack_event.get("subtype") != "file_share":
         log_json({
             "level": "INFO",
             "message": "slack_event_ignored",
@@ -327,6 +361,7 @@ def lambda_handler(event, context):
     channel = slack_event.get("channel")
     raw_text = slack_event.get("text", "")
     text = clean_slack_text(raw_text)
+    image_files = extract_image_files(slack_event)
     user = slack_event.get("user")
     ts = slack_event.get("ts")
 
@@ -339,7 +374,8 @@ def lambda_handler(event, context):
         "channel_type": channel_type,
         "routing_reason": routing_reason,
         "user": user,
-        "text": text
+        "text": text,
+        "image_file_count": len(image_files)
     })
 
     if channel and user:
@@ -354,7 +390,9 @@ def lambda_handler(event, context):
                 "ts": ts,
                 "event_type": event_type,
                 "channel_type": channel_type,
-                "routing_reason": routing_reason
+                "routing_reason": routing_reason,
+                "files": image_files,
+                "has_image": bool(image_files)
             })
         )
 

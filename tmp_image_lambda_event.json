@@ -1,0 +1,16 @@
+{
+  "files": [
+    {
+      "url_private_download": "https://o3images.s3.ap-southeast-2.amazonaws.com/slack-images/test-samples/adam_login_mfa_error.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA4UNLURSJNJL47CF3%2F20260629%2Fap-southeast-2%2Fs3%2Faws4_request&X-Amz-Date=20260629T112639Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=cf49ac301acfc20c3ce68a521b4bab3dc62821bb9d9324274121163636ddde5d",
+      "name": "adam_login_mfa_error.png",
+      "id": "s3-adam",
+      "filetype": "png",
+      "mimetype": "image/png"
+    }
+  ],
+  "event_id": "s3-sample-test-adam-2",
+  "user": "UTEST",
+  "session_id": "test:s3",
+  "channel": "DTEST",
+  "text": "Can you help with this?"
+}

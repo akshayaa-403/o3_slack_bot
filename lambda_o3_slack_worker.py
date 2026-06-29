@@ -5,6 +5,7 @@ import time
 import hashlib
 import boto3
 import urllib.request
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 from botocore.exceptions import ClientError
 
@@ -14,6 +15,7 @@ lex = boto3.client("lexv2-runtime", region_name=AWS_REGION)
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 scheduler = boto3.client("scheduler", region_name=AWS_REGION)
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
+bedrock_agent_runtime = boto3.client("bedrock-agent-runtime", region_name=AWS_REGION)
 
 BOT_ID = os.environ["BOT_ID"]
 BOT_ALIAS_ID = os.environ["BOT_ALIAS_ID"]
@@ -46,6 +48,25 @@ CLAUDE_FAILURE_REPLY = os.environ.get(
 CREATE_JIRA_TICKET_FUNCTION = os.environ.get("CREATE_JIRA_TICKET_FUNCTION")
 ENABLE_ROVO_ENRICHMENT = os.environ.get("ENABLE_ROVO_ENRICHMENT", "false").lower() == "true"
 ROVO_ENRICHMENT_FUNCTION = os.environ.get("ROVO_ENRICHMENT_FUNCTION")
+IMAGE_REK_FUNCTION = os.environ.get("IMAGE_REK_FUNCTION")
+IMAGE_ANALYSIS_UNAVAILABLE_REPLY = os.environ.get(
+    "IMAGE_ANALYSIS_UNAVAILABLE_REPLY",
+    "I received the image, but image analysis is not configured yet."
+)
+BEDROCK_KNOWLEDGE_BASE_ID = os.environ.get("BEDROCK_KNOWLEDGE_BASE_ID")
+BEDROCK_KB_MODEL_ARN = os.environ.get("BEDROCK_KB_MODEL_ARN")
+BEDROCK_KB_NUMBER_OF_RESULTS = int(os.environ.get("BEDROCK_KB_NUMBER_OF_RESULTS", "5"))
+BEDROCK_KB_NO_ANSWER_MARKERS = [
+    marker.strip().lower()
+    for marker in os.environ.get(
+        "BEDROCK_KB_NO_ANSWER_MARKERS",
+        "no relevant information,no kb article found,i don't know,i do not know"
+    ).split(",")
+    if marker.strip()
+]
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "20"))
 JIRA_UNCLEAR_CONFIRMATION_REPLY = os.environ.get(
     "JIRA_UNCLEAR_CONFIRMATION_REPLY",
     "Please reply yes to create the Jira ticket, or no to cancel."
@@ -648,6 +669,318 @@ def invoke_rovo_enrichment(payload):
         "error": f"Unexpected Rovo Lambda invoke status: {status_code}",
         "error_code": "rovo_lambda_invoke_rejected",
         "status_code": status_code
+    }
+
+
+def invoke_image_analysis(payload):
+    if not IMAGE_REK_FUNCTION:
+        return {
+            "ok": False,
+            "error": "missing_image_rek_function",
+            "error_code": "missing_image_rek_function"
+        }
+
+    try:
+        response = lambda_client.invoke(
+            FunctionName=IMAGE_REK_FUNCTION,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload).encode("utf-8")
+        )
+
+    except ClientError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "image_lambda_invoke_failed"
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "image_lambda_invoke_failed"
+        }
+
+    raw_payload = response.get("Payload").read().decode("utf-8")
+
+    if response.get("FunctionError"):
+        return {
+            "ok": False,
+            "error": raw_payload or response.get("FunctionError"),
+            "error_code": "image_lambda_function_error"
+        }
+
+    if not raw_payload:
+        return {
+            "ok": False,
+            "error": "empty_image_analysis_response",
+            "error_code": "invalid_image_analysis_response"
+        }
+
+    try:
+        return json.loads(raw_payload)
+
+    except json.JSONDecodeError:
+        return {
+            "ok": False,
+            "error": "invalid_image_analysis_response",
+            "error_code": "invalid_image_analysis_response",
+            "raw_response": raw_payload
+        }
+
+
+def build_image_payload(body, session_id, text, raw_text, image_files):
+    return {
+        "event_id": body.get("event_id"),
+        "session_id": session_id,
+        "channel": body.get("channel"),
+        "channel_type": body.get("channel_type"),
+        "routing_reason": body.get("routing_reason"),
+        "user": body.get("user"),
+        "text": text,
+        "raw_text": raw_text,
+        "files": image_files,
+        "slack": {
+            "channel": body.get("channel"),
+            "user": body.get("user"),
+            "event_ts": body.get("ts"),
+        }
+    }
+
+
+def image_reply_from_result(result):
+    if not result.get("ok"):
+        if result.get("error_code") == "missing_image_rek_function":
+            return IMAGE_ANALYSIS_UNAVAILABLE_REPLY
+
+        return "I could not analyze that image. Please try again or describe the error in text."
+
+    for key in ("reply", "message", "summary"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return "I analyzed the image, but there was no readable result."
+
+
+def image_issue_text(text, image_result):
+    parts = []
+
+    if text:
+        parts.append(f"User caption: {text}")
+
+    detected_text = []
+    for item in image_result.get("detected_text") or []:
+        value = item.get("text") if isinstance(item, dict) else item
+        if value:
+            detected_text.append(str(value).strip())
+
+    if detected_text:
+        parts.append("Text visible in image: " + " | ".join(detected_text[:12]))
+
+    labels = []
+    for item in image_result.get("labels") or []:
+        value = item.get("name") if isinstance(item, dict) else item
+        if value:
+            labels.append(str(value).strip())
+
+    if labels:
+        parts.append("Image labels: " + ", ".join(labels[:8]))
+
+    summary = (image_result.get("summary") or "").strip()
+    if summary and not parts:
+        parts.append(summary)
+
+    return "\n".join(parts).strip()
+
+
+def lex_is_resolved(lex_intent, lex_state, lex_reply_empty):
+    return (
+        lex_state not in {"Failed", "Ignored"}
+        and not lex_reply_empty
+        and lex_intent not in CLAUDE_FALLBACK_INTENTS
+    )
+
+
+def bedrock_kb_answer_is_useful(answer):
+    value = (answer or "").strip()
+    if not value:
+        return False
+
+    value_lower = value.lower()
+    return not any(marker in value_lower for marker in BEDROCK_KB_NO_ANSWER_MARKERS)
+
+
+def invoke_bedrock_knowledge_base(query):
+    if not BEDROCK_KNOWLEDGE_BASE_ID or not BEDROCK_KB_MODEL_ARN:
+        return {
+            "ok": False,
+            "error": "missing_bedrock_kb_configuration",
+            "error_code": "missing_bedrock_kb_configuration"
+        }
+
+    try:
+        response = bedrock_agent_runtime.retrieve_and_generate(
+            input={
+                "text": query
+            },
+            retrieveAndGenerateConfiguration={
+                "type": "KNOWLEDGE_BASE",
+                "knowledgeBaseConfiguration": {
+                    "knowledgeBaseId": BEDROCK_KNOWLEDGE_BASE_ID,
+                    "modelArn": BEDROCK_KB_MODEL_ARN,
+                    "retrievalConfiguration": {
+                        "vectorSearchConfiguration": {
+                            "numberOfResults": BEDROCK_KB_NUMBER_OF_RESULTS
+                        }
+                    }
+                }
+            }
+        )
+
+    except ClientError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "bedrock_kb_request_failed"
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "bedrock_kb_request_failed"
+        }
+
+    answer = ((response.get("output") or {}).get("text") or "").strip()
+    if not bedrock_kb_answer_is_useful(answer):
+        return {
+            "ok": False,
+            "error": "bedrock_kb_no_useful_answer",
+            "error_code": "bedrock_kb_no_useful_answer",
+            "raw_answer": answer,
+            "citations": response.get("citations") or []
+        }
+
+    return {
+        "ok": True,
+        "reply": answer,
+        "summary": answer,
+        "source": "bedrock_knowledge_base",
+        "citations": response.get("citations") or [],
+        "session_id": response.get("sessionId")
+    }
+
+
+_gemini_api_key_cache = None
+
+
+def get_gemini_api_key():
+    global _gemini_api_key_cache
+
+    if _gemini_api_key_cache:
+        return _gemini_api_key_cache
+
+    if GEMINI_API_KEY:
+        _gemini_api_key_cache = GEMINI_API_KEY
+        return _gemini_api_key_cache
+
+    return ""
+
+
+def extract_gemini_text(response_body):
+    parts = []
+
+    for candidate in response_body.get("candidates") or []:
+        content = candidate.get("content") or {}
+        for part in content.get("parts") or []:
+            text = (part.get("text") or "").strip()
+            if text:
+                parts.append(text)
+
+    return "\n".join(parts).strip()
+
+
+def invoke_gemini_fallback(query, image_result, kb_error=None):
+    api_key = get_gemini_api_key()
+    if not api_key:
+        return {
+            "ok": False,
+            "error": "missing_gemini_api_key",
+            "error_code": "missing_gemini_api_key"
+        }
+
+    prompt = "\n".join([
+        "You are IVY, a concise IT support assistant.",
+        "Use the user's screenshot context to suggest the most likely resolution.",
+        "If the screenshot text is ambiguous, ask one clear clarifying question.",
+        "Do not claim that a Jira ticket was created.",
+        "",
+        "Screenshot-derived issue:",
+        query,
+        "",
+        "Image analysis JSON:",
+        json.dumps({
+            "summary": image_result.get("summary"),
+            "detected_text": image_result.get("detected_text"),
+            "labels": image_result.get("labels"),
+            "bedrock_kb_error": kb_error,
+        }, default=str, ensure_ascii=True),
+    ])
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{urllib.parse.quote(GEMINI_MODEL, safe='')}:generateContent"
+    )
+    data = json.dumps({
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ]
+    }).encode("utf-8")
+
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=GEMINI_TIMEOUT_SECONDS) as response:
+            response_body = json.loads(response.read().decode("utf-8"))
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "gemini_request_failed"
+        }
+
+    reply = extract_gemini_text(response_body)
+    if not reply:
+        return {
+            "ok": False,
+            "error": "empty_gemini_reply",
+            "error_code": "empty_gemini_reply",
+            "raw_response": response_body
+        }
+
+    return {
+        "ok": True,
+        "reply": reply,
+        "summary": reply,
+        "source": "gemini",
+        "model_id": GEMINI_MODEL
     }
 
 
@@ -1756,6 +2089,8 @@ def process_record(record):
     event_id = body.get("event_id")
     text = (body.get("text") or "").strip()
     raw_text = body.get("raw_text", text)
+    image_files = body.get("files") or []
+    has_image = bool(body.get("has_image") or image_files)
     user = body.get("user", "unknown-user")
     channel = body.get("channel")
     ts = body.get("ts")
@@ -1779,6 +2114,7 @@ def process_record(record):
         "routing_reason": routing_reason,
         "user": user,
         "text": text,
+        "image_file_count": len(image_files),
         "action_id": action_id
     })
 
@@ -1810,6 +2146,14 @@ def process_record(record):
     rovo_error = None
     rovo_error_code = None
     rovo_should_invoke = False
+    image_status = None
+    image_requested_at = None
+    image_analyzed_at = None
+    image_error = None
+    image_error_code = None
+    image_summary = None
+    image_resolution_source = None
+    image_files_value = image_files if has_image else None
     assistance_status = None
     assistance_original_text = None
     assistance_raw_text = None
@@ -1915,6 +2259,101 @@ def process_record(record):
             "next_action": next_action,
             "support_options_status": support_options_status,
             "jira_status": jira_status
+        })
+
+    elif has_image and not is_interactive_action:
+        image_requested_at = to_iso(datetime.now(timezone.utc))
+        image_result = invoke_image_analysis(
+            build_image_payload(body, session_id, text, raw_text, image_files)
+        )
+        image_analyzed_at = to_iso(datetime.now(timezone.utc))
+        image_status = "analysis_completed" if image_result.get("ok") else "failed"
+        image_error = image_result.get("error")
+        image_error_code = image_result.get("error_code")
+        image_summary = (
+            image_result.get("summary")
+            or image_result.get("message")
+            or image_result.get("reply")
+        )
+        image_query = image_issue_text(text, image_result)
+
+        if image_result.get("ok") and image_query:
+            response = lex.recognize_text(
+                botId=BOT_ID,
+                botAliasId=BOT_ALIAS_ID,
+                localeId=LOCALE_ID,
+                sessionId=lex_session_id,
+                text=image_query
+            )
+
+            session_state = response.get("sessionState", {})
+            intent = session_state.get("intent", {})
+            lex_session_attributes = session_state.get("sessionAttributes", {}) or {}
+
+            lex_intent = intent.get("name", "ImageRek")
+            lex_state = intent.get("state", "UNKNOWN")
+            lex_slots = simplify_slots(intent.get("slots", {}))
+            lex_reply, lex_reply_empty = get_lex_reply(response.get("messages", []))
+
+            if lex_is_resolved(lex_intent, lex_state, lex_reply_empty):
+                image_status = "completed"
+                image_resolution_source = "lex"
+                response_source = "image_lex"
+
+            else:
+                kb_result = invoke_bedrock_knowledge_base(image_query)
+                if kb_result.get("ok"):
+                    image_status = "completed"
+                    image_resolution_source = "bedrock_knowledge_base"
+                    response_source = "image_bedrock_kb"
+                    lex_reply = kb_result["reply"]
+                    lex_reply_empty = False
+                    image_summary = kb_result.get("summary") or image_summary
+                else:
+                    gemini_result = invoke_gemini_fallback(
+                        image_query,
+                        image_result,
+                        kb_result.get("error") or kb_result.get("error_code")
+                    )
+                    if gemini_result.get("ok"):
+                        image_status = "completed"
+                        image_resolution_source = "gemini"
+                        response_source = "image_gemini"
+                        lex_reply = gemini_result["reply"]
+                        lex_reply_empty = False
+                        image_summary = gemini_result.get("summary") or image_summary
+                    else:
+                        image_status = "failed"
+                        image_resolution_source = "unresolved"
+                        response_source = "image"
+                        image_error = gemini_result.get("error") or kb_result.get("error")
+                        image_error_code = gemini_result.get("error_code") or kb_result.get("error_code")
+                        lex_reply = image_reply_from_result({
+                            "ok": False,
+                            "error": image_error,
+                            "error_code": image_error_code,
+                        })
+                        lex_reply_empty = False
+
+        else:
+            lex_intent = "ImageRek"
+            lex_state = "Failed"
+            lex_slots = {}
+            lex_session_attributes = {}
+            lex_reply = image_reply_from_result(image_result)
+            lex_reply_empty = False
+            response_source = "image"
+            image_resolution_source = "image_analysis"
+
+        log_json({
+            "level": "INFO" if image_status == "completed" else "WARN",
+            "message": "image_flow_completed",
+            "event_id": event_id,
+            "session_id": session_id,
+            "image_status": image_status,
+            "image_resolution_source": image_resolution_source,
+            "image_file_count": len(image_files),
+            "error_code": image_error_code
         })
 
     elif has_pending_assistance_details(existing_session) and text:
@@ -2513,6 +2952,28 @@ def process_record(record):
             "rovo_comment_id"
         ])
 
+    image_attributes = {
+        "image_status": image_status,
+        "image_requested_at": image_requested_at,
+        "image_analyzed_at": image_analyzed_at,
+        "image_error": image_error,
+        "image_error_code": image_error_code,
+        "image_summary": image_summary,
+        "image_resolution_source": image_resolution_source,
+        "image_files": image_files_value,
+    }
+
+    for attribute_name, attribute_value in image_attributes.items():
+        if attribute_value is not None:
+            value_name = f":{attribute_name}"
+            update_expression += f"""
+            ,
+            {attribute_name} = {value_name}
+        """
+            expression_attribute_values[value_name] = attribute_value
+        else:
+            remove_attributes.append(attribute_name)
+
     if claude_fallback_error:
         update_expression += """
             ,
@@ -2689,6 +3150,9 @@ def process_record(record):
         "rovo_status": rovo_status,
         "rovo_error": rovo_error,
         "rovo_error_code": rovo_error_code,
+        "image_status": image_status,
+        "image_resolution_source": image_resolution_source,
+        "image_error_code": image_error_code,
         "timeout_status": "scheduled" if timeout_state else "inactive",
         "timeout_due_at": timeout_state["timeout_due_at"] if timeout_state else None,
         "reply_sent": True,

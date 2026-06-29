@@ -1,0 +1,12 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "Reply with exactly: OK"
+        }
+      ],
+      "role": "user"
+    }
+  ]
+}
