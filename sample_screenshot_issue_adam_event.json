@@ -1,0 +1,14 @@
+{
+  "bucket": "o3images",
+  "key": "screenshot-kb/adam_login_mfa_error.png",
+  "issue_id": "adam_mfa_blank_page",
+  "title": "ADAM blank page after MFA",
+  "lex_query": "ADAM portal shows blank page after MFA",
+  "expected_lex_intent": "ADAMLoginMFAIssue",
+  "tags": [
+    "ADAM",
+    "MFA",
+    "Chrome"
+  ],
+  "enabled": true
+}

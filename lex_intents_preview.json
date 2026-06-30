@@ -1293,5 +1293,61 @@
         "allowInterrupt": true
       }
     }
+  },
+  {
+    "intentName": "ADAMLoginMFAIssue",
+    "description": "Imported from Intents_20_List.xlsx. Original name: ADAMLoginMFAIssue. Category: Password & Auth. Uses Lambda in source sheet: No.",
+    "sampleUtterances": [
+      {
+        "utterance": "ADAM portal shows blank page after MFA"
+      },
+      {
+        "utterance": "Unable to sign in to ADAM after Microsoft Authenticator approval"
+      },
+      {
+        "utterance": "ADAM login issue after MFA"
+      },
+      {
+        "utterance": "ADAM portal blank after authenticator approval"
+      },
+      {
+        "utterance": "help me fix ADAM login issue"
+      },
+      {
+        "utterance": "ADAM Portal Unable to sign in"
+      },
+      {
+        "utterance": "Error ADAM portal shows blank page after MFA"
+      }
+    ],
+    "intentClosingSetting": {
+      "active": true,
+      "closingResponse": {
+        "messageGroups": [
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "ADAM Login MFA Blank Page"
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "This looks like an ADAM sign-in issue after MFA approval. Please clear Chrome site data/cache for the ADAM portal, retry in an incognito window, and confirm Microsoft Authenticator approval completed."
+              }
+            }
+          },
+          {
+            "message": {
+              "plainTextMessage": {
+                "value": "If the ADAM portal still shows a blank page after MFA, create a Jira ticket with the screenshot, browser name, timestamp, and the account you are trying to access."
+              }
+            }
+          }
+        ],
+        "allowInterrupt": true
+      }
+    }
   }
 ]

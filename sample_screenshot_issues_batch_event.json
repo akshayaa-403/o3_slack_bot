@@ -1,0 +1,57 @@
+{
+  "items": [
+    {
+      "bucket": "o3images",
+      "key": "screenshot-kb/adam_login_mfa_error.png",
+      "issue_id": "adam_mfa_blank_page",
+      "title": "ADAM blank page after MFA",
+      "lex_query": "ADAM portal shows blank page after MFA",
+      "expected_lex_intent": "ADAMLoginMFAIssue",
+      "tags": [
+        "ADAM",
+        "MFA",
+        "Chrome"
+      ],
+      "enabled": true
+    },
+    {
+      "bucket": "o3images",
+      "key": "screenshot-kb/vpn_connection_failed.png",
+      "issue_id": "vpn_connection_failed",
+      "title": "VPN connection failed",
+      "lex_query": "VPN connection failed",
+      "expected_lex_intent": "",
+      "tags": [
+        "VPN",
+        "Network"
+      ],
+      "enabled": true
+    },
+    {
+      "bucket": "o3images",
+      "key": "screenshot-kb/outlook_mailbox_full.png",
+      "issue_id": "outlook_mailbox_full",
+      "title": "Outlook mailbox full",
+      "lex_query": "Outlook mailbox full",
+      "expected_lex_intent": "",
+      "tags": [
+        "Outlook",
+        "Mailbox"
+      ],
+      "enabled": true
+    },
+    {
+      "bucket": "o3images",
+      "key": "screenshot-kb/pcq_access_denied.png",
+      "issue_id": "pcq_access_denied",
+      "title": "PCQ access denied",
+      "lex_query": "PCQ access denied",
+      "expected_lex_intent": "AccessToPCQ",
+      "tags": [
+        "PCQ",
+        "Access"
+      ],
+      "enabled": true
+    }
+  ]
+}

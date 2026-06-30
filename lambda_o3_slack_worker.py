@@ -3,18 +3,23 @@ import os
 import re
 import time
 import hashlib
+import base64
 import boto3
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone, timedelta
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
 from botocore.exceptions import ClientError
 
 AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
 
 lex = boto3.client("lexv2-runtime", region_name=AWS_REGION)
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+s3_client = boto3.client("s3", region_name=AWS_REGION)
 scheduler = boto3.client("scheduler", region_name=AWS_REGION)
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
+bedrock_runtime = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 bedrock_agent_runtime = boto3.client("bedrock-agent-runtime", region_name=AWS_REGION)
 
 BOT_ID = os.environ["BOT_ID"]
@@ -53,6 +58,17 @@ IMAGE_ANALYSIS_UNAVAILABLE_REPLY = os.environ.get(
     "IMAGE_ANALYSIS_UNAVAILABLE_REPLY",
     "I received the image, but image analysis is not configured yet."
 )
+SCREENSHOT_MATCH_ENABLED = os.environ.get("SCREENSHOT_MATCH_ENABLED", "true").lower() == "true"
+SCREENSHOT_ISSUE_TABLE = os.environ.get("SCREENSHOT_ISSUE_TABLE", "o3_screenshot_issue_kb")
+SCREENSHOT_VECTOR_ENDPOINT = os.environ.get("SCREENSHOT_VECTOR_ENDPOINT", "").rstrip("/")
+SCREENSHOT_VECTOR_BACKEND = os.environ.get("SCREENSHOT_VECTOR_BACKEND", "opensearch").lower()
+SCREENSHOT_VECTOR_INDEX = os.environ.get("SCREENSHOT_VECTOR_INDEX", "o3-screenshot-issues")
+SCREENSHOT_VECTOR_FIELD = os.environ.get("SCREENSHOT_VECTOR_FIELD", "image_vector")
+SCREENSHOT_OPENSEARCH_SERVICE = os.environ.get("SCREENSHOT_OPENSEARCH_SERVICE", "aoss")
+SCREENSHOT_EMBEDDING_MODEL_ID = os.environ.get("SCREENSHOT_EMBEDDING_MODEL_ID", "amazon.titan-embed-image-v1")
+SCREENSHOT_MATCH_THRESHOLD = float(os.environ.get("SCREENSHOT_MATCH_THRESHOLD", "0.80"))
+SCREENSHOT_VECTOR_K = int(os.environ.get("SCREENSHOT_VECTOR_K", "1"))
+SCREENSHOT_EMBEDDING_MAX_BYTES = int(os.environ.get("SCREENSHOT_EMBEDDING_MAX_BYTES", "5000000"))
 BEDROCK_KNOWLEDGE_BASE_ID = os.environ.get("BEDROCK_KNOWLEDGE_BASE_ID")
 BEDROCK_KB_MODEL_ARN = os.environ.get("BEDROCK_KB_MODEL_ARN")
 BEDROCK_KB_NUMBER_OF_RESULTS = int(os.environ.get("BEDROCK_KB_NUMBER_OF_RESULTS", "5"))
@@ -169,6 +185,7 @@ JIRA_CONFIRM_NO = {
 }
 
 sessions_table = dynamodb.Table(DYNAMODB_TABLE)
+screenshot_issue_table = dynamodb.Table(SCREENSHOT_ISSUE_TABLE) if SCREENSHOT_ISSUE_TABLE else None
 
 
 def to_iso(dt):
@@ -202,6 +219,10 @@ def make_jira_request_id(session_id, event_id, intent_name, request_text):
 
 def log_json(data):
     print(json.dumps(data, default=str))
+
+
+def value_is_false(value):
+    return str(value).strip().lower() in {"false", "0", "no", "disabled"}
 
 
 def send_slack_message(channel, text, blocks=None):
@@ -727,6 +748,398 @@ def invoke_image_analysis(payload):
             "error_code": "invalid_image_analysis_response",
             "raw_response": raw_payload
         }
+
+
+def get_s3_object_bytes(s3_object):
+    if not s3_object:
+        return None
+
+    bucket = s3_object.get("bucket")
+    key = s3_object.get("key")
+    if not bucket or not key:
+        return None
+
+    response = s3_client.get_object(Bucket=bucket, Key=key)
+    return response["Body"].read()
+
+
+def create_image_embedding_from_bytes(image_bytes):
+    if not image_bytes:
+        return {
+            "ok": False,
+            "error": "missing_image_bytes",
+            "error_code": "missing_image_bytes"
+        }
+
+    if len(image_bytes) > SCREENSHOT_EMBEDDING_MAX_BYTES:
+        return {
+            "ok": False,
+            "error": "image_too_large_for_embedding",
+            "error_code": "image_too_large_for_embedding"
+        }
+
+    request_body = {
+        "inputImage": base64.b64encode(image_bytes).decode("utf-8")
+    }
+
+    try:
+        response = bedrock_runtime.invoke_model(
+            modelId=SCREENSHOT_EMBEDDING_MODEL_ID,
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps(request_body).encode("utf-8")
+        )
+        response_body = json.loads(response["body"].read().decode("utf-8"))
+
+    except ClientError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "embedding_request_failed"
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "embedding_request_failed"
+        }
+
+    embedding = response_body.get("embedding")
+    if not embedding:
+        return {
+            "ok": False,
+            "error": "empty_embedding_response",
+            "error_code": "empty_embedding_response",
+            "raw_response": response_body
+        }
+
+    return {
+        "ok": True,
+        "embedding": embedding,
+        "model_id": SCREENSHOT_EMBEDDING_MODEL_ID
+    }
+
+
+def create_screenshot_embedding(image_result):
+    try:
+        image_bytes = get_s3_object_bytes(image_result.get("s3_object"))
+        return create_image_embedding_from_bytes(image_bytes)
+
+    except ClientError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "image_s3_read_failed"
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "image_s3_read_failed"
+        }
+
+
+def signed_opensearch_request(method, path, payload=None):
+    if not SCREENSHOT_VECTOR_ENDPOINT:
+        return {
+            "ok": False,
+            "error": "missing_screenshot_vector_endpoint",
+            "error_code": "missing_screenshot_vector_endpoint"
+        }
+
+    body = json.dumps(payload or {}).encode("utf-8")
+    url = f"{SCREENSHOT_VECTOR_ENDPOINT}{path}"
+    request = AWSRequest(
+        method=method,
+        url=url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Host": urllib.parse.urlparse(SCREENSHOT_VECTOR_ENDPOINT).netloc
+        }
+    )
+    SigV4Auth(
+        boto3.Session().get_credentials(),
+        SCREENSHOT_OPENSEARCH_SERVICE,
+        AWS_REGION
+    ).add_auth(request)
+
+    prepared = request.prepare()
+    urllib_request = urllib.request.Request(
+        url,
+        data=body,
+        headers=dict(prepared.headers.items()),
+        method=method
+    )
+
+    try:
+        with urllib.request.urlopen(urllib_request, timeout=10) as response:
+            response_body = response.read().decode("utf-8")
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "opensearch_request_failed"
+        }
+
+    if not response_body:
+        return {
+            "ok": True,
+            "response": {}
+        }
+
+    try:
+        return {
+            "ok": True,
+            "response": json.loads(response_body)
+        }
+
+    except json.JSONDecodeError:
+        return {
+            "ok": False,
+            "error": "invalid_opensearch_response",
+            "error_code": "invalid_opensearch_response",
+            "raw_response": response_body
+        }
+
+
+def search_screenshot_vector_index(embedding):
+    payload = {
+        "size": SCREENSHOT_VECTOR_K,
+        "query": {
+            "knn": {
+                SCREENSHOT_VECTOR_FIELD: {
+                    "vector": embedding,
+                    "k": SCREENSHOT_VECTOR_K
+                }
+            }
+        }
+    }
+    path = f"/{urllib.parse.quote(SCREENSHOT_VECTOR_INDEX, safe='')}/_search"
+    result = signed_opensearch_request("POST", path, payload)
+    if not result.get("ok"):
+        return result
+
+    hits = ((result.get("response") or {}).get("hits") or {}).get("hits") or []
+    if not hits:
+        return {
+            "ok": True,
+            "matched": False,
+            "reason": "no_vector_hits"
+        }
+
+    top_hit = hits[0]
+    source = top_hit.get("_source") or {}
+    return {
+        "ok": True,
+        "matched": True,
+        "issue_id": source.get("issue_id") or top_hit.get("_id"),
+        "score": float(top_hit.get("_score") or 0),
+        "vector_id": top_hit.get("_id"),
+        "source": source
+    }
+
+
+def cosine_similarity(left, right):
+    dot_product = 0.0
+    left_norm = 0.0
+    right_norm = 0.0
+
+    for left_value, right_value in zip(left, right):
+        left_float = float(left_value)
+        right_float = float(right_value)
+        dot_product += left_float * right_float
+        left_norm += left_float * left_float
+        right_norm += right_float * right_float
+
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+
+    return dot_product / ((left_norm ** 0.5) * (right_norm ** 0.5))
+
+
+def search_screenshot_dynamodb_embeddings(embedding):
+    if not screenshot_issue_table:
+        return {
+            "ok": False,
+            "error": "missing_screenshot_issue_table",
+            "error_code": "missing_screenshot_issue_table"
+        }
+
+    try:
+        response = screenshot_issue_table.scan()
+        items = response.get("Items") or []
+
+        while response.get("LastEvaluatedKey"):
+            response = screenshot_issue_table.scan(
+                ExclusiveStartKey=response["LastEvaluatedKey"]
+            )
+            items.extend(response.get("Items") or [])
+
+    except ClientError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "screenshot_issue_scan_failed"
+        }
+
+    best_item = None
+    best_score = 0.0
+    for item in items:
+        if item.get("enabled") is False or value_is_false(item.get("enabled")):
+            continue
+
+        item_embedding = item.get("image_embedding")
+        if not item_embedding:
+            continue
+
+        score = cosine_similarity(embedding, item_embedding)
+        if score > best_score:
+            best_item = item
+            best_score = score
+
+    if not best_item:
+        return {
+            "ok": True,
+            "matched": False,
+            "reason": "no_dynamodb_embedding_hits"
+        }
+
+    return {
+        "ok": True,
+        "matched": True,
+        "issue_id": best_item.get("issue_id"),
+        "score": best_score,
+        "vector_id": best_item.get("issue_id"),
+        "source": best_item,
+        "issue": best_item,
+    }
+
+
+def get_screenshot_issue(issue_id):
+    if not screenshot_issue_table:
+        return {
+            "ok": False,
+            "error": "missing_screenshot_issue_table",
+            "error_code": "missing_screenshot_issue_table"
+        }
+
+    try:
+        response = screenshot_issue_table.get_item(
+            Key={
+                "issue_id": issue_id
+            }
+        )
+
+    except ClientError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "screenshot_issue_lookup_failed"
+        }
+
+    item = response.get("Item")
+    if not item:
+        return {
+            "ok": False,
+            "error": "screenshot_issue_not_found",
+            "error_code": "screenshot_issue_not_found"
+        }
+
+    if item.get("enabled") is False or value_is_false(item.get("enabled")):
+        return {
+            "ok": False,
+            "error": "screenshot_issue_disabled",
+            "error_code": "screenshot_issue_disabled"
+        }
+
+    return {
+        "ok": True,
+        "item": item
+    }
+
+
+def find_matching_screenshot_issue(image_result):
+    if not SCREENSHOT_MATCH_ENABLED:
+        return {
+            "ok": True,
+            "matched": False,
+            "reason": "screenshot_match_disabled"
+        }
+
+    if SCREENSHOT_VECTOR_BACKEND == "opensearch" and not SCREENSHOT_VECTOR_ENDPOINT:
+        return {
+            "ok": True,
+            "matched": False,
+            "reason": "missing_screenshot_vector_endpoint"
+        }
+
+    embedding_result = create_screenshot_embedding(image_result)
+    if not embedding_result.get("ok"):
+        return {
+            "ok": False,
+            "matched": False,
+            "reason": embedding_result.get("error_code", "embedding_failed"),
+            "error": embedding_result.get("error")
+        }
+
+    if SCREENSHOT_VECTOR_BACKEND == "dynamodb":
+        search_result = search_screenshot_dynamodb_embeddings(embedding_result["embedding"])
+    else:
+        search_result = search_screenshot_vector_index(embedding_result["embedding"])
+    if not search_result.get("ok"):
+        return {
+            "ok": False,
+            "matched": False,
+            "reason": search_result.get("error_code", "vector_search_failed"),
+            "error": search_result.get("error")
+        }
+
+    if not search_result.get("matched"):
+        return search_result
+
+    score = search_result.get("score", 0)
+    if score < SCREENSHOT_MATCH_THRESHOLD:
+        return {
+            **search_result,
+            "matched": False,
+            "reason": "below_threshold",
+            "threshold": SCREENSHOT_MATCH_THRESHOLD
+        }
+
+    issue = search_result.get("issue")
+    if not issue:
+        issue_result = get_screenshot_issue(search_result.get("issue_id"))
+        if not issue_result.get("ok"):
+            return {
+                **search_result,
+                "matched": False,
+                "reason": issue_result.get("error_code", "issue_lookup_failed"),
+                "error": issue_result.get("error"),
+                "threshold": SCREENSHOT_MATCH_THRESHOLD
+            }
+
+        issue = issue_result["item"]
+    lex_query = (issue.get("lex_query") or "").strip()
+    if not lex_query:
+        return {
+            **search_result,
+            "matched": False,
+            "reason": "missing_lex_query",
+            "threshold": SCREENSHOT_MATCH_THRESHOLD
+        }
+
+    return {
+        **search_result,
+        "matched": True,
+        "threshold": SCREENSHOT_MATCH_THRESHOLD,
+        "issue": issue,
+        "lex_query": lex_query,
+        "expected_lex_intent": issue.get("expected_lex_intent")
+    }
 
 
 def build_image_payload(body, session_id, text, raw_text, image_files):
@@ -2154,6 +2567,11 @@ def process_record(record):
     image_summary = None
     image_resolution_source = None
     image_files_value = image_files if has_image else None
+    image_match_issue_id = None
+    image_match_score = None
+    image_match_expected_lex_intent = None
+    image_match_actual_lex_intent = None
+    image_match_fallback_reason = None
     assistance_status = None
     assistance_original_text = None
     assistance_raw_text = None
@@ -2278,62 +2696,120 @@ def process_record(record):
         image_query = image_issue_text(text, image_result)
 
         if image_result.get("ok") and image_query:
-            response = lex.recognize_text(
-                botId=BOT_ID,
-                botAliasId=BOT_ALIAS_ID,
-                localeId=LOCALE_ID,
-                sessionId=lex_session_id,
-                text=image_query
-            )
+            lex_session_attributes = {}
+            match_result = find_matching_screenshot_issue(image_result)
+            image_match_issue_id = match_result.get("issue_id")
+            image_match_score = match_result.get("score")
+            image_match_expected_lex_intent = match_result.get("expected_lex_intent")
+            image_match_fallback_reason = match_result.get("reason")
 
-            session_state = response.get("sessionState", {})
-            intent = session_state.get("intent", {})
-            lex_session_attributes = session_state.get("sessionAttributes", {}) or {}
+            if match_result.get("matched"):
+                response = lex.recognize_text(
+                    botId=BOT_ID,
+                    botAliasId=BOT_ALIAS_ID,
+                    localeId=LOCALE_ID,
+                    sessionId=lex_session_id,
+                    text=match_result["lex_query"]
+                )
 
-            lex_intent = intent.get("name", "ImageRek")
-            lex_state = intent.get("state", "UNKNOWN")
-            lex_slots = simplify_slots(intent.get("slots", {}))
-            lex_reply, lex_reply_empty = get_lex_reply(response.get("messages", []))
+                session_state = response.get("sessionState", {})
+                intent = session_state.get("intent", {})
+                lex_session_attributes = session_state.get("sessionAttributes", {}) or {}
 
-            if lex_is_resolved(lex_intent, lex_state, lex_reply_empty):
-                image_status = "completed"
-                image_resolution_source = "lex"
-                response_source = "image_lex"
+                lex_intent = intent.get("name", "ImageVectorMatch")
+                image_match_actual_lex_intent = lex_intent
+                lex_state = intent.get("state", "UNKNOWN")
+                lex_slots = simplify_slots(intent.get("slots", {}))
+                lex_reply, lex_reply_empty = get_lex_reply(response.get("messages", []))
 
-            else:
-                kb_result = invoke_bedrock_knowledge_base(image_query)
-                if kb_result.get("ok"):
+                expected_intent = match_result.get("expected_lex_intent")
+                lex_intent_matches = not expected_intent or lex_intent == expected_intent
+
+                if lex_intent_matches and lex_is_resolved(lex_intent, lex_state, lex_reply_empty):
                     image_status = "completed"
-                    image_resolution_source = "bedrock_knowledge_base"
-                    response_source = "image_bedrock_kb"
-                    lex_reply = kb_result["reply"]
-                    lex_reply_empty = False
-                    image_summary = kb_result.get("summary") or image_summary
+                    image_resolution_source = "screenshot_match_lex"
+                    response_source = "image_screenshot_match_lex"
+                    image_summary = match_result.get("lex_query") or image_summary
+
                 else:
+                    image_match_fallback_reason = "lex_intent_mismatch_or_unresolved"
+                    log_json({
+                        "level": "WARN",
+                        "message": "screenshot_match_lex_rejected",
+                        "event_id": event_id,
+                        "session_id": session_id,
+                        "issue_id": image_match_issue_id,
+                        "match_score": image_match_score,
+                        "expected_lex_intent": expected_intent,
+                        "actual_lex_intent": lex_intent,
+                        "lex_state": lex_state,
+                        "lex_reply_empty": lex_reply_empty
+                    })
+
                     gemini_result = invoke_gemini_fallback(
                         image_query,
                         image_result,
-                        kb_result.get("error") or kb_result.get("error_code")
+                        image_match_fallback_reason
                     )
                     if gemini_result.get("ok"):
+                        lex_intent = "ImageLLMFallback"
+                        lex_state = "Fulfilled"
+                        lex_slots = {}
+                        lex_reply = gemini_result["reply"]
+                        lex_reply_empty = False
                         image_status = "completed"
                         image_resolution_source = "gemini"
                         response_source = "image_gemini"
-                        lex_reply = gemini_result["reply"]
-                        lex_reply_empty = False
                         image_summary = gemini_result.get("summary") or image_summary
                     else:
+                        lex_intent = "ImageLLMFallback"
+                        lex_state = "Failed"
+                        lex_slots = {}
                         image_status = "failed"
                         image_resolution_source = "unresolved"
                         response_source = "image"
-                        image_error = gemini_result.get("error") or kb_result.get("error")
-                        image_error_code = gemini_result.get("error_code") or kb_result.get("error_code")
+                        image_error = gemini_result.get("error")
+                        image_error_code = gemini_result.get("error_code")
                         lex_reply = image_reply_from_result({
                             "ok": False,
                             "error": image_error,
                             "error_code": image_error_code,
                         })
                         lex_reply_empty = False
+
+            else:
+                gemini_result = invoke_gemini_fallback(
+                    image_query,
+                    image_result,
+                    image_match_fallback_reason or "no_confident_screenshot_match"
+                )
+                if gemini_result.get("ok"):
+                    lex_intent = "ImageLLMFallback"
+                    lex_state = "Fulfilled"
+                    lex_slots = {}
+                    lex_session_attributes = {}
+                    lex_reply = gemini_result["reply"]
+                    lex_reply_empty = False
+                    image_status = "completed"
+                    image_resolution_source = "gemini"
+                    response_source = "image_gemini"
+                    image_summary = gemini_result.get("summary") or image_summary
+                else:
+                    lex_intent = "ImageLLMFallback"
+                    lex_state = "Failed"
+                    lex_slots = {}
+                    lex_session_attributes = {}
+                    image_status = "failed"
+                    image_resolution_source = "unresolved"
+                    response_source = "image"
+                    image_error = gemini_result.get("error") or match_result.get("error")
+                    image_error_code = gemini_result.get("error_code") or match_result.get("reason")
+                    lex_reply = image_reply_from_result({
+                        "ok": False,
+                        "error": image_error,
+                        "error_code": image_error_code,
+                    })
+                    lex_reply_empty = False
 
         else:
             lex_intent = "ImageRek"
@@ -2352,6 +2828,11 @@ def process_record(record):
             "session_id": session_id,
             "image_status": image_status,
             "image_resolution_source": image_resolution_source,
+            "image_match_issue_id": image_match_issue_id,
+            "image_match_score": image_match_score,
+            "image_match_expected_lex_intent": image_match_expected_lex_intent,
+            "image_match_actual_lex_intent": image_match_actual_lex_intent,
+            "image_match_fallback_reason": image_match_fallback_reason,
             "image_file_count": len(image_files),
             "error_code": image_error_code
         })
@@ -3152,6 +3633,11 @@ def process_record(record):
         "rovo_error_code": rovo_error_code,
         "image_status": image_status,
         "image_resolution_source": image_resolution_source,
+        "image_match_issue_id": image_match_issue_id,
+        "image_match_score": image_match_score,
+        "image_match_expected_lex_intent": image_match_expected_lex_intent,
+        "image_match_actual_lex_intent": image_match_actual_lex_intent,
+        "image_match_fallback_reason": image_match_fallback_reason,
         "image_error_code": image_error_code,
         "timeout_status": "scheduled" if timeout_state else "inactive",
         "timeout_due_at": timeout_state["timeout_due_at"] if timeout_state else None,

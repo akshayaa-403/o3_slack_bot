@@ -363,6 +363,8 @@ Optional:
 - `MAX_INLINE_REKOGNITION_BYTES`, default `5000000`
 - `REKOGNITION_MAX_LABELS`, default `10`
 - `REKOGNITION_MIN_CONFIDENCE`, default `70`
+- `LOG_DETECTED_TEXT`, default `true`
+- `LOG_DETECTED_TEXT_LIMIT`, default `20`
 
 IAM:
 
@@ -541,6 +543,7 @@ Manual image test:
 - Upload a screenshot in a Slack DM to the bot.
 - Confirm handler logs show `image_file_count > 0`.
 - Confirm worker logs show `image_flow_completed`.
+- Confirm ImageRek logs show `detected_text_lines` and `detected_text_preview`.
 - Confirm Slack receives the Lex answer when Lex can resolve the screenshot-derived issue.
 - Temporarily force Lex fallback and confirm Bedrock KB answers with `response_source=image_bedrock_kb`.
 - Temporarily force Bedrock KB no-answer and confirm Gemini answers with `response_source=image_gemini`.
@@ -576,6 +579,7 @@ Jira deployment checks:
 - Added worker-side ImageRek Lambda invocation for Slack image uploads.
 - Changed the image flow to use screenshot extraction first, Lex resolution second, Bedrock Knowledge Base third, and Gemini final fallback.
 - Changed Gemini fallback configuration to use only direct `GEMINI_API_KEY` environment variable.
+- Added ImageRek CloudWatch logging for Rekognition OCR text lines and confidence scores.
 - Added image session metadata fields for status, resolution source, timing, source files, summary, and errors.
 - Added `lambda_o3_image_rek.py` to download private Slack images, optionally store them in S3, and run Rekognition text/label detection.
 - Documented ImageRek, Bedrock KB, and Gemini environment variables, IAM, architecture alignment, and manual tests.

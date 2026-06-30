@@ -13,6 +13,8 @@ ENABLE_REKOGNITION = os.environ.get("ENABLE_REKOGNITION", "true").lower() == "tr
 MAX_INLINE_REKOGNITION_BYTES = int(os.environ.get("MAX_INLINE_REKOGNITION_BYTES", "5000000"))
 REKOGNITION_MAX_LABELS = int(os.environ.get("REKOGNITION_MAX_LABELS", "10"))
 REKOGNITION_MIN_CONFIDENCE = float(os.environ.get("REKOGNITION_MIN_CONFIDENCE", "70"))
+LOG_DETECTED_TEXT = os.environ.get("LOG_DETECTED_TEXT", "true").lower() == "true"
+LOG_DETECTED_TEXT_LIMIT = int(os.environ.get("LOG_DETECTED_TEXT_LIMIT", "20"))
 
 s3 = boto3.client("s3", region_name=AWS_REGION)
 rekognition = boto3.client("rekognition", region_name=AWS_REGION)
@@ -170,6 +172,19 @@ def build_summary(text_lines, labels):
     return "\n".join(parts)
 
 
+def log_safe_text_lines(text_lines):
+    if not LOG_DETECTED_TEXT:
+        return []
+
+    return [
+        {
+            "text": line.get("text"),
+            "confidence": line.get("confidence"),
+        }
+        for line in text_lines[: max(0, LOG_DETECTED_TEXT_LIMIT)]
+    ]
+
+
 def lambda_handler(event, context):
     analyzed_at = to_iso(datetime.now(timezone.utc))
 
@@ -201,7 +216,16 @@ def lambda_handler(event, context):
             "s3_bucket": (s3_object or {}).get("bucket"),
             "s3_key": (s3_object or {}).get("key"),
             "text_line_count": len(text_lines),
+            "detected_text_lines": log_safe_text_lines(text_lines),
+            "detected_text_preview": " | ".join(
+                line.get("text", "")
+                for line in text_lines[: max(0, LOG_DETECTED_TEXT_LIMIT)]
+            ),
             "label_count": len(labels),
+            "detected_labels": [
+                label.get("name")
+                for label in labels[: max(0, REKOGNITION_MAX_LABELS)]
+            ],
         })
 
         return {
