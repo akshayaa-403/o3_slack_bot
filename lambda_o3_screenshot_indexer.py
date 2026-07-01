@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import os
 import urllib.parse
@@ -181,6 +182,7 @@ def signed_opensearch_request(method, path, payload=None):
         raise ValueError("Missing SCREENSHOT_VECTOR_ENDPOINT")
 
     body = json.dumps(payload or {}).encode("utf-8")
+    payload_hash = hashlib.sha256(body).hexdigest()
     url = f"{SCREENSHOT_VECTOR_ENDPOINT}{path}"
     request = AWSRequest(
         method=method,
@@ -189,6 +191,7 @@ def signed_opensearch_request(method, path, payload=None):
         headers={
             "Content-Type": "application/json",
             "Host": urllib.parse.urlparse(SCREENSHOT_VECTOR_ENDPOINT).netloc,
+            "X-Amz-Content-Sha256": payload_hash,
         }
     )
     SigV4Auth(
@@ -264,11 +267,8 @@ def put_vector_document(issue_id, item, embedding):
         "tags": item.get("tags", []),
         SCREENSHOT_VECTOR_FIELD: embedding,
     }
-    path = (
-        f"/{urllib.parse.quote(SCREENSHOT_VECTOR_INDEX, safe='')}"
-        f"/_doc/{urllib.parse.quote(issue_id, safe='')}"
-    )
-    return signed_opensearch_request("PUT", path, document)
+    path = f"/{urllib.parse.quote(SCREENSHOT_VECTOR_INDEX, safe='')}/_doc"
+    return signed_opensearch_request("POST", path, document)
 
 
 def dynamodb_embedding(embedding):
@@ -303,6 +303,9 @@ def build_issue_item(event, bucket, key, metadata, text_lines, labels, embedding
 
     if not lex_query:
         raise ValueError("Missing lex_query for screenshot issue")
+
+    if not expected_lex_intent:
+        raise ValueError("Missing expected_lex_intent for screenshot issue")
 
     now_iso = to_iso(datetime.now(timezone.utc))
     return {
@@ -350,11 +353,15 @@ def index_screenshot(event):
         "message": "screenshot_issue_indexed",
         "issue_id": issue_item["issue_id"],
         "title": issue_item["title"],
+        "vector_backend": SCREENSHOT_VECTOR_BACKEND,
+        "opensearch_status": "ok" if SCREENSHOT_VECTOR_BACKEND == "opensearch" else None,
+        "opensearch_document_id": vector_response.get("_id") if isinstance(vector_response, dict) else None,
         "s3_bucket": bucket,
         "s3_key": key,
         "lex_query": issue_item["lex_query"],
         "expected_lex_intent": issue_item.get("expected_lex_intent"),
         "vector_index": SCREENSHOT_VECTOR_INDEX,
+        "vector_endpoint": SCREENSHOT_VECTOR_ENDPOINT if SCREENSHOT_VECTOR_BACKEND == "opensearch" else None,
         "text_line_count": len(text_lines),
         "label_count": len(labels)
     })

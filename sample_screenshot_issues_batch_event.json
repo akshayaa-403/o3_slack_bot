@@ -20,7 +20,7 @@
       "issue_id": "vpn_connection_failed",
       "title": "VPN connection failed",
       "lex_query": "VPN connection failed",
-      "expected_lex_intent": "",
+      "expected_lex_intent": "VPNConnectionFailed",
       "tags": [
         "VPN",
         "Network"
@@ -33,7 +33,7 @@
       "issue_id": "outlook_mailbox_full",
       "title": "Outlook mailbox full",
       "lex_query": "Outlook mailbox full",
-      "expected_lex_intent": "",
+      "expected_lex_intent": "OutlookMailboxFull",
       "tags": [
         "Outlook",
         "Mailbox"

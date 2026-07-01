@@ -850,6 +850,7 @@ def signed_opensearch_request(method, path, payload=None):
         }
 
     body = json.dumps(payload or {}).encode("utf-8")
+    payload_hash = hashlib.sha256(body).hexdigest()
     url = f"{SCREENSHOT_VECTOR_ENDPOINT}{path}"
     request = AWSRequest(
         method=method,
@@ -857,7 +858,8 @@ def signed_opensearch_request(method, path, payload=None):
         data=body,
         headers={
             "Content-Type": "application/json",
-            "Host": urllib.parse.urlparse(SCREENSHOT_VECTOR_ENDPOINT).netloc
+            "Host": urllib.parse.urlparse(SCREENSHOT_VECTOR_ENDPOINT).netloc,
+            "X-Amz-Content-Sha256": payload_hash
         }
     )
     SigV4Auth(
@@ -921,14 +923,25 @@ def search_screenshot_vector_index(embedding):
     path = f"/{urllib.parse.quote(SCREENSHOT_VECTOR_INDEX, safe='')}/_search"
     result = signed_opensearch_request("POST", path, payload)
     if not result.get("ok"):
-        return result
+        return {
+            **result,
+            "backend": "opensearch",
+            "opensearch_status": "failed",
+            "vector_index": SCREENSHOT_VECTOR_INDEX,
+            "vector_endpoint": SCREENSHOT_VECTOR_ENDPOINT,
+        }
 
     hits = ((result.get("response") or {}).get("hits") or {}).get("hits") or []
     if not hits:
         return {
             "ok": True,
             "matched": False,
-            "reason": "no_vector_hits"
+            "reason": "no_vector_hits",
+            "backend": "opensearch",
+            "opensearch_status": "ok",
+            "vector_index": SCREENSHOT_VECTOR_INDEX,
+            "vector_endpoint": SCREENSHOT_VECTOR_ENDPOINT,
+            "hit_count": 0,
         }
 
     top_hit = hits[0]
@@ -936,6 +949,11 @@ def search_screenshot_vector_index(embedding):
     return {
         "ok": True,
         "matched": True,
+        "backend": "opensearch",
+        "opensearch_status": "ok",
+        "vector_index": SCREENSHOT_VECTOR_INDEX,
+        "vector_endpoint": SCREENSHOT_VECTOR_ENDPOINT,
+        "hit_count": len(hits),
         "issue_id": source.get("issue_id") or top_hit.get("_id"),
         "score": float(top_hit.get("_score") or 0),
         "vector_id": top_hit.get("_id"),
@@ -1090,6 +1108,20 @@ def find_matching_screenshot_issue(image_result):
         search_result = search_screenshot_dynamodb_embeddings(embedding_result["embedding"])
     else:
         search_result = search_screenshot_vector_index(embedding_result["embedding"])
+
+    log_json({
+        "level": "INFO" if search_result.get("ok") else "ERROR",
+        "message": "screenshot_vector_search_completed",
+        "vector_backend": SCREENSHOT_VECTOR_BACKEND,
+        "opensearch_status": search_result.get("opensearch_status"),
+        "vector_index": search_result.get("vector_index") or SCREENSHOT_VECTOR_INDEX,
+        "matched": search_result.get("matched", False),
+        "issue_id": search_result.get("issue_id"),
+        "score": search_result.get("score"),
+        "hit_count": search_result.get("hit_count"),
+        "reason": search_result.get("reason") or search_result.get("error_code"),
+    })
+
     if not search_result.get("ok"):
         return {
             "ok": False,
@@ -1123,6 +1155,16 @@ def find_matching_screenshot_issue(image_result):
             }
 
         issue = issue_result["item"]
+
+    expected_lex_intent = (issue.get("expected_lex_intent") or "").strip()
+    if not expected_lex_intent:
+        return {
+            **search_result,
+            "matched": False,
+            "reason": "missing_expected_lex_intent",
+            "threshold": SCREENSHOT_MATCH_THRESHOLD
+        }
+
     lex_query = (issue.get("lex_query") or "").strip()
     if not lex_query:
         return {
@@ -1138,7 +1180,7 @@ def find_matching_screenshot_issue(image_result):
         "threshold": SCREENSHOT_MATCH_THRESHOLD,
         "issue": issue,
         "lex_query": lex_query,
-        "expected_lex_intent": issue.get("expected_lex_intent")
+        "expected_lex_intent": expected_lex_intent
     }
 
 
