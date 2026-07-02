@@ -1,5 +1,6 @@
 import json
 import os
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -52,15 +53,22 @@ def image_url(file_info):
 
 
 def download_slack_image(url):
-    if not SLACK_BOT_TOKEN:
+    host = urllib.parse.urlparse(url).netloc.lower()
+    is_slack_url = "slack.com" in host or "slack-edge.com" in host
+
+    if is_slack_url and not SLACK_BOT_TOKEN:
         raise ValueError("Missing required environment variable: SLACK_BOT_TOKEN")
+
+    headers = {
+        "User-Agent": "Project-IVY-ImageRek/1.0",
+    }
+
+    if is_slack_url:
+        headers["Authorization"] = f"Bearer {SLACK_BOT_TOKEN}"
 
     request = urllib.request.Request(
         url,
-        headers={
-            "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
-            "User-Agent": "Project-IVY-ImageRek/1.0",
-        },
+        headers=headers,
         method="GET",
     )
 

@@ -49,13 +49,18 @@ def ttl_epoch():
     return int(time.time()) + SESSION_TTL_SECONDS
 
 
-def send_slack_message(channel, text):
+def send_slack_message(channel, text, thread_ts=None):
     url = "https://slack.com/api/chat.postMessage"
 
-    data = json.dumps({
+    message = {
         "channel": channel,
         "text": text
-    }).encode("utf-8")
+    }
+
+    if thread_ts:
+        message["thread_ts"] = thread_ts
+
+    data = json.dumps(message).encode("utf-8")
 
     req = urllib.request.Request(
         url,

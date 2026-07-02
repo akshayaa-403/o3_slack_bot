@@ -53,6 +53,7 @@ CLAUDE_FAILURE_REPLY = os.environ.get(
 CREATE_JIRA_TICKET_FUNCTION = os.environ.get("CREATE_JIRA_TICKET_FUNCTION")
 ENABLE_ROVO_ENRICHMENT = os.environ.get("ENABLE_ROVO_ENRICHMENT", "false").lower() == "true"
 ROVO_ENRICHMENT_FUNCTION = os.environ.get("ROVO_ENRICHMENT_FUNCTION")
+SUMMARIZER_FUNCTION_NAME = os.environ.get("SUMMARIZER_FUNCTION_NAME")
 IMAGE_REK_FUNCTION = os.environ.get("IMAGE_REK_FUNCTION")
 IMAGE_ANALYSIS_UNAVAILABLE_REPLY = os.environ.get(
     "IMAGE_ANALYSIS_UNAVAILABLE_REPLY",
@@ -159,6 +160,17 @@ ACTION_ID_ASSISTANCE_NEED_MORE_HELP = "ivy_assistance_need_more_help"
 ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET = "ivy_assistance_create_jira_ticket"
 ACTION_ID_LIVE_AGENT_SUPPORT = "ivy_live_agent_support"
 ACTION_ID_CREATE_JIRA_TICKET = "ivy_create_jira_ticket"
+ACTION_ID_CLOSE_AND_SUMMARIZE = "ivy_close_and_summarize"
+
+CLOSE_SUMMARY_RESPONSE_SOURCES = {
+    "lex",
+    "router",
+    "claude",
+    "image",
+    "image_screenshot_match_lex",
+    "image_bedrock_kb",
+    "image_gemini",
+}
 
 JIRA_CONFIRM_YES = {
     "yes",
@@ -225,13 +237,16 @@ def value_is_false(value):
     return str(value).strip().lower() in {"false", "0", "no", "disabled"}
 
 
-def send_slack_message(channel, text, blocks=None):
+def send_slack_message(channel, text, blocks=None, thread_ts=None):
     url = "https://slack.com/api/chat.postMessage"
 
     message = {
         "channel": channel,
         "text": text
     }
+
+    if thread_ts:
+        message["thread_ts"] = thread_ts
 
     if blocks:
         message["blocks"] = blocks
@@ -365,10 +380,65 @@ def final_support_blocks(reply):
                     "style": "primary",
                     "action_id": ACTION_ID_CREATE_JIRA_TICKET,
                     "value": "create_jira_ticket"
+                },
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Close & summarize"
+                    },
+                    "action_id": ACTION_ID_CLOSE_AND_SUMMARIZE,
+                    "value": "close_and_summarize"
                 }
             ]
         }
     ]
+
+
+def close_and_summarize_block():
+    return {
+        "type": "actions",
+        "block_id": "ivy_close_summary_actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Close & summarize"
+                },
+                "action_id": ACTION_ID_CLOSE_AND_SUMMARIZE,
+                "value": "close_and_summarize"
+            }
+        ]
+    }
+
+
+def add_close_and_summarize_button(blocks, reply=None):
+    value = list(blocks or [])
+
+    if not value and reply:
+        value.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": slack_mrkdwn(reply)
+            }
+        })
+
+    if any(block.get("block_id") == "ivy_close_summary_actions" for block in value):
+        return value
+
+    value.append(close_and_summarize_block())
+    return value
+
+
+def should_offer_close_summary(response_source, jira_status, assistance_status, support_options_status):
+    return (
+        response_source in CLOSE_SUMMARY_RESPONSE_SOURCES
+        and not jira_status
+        and assistance_status not in {"pending_confirmation", "awaiting_details"}
+        and support_options_status not in {"pending", "creating_jira"}
+    )
 
 
 def simplify_slot(slot):
@@ -689,6 +759,50 @@ def invoke_rovo_enrichment(payload):
         "ok": False,
         "error": f"Unexpected Rovo Lambda invoke status: {status_code}",
         "error_code": "rovo_lambda_invoke_rejected",
+        "status_code": status_code
+    }
+
+
+def invoke_summarizer(payload):
+    if not SUMMARIZER_FUNCTION_NAME:
+        return {
+            "ok": False,
+            "error": "missing_summarizer_function",
+            "error_code": "missing_summarizer_function"
+        }
+
+    try:
+        response = lambda_client.invoke(
+            FunctionName=SUMMARIZER_FUNCTION_NAME,
+            InvocationType="Event",
+            Payload=json.dumps(payload).encode("utf-8")
+        )
+
+    except ClientError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "summarizer_lambda_invoke_failed"
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "summarizer_lambda_invoke_failed"
+        }
+
+    status_code = response.get("StatusCode")
+    if status_code and 200 <= int(status_code) < 300:
+        return {
+            "ok": True,
+            "status_code": status_code
+        }
+
+    return {
+        "ok": False,
+        "error": f"Unexpected summarizer Lambda invoke status: {status_code}",
+        "error_code": "summarizer_lambda_invoke_rejected",
         "status_code": status_code
     }
 
@@ -1199,6 +1313,7 @@ def build_image_payload(body, session_id, text, raw_text, image_files):
             "channel": body.get("channel"),
             "user": body.get("user"),
             "event_ts": body.get("ts"),
+            "thread_ts": body.get("thread_ts"),
         }
     }
 
@@ -1411,24 +1526,58 @@ def invoke_gemini_fallback(query, image_result, kb_error=None):
     )
 
     try:
+        started_at = time.time()
         with urllib.request.urlopen(request, timeout=GEMINI_TIMEOUT_SECONDS) as response:
             response_body = json.loads(response.read().decode("utf-8"))
 
     except Exception as e:
+        error_body = None
+        if hasattr(e, "read"):
+            try:
+                error_body = e.read().decode("utf-8", errors="replace")[:1000]
+            except Exception:
+                error_body = None
+
+        log_json({
+            "level": "ERROR",
+            "message": "gemini_request_failed",
+            "model_id": GEMINI_MODEL,
+            "timeout_seconds": GEMINI_TIMEOUT_SECONDS,
+            "latency_seconds": round(time.time() - started_at, 2) if "started_at" in locals() else None,
+            "error": str(e),
+            "error_body": error_body,
+        })
         return {
             "ok": False,
             "error": str(e),
-            "error_code": "gemini_request_failed"
+            "error_code": "gemini_request_failed",
+            "error_body": error_body,
         }
 
     reply = extract_gemini_text(response_body)
     if not reply:
+        log_json({
+            "level": "ERROR",
+            "message": "gemini_empty_reply",
+            "model_id": GEMINI_MODEL,
+            "latency_seconds": round(time.time() - started_at, 2),
+            "candidate_count": len(response_body.get("candidates") or []),
+        })
         return {
             "ok": False,
             "error": "empty_gemini_reply",
             "error_code": "empty_gemini_reply",
             "raw_response": response_body
         }
+
+    log_json({
+        "level": "INFO",
+        "message": "gemini_request_completed",
+        "model_id": GEMINI_MODEL,
+        "latency_seconds": round(time.time() - started_at, 2),
+        "candidate_count": len(response_body.get("candidates") or []),
+        "reply_length": len(reply),
+    })
 
     return {
         "ok": True,
@@ -1741,6 +1890,7 @@ def build_jira_payload(session_item, body, session_id, text, raw_text):
             "channel": body.get("channel"),
             "user": body.get("user"),
             "event_ts": body.get("ts"),
+            "thread_ts": body.get("thread_ts"),
         }
     }
 
@@ -1812,7 +1962,8 @@ def build_rovo_payload(
         "slack": {
             "channel": body.get("channel"),
             "user": body.get("user"),
-            "event_ts": body.get("ts")
+            "event_ts": body.get("ts"),
+            "thread_ts": body.get("thread_ts"),
         }
     }
 
@@ -1883,6 +2034,82 @@ def store_rovo_slack_message_target(session_id, slack_ts, slack_text):
         })
 
 
+def close_session_for_summary(session_id, timeout_token_value, closed_at):
+    remove_attributes = [
+        "next_action",
+        "jira_status",
+        "jira_intent_name",
+        "jira_request_text",
+        "jira_request_id",
+        "jira_requested_at",
+        "jira_confirmed_at",
+        "jira_create_started_at",
+        "jira_error",
+        "jira_error_code",
+        "jira_error_status",
+        "assistance_status",
+        "assistance_original_text",
+        "assistance_raw_text",
+        "assistance_lex_intent",
+        "assistance_lex_state",
+        "assistance_lex_slots",
+        "assistance_lex_reply",
+        "assistance_requested_at",
+        "assistance_followup_text",
+        "assistance_followup_raw_text",
+        "assistance_followup_at",
+        "support_options_status",
+        "support_original_text",
+        "support_raw_text",
+        "support_lex_intent",
+        "support_lex_state",
+        "support_lex_slots",
+        "support_lex_reply",
+        "support_claude_reply",
+        "support_claude_error",
+        "support_requested_at",
+        "live_agent_status",
+        "live_agent_requested_at",
+        "timeout_due_at",
+        "timeout_schedule_name",
+        "timeout_prompt_started_at",
+        "timeout_prompted_at",
+        "timeout_close_due_at",
+    ]
+    now_iso = to_iso(closed_at)
+
+    expression_values = {
+        ":closed": "closed",
+        ":manual_reason": "button_close_summary",
+        ":now": now_iso,
+        ":ttl": ttl_epoch(),
+        ":active": "active",
+    }
+    condition = "conversation_status = :active"
+
+    if timeout_token_value:
+        condition += " AND timeout_token = :timeout_token"
+        expression_values[":timeout_token"] = timeout_token_value
+
+    sessions_table.update_item(
+        Key={"session_id": session_id},
+        UpdateExpression=f"""
+            SET
+                conversation_status = :closed,
+                timeout_status = :closed,
+                manual_closed_at = :now,
+                manual_close_reason = :manual_reason,
+                timeout_closed_at = :now,
+                updated_at = :now,
+                #ttl = :ttl
+            REMOVE {", ".join(remove_attributes)}
+        """,
+        ConditionExpression=condition,
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues=expression_values,
+    )
+
+
 def base_interactive_result(session_item):
     return {
         "lex_intent": session_item.get("lex_intent") or "INTERACTIVE_ACTION",
@@ -1940,6 +2167,8 @@ def base_interactive_result(session_item):
         "support_resolved_at": None,
         "live_agent_status": None,
         "live_agent_requested_at": None,
+        "manual_close_summary": False,
+        "manual_close_timeout_token": None,
     }
 
 
@@ -2306,6 +2535,20 @@ def handle_interactive_action(session_item, body, session_id):
     now_iso = to_iso(datetime.now(timezone.utc))
     result = base_interactive_result(session_item)
 
+    if action_id == ACTION_ID_CLOSE_AND_SUMMARIZE:
+        if session_item.get("conversation_status") != "active":
+            return result
+
+        result.update({
+            "lex_state": "Fulfilled",
+            "response_source": "manual_close_summary",
+            "next_action": None,
+            "reply": "Closed this IVY session and started the summary.",
+            "manual_close_summary": True,
+            "manual_close_timeout_token": session_item.get("timeout_token"),
+        })
+        return result
+
     if action_id in {ACTION_ID_ASSISTANCE_NO, ACTION_ID_ASSISTANCE_SOLVED}:
         if not (
             has_pending_assistance_confirmation(session_item)
@@ -2549,6 +2792,7 @@ def process_record(record):
     user = body.get("user", "unknown-user")
     channel = body.get("channel")
     ts = body.get("ts")
+    thread_ts = body.get("thread_ts")
     event_type = body.get("event_type")
     channel_type = body.get("channel_type")
     routing_reason = body.get("routing_reason")
@@ -2556,8 +2800,7 @@ def process_record(record):
     action_value = body.get("action_value")
     is_interactive_action = event_type == "interactive_action"
 
-    session_id = f"{channel}:{user}"
-    lex_session_id = session_id
+    session_id = f"{channel}:{user}:{thread_ts}" if thread_ts else f"{channel}:{user}"
 
     log_json({
         "level": "INFO",
@@ -2569,11 +2812,31 @@ def process_record(record):
         "routing_reason": routing_reason,
         "user": user,
         "text": text,
+        "thread_ts": thread_ts,
         "image_file_count": len(image_files),
         "action_id": action_id
     })
 
     existing_session = get_session_item(session_id)
+    reset_closed_session = (
+        not is_interactive_action
+        and not thread_ts
+        and existing_session.get("conversation_status") in {"closed", "failed"}
+    )
+    if reset_closed_session:
+        lex_session_id = f"{session_id}:{event_id or int(time.time())}"
+        log_json({
+            "level": "INFO",
+            "message": "closed_session_reset_for_new_conversation",
+            "event_id": event_id,
+            "session_id": session_id,
+            "previous_conversation_status": existing_session.get("conversation_status"),
+            "lex_session_id": lex_session_id,
+        })
+        existing_session = {}
+    else:
+        lex_session_id = existing_session.get("lex_session_id") or session_id
+
     response_source = "lex"
     claude_fallback_attempted = False
     claude_fallback_error = None
@@ -2641,6 +2904,8 @@ def process_record(record):
     jira_confirmation_handled = False
     interactive_action_handled = False
     assistance_details_handled = False
+    manual_close_summary = False
+    manual_close_timeout_token = None
 
     if is_interactive_action:
         interactive_action_handled = True
@@ -2707,6 +2972,8 @@ def process_record(record):
         support_resolved_at = interactive_result.get("support_resolved_at")
         live_agent_status = interactive_result.get("live_agent_status")
         live_agent_requested_at = interactive_result.get("live_agent_requested_at")
+        manual_close_summary = interactive_result.get("manual_close_summary", False)
+        manual_close_timeout_token = interactive_result.get("manual_close_timeout_token")
 
         log_json({
             "level": "INFO",
@@ -2720,6 +2987,64 @@ def process_record(record):
             "support_options_status": support_options_status,
             "jira_status": jira_status
         })
+
+        if manual_close_summary:
+            closed_at = datetime.now(timezone.utc).replace(microsecond=0)
+
+            try:
+                close_session_for_summary(
+                    session_id,
+                    manual_close_timeout_token,
+                    closed_at
+                )
+
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                    lex_reply = "That action is no longer active. Please send a new message."
+                    send_slack_message(channel, lex_reply)
+                    log_json({
+                        "level": "INFO",
+                        "message": "manual_close_summary_ignored",
+                        "event_id": event_id,
+                        "session_id": session_id,
+                        "reason": "stale_or_closed_session"
+                    })
+                    return
+
+                raise
+
+            delete_timeout_schedule(session_id, "prompt")
+            delete_timeout_schedule(session_id, "close")
+
+            summarizer_result = invoke_summarizer({
+                "session_id": session_id,
+                "timeout_token": manual_close_timeout_token,
+                "closed_at": to_iso(closed_at),
+                "reason": "manual_close_summary"
+            })
+
+            log_json({
+                "level": "INFO" if summarizer_result.get("ok") else "ERROR",
+                "message": "manual_close_summary_summarizer_invoked",
+                "event_id": event_id,
+                "session_id": session_id,
+                "summarizer_function": SUMMARIZER_FUNCTION_NAME,
+                "ok": summarizer_result.get("ok"),
+                "error": summarizer_result.get("error"),
+                "error_code": summarizer_result.get("error_code")
+            })
+
+            slack_response = send_slack_message(channel, lex_reply)
+
+            log_json({
+                "level": "INFO",
+                "message": "manual_close_summary_completed",
+                "event_id": event_id,
+                "session_id": session_id,
+                "summarizer_ok": summarizer_result.get("ok"),
+                "slack_ts": slack_response.get("ts")
+            })
+            return
 
     elif has_image and not is_interactive_action:
         image_requested_at = to_iso(datetime.now(timezone.utc))
@@ -3164,6 +3489,18 @@ def process_record(record):
     if support_options_status in {"pending", "creating_jira"}:
         conversation_status = "active"
 
+    offer_close_summary = (
+        not is_interactive_action
+        and should_offer_close_summary(
+            response_source,
+            jira_status,
+            assistance_status,
+            support_options_status
+        )
+    )
+    if offer_close_summary:
+        conversation_status = "active"
+
     activity_at_dt = datetime.now(timezone.utc).replace(microsecond=0)
     updated_at = to_iso(activity_at_dt)
 
@@ -3199,7 +3536,16 @@ def process_record(record):
             "timeout_schedule_name": timeout_schedule_name(session_id, "prompt")
         }
 
-    update_expression = """
+    if offer_close_summary:
+        slack_blocks = add_close_and_summarize_button(slack_blocks, lex_reply)
+
+    created_at_expression = (
+        "created_at = :created_at"
+        if reset_closed_session
+        else "created_at = if_not_exists(created_at, :created_at)"
+    )
+
+    update_expression = f"""
         SET
             #channel = :channel,
             #user = :user,
@@ -3207,6 +3553,7 @@ def process_record(record):
             last_user_text = :last_user_text,
             last_raw_user_text = :last_raw_user_text,
             last_bot_reply = :last_bot_reply,
+            thread_ts = :thread_ts,
             response_source = :response_source,
             claude_fallback_attempted = :claude_fallback_attempted,
             last_ts = :last_ts,
@@ -3220,7 +3567,7 @@ def process_record(record):
             lex_slots = :lex_slots,
             conversation_status = :conversation_status,
             timeout_status = :timeout_status,
-            created_at = if_not_exists(created_at, :created_at),
+            {created_at_expression},
             updated_at = :updated_at,
             #ttl = :ttl
     """
@@ -3232,6 +3579,7 @@ def process_record(record):
         ":last_user_text": text,
         ":last_raw_user_text": raw_text,
         ":last_bot_reply": lex_reply,
+        ":thread_ts": thread_ts,
         ":response_source": response_source,
         ":claude_fallback_attempted": claude_fallback_attempted,
         ":last_ts": ts,
@@ -3252,6 +3600,22 @@ def process_record(record):
     }
 
     remove_attributes = []
+    if reset_closed_session:
+        remove_attributes.extend([
+            "manual_closed_at",
+            "manual_close_reason",
+            "summary_status",
+            "summary_started_at",
+            "summary_completed_at",
+            "summary_failed_at",
+            "summary_error",
+            "summary_error_code",
+            "conversation_summary",
+            "summary_webhook_sent",
+            "summary_webhook_error",
+            "summary_audit_s3_key",
+            "summary_audit_error",
+        ])
 
     if timeout_state:
         update_expression += """

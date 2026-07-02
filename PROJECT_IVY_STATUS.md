@@ -37,6 +37,7 @@ The diagram maps the current code approximately as:
 - `lambda_o3_create_jira_ticket.py` -> `O3_CreateJiraTicket`
 - `lambda_o3_rovo_enrichment.py` -> `Rovo` enrichment path
 - `lambda_o3_image_rek.py` -> `O3_Image_rek` / image-analysis path
+- `lambda_o3_slack_summarizer.py` -> `O3_slack_summarizer`
 
 ## Current Implementation
 
@@ -71,9 +72,11 @@ Responsibilities:
 - Simplifies Lex slots.
 - Stores session state in DynamoDB table `o3_slack_sessions` by default.
 - Stores `last_activity_at`, `timeout_due_at`, `timeout_token`, and timeout status fields in the session record.
+- Uses Slack DM `thread_ts` in the session key so each top-level DM issue becomes its own thread-backed IVY session.
 - Refreshes a per-session EventBridge Scheduler prompt schedule after active user messages.
 - Resets stale timeout prompt/close fields when a user resumes an active session.
-- Sends Lex response back to Slack through `chat.postMessage`.
+- Sends Lex response back to Slack through `chat.postMessage`, using `thread_ts` so replies stay in the current issue thread.
+- Adds a `Close & summarize` button to active answer-style Slack replies so users can close the IVY session manually.
 - Reads Lex fulfillment `sessionAttributes` from the router and stores action metadata in the session record.
 - Handles pending Jira ticket confirmations before calling Lex.
 - Invokes the CreateJiraTicket Lambda only after the user confirms ticket creation.
@@ -214,7 +217,7 @@ Responsibilities:
 - Handles EventBridge Scheduler `prompt` and `close` actions.
 - Validates scheduled events against the session's current `timeout_token`.
 - Ignores stale schedules when a user has already replied or a conversation is no longer active.
-- Sends the inactivity timeout prompt as a normal Slack DM message.
+- Sends the inactivity timeout prompt into the session thread when `thread_ts` is stored.
 - Creates the close schedule after the timeout prompt is sent.
 - Closes sessions that remain inactive through the grace window.
 - Invokes an optional summarizer Lambda asynchronously when configured.
@@ -262,6 +265,7 @@ Optional:
 - `CREATE_JIRA_TICKET_FUNCTION`, required for confirmed Jira ticket creation
 - `ENABLE_ROVO_ENRICHMENT`, default `false`
 - `ROVO_ENRICHMENT_FUNCTION`, required when `ENABLE_ROVO_ENRICHMENT=true`
+- `SUMMARIZER_FUNCTION_NAME`, optional Lambda name or ARN for manual Close & summarize button invocation
 - `IMAGE_REK_FUNCTION`, required for Slack image upload analysis
 - `IMAGE_ANALYSIS_UNAVAILABLE_REPLY`, default `I received the image, but image analysis is not configured yet.`
 - `BEDROCK_KNOWLEDGE_BASE_ID`, required for image Bedrock KB fallback
@@ -289,6 +293,7 @@ IAM:
 - Worker Lambda execution role needs `dynamodb:GetItem` and `dynamodb:UpdateItem` on `O3_slack_sessions`.
 - Worker Lambda execution role needs `lambda:InvokeFunction` on the CreateJiraTicket Lambda.
 - Worker Lambda execution role needs `lambda:InvokeFunction` on the RovoEnrichment Lambda when `ENABLE_ROVO_ENRICHMENT=true`.
+- Worker Lambda execution role needs `lambda:InvokeFunction` on the Summarizer Lambda when `SUMMARIZER_FUNCTION_NAME` is configured.
 - Worker Lambda execution role needs `lambda:InvokeFunction` on the ImageRek Lambda when `IMAGE_REK_FUNCTION` is configured.
 - Worker Lambda execution role needs `bedrock:RetrieveAndGenerate` for the configured Bedrock Knowledge Base.
 
@@ -390,6 +395,57 @@ Optional:
 - `SCHEDULER_NAME_PREFIX`, default `o3-slack-timeout`
 - `SUMMARIZER_FUNCTION_NAME`, optional Lambda name or ARN for async summarizer invocation
 
+### Slack Summarizer Lambda
+
+File: `lambda_o3_slack_summarizer.py`
+
+Responsibilities:
+
+- Receives async close events from the timeout handler with `session_id`, `timeout_token`, `closed_at`, and close reason.
+- Reads the IVY Slack session from DynamoDB and validates the timeout token before summarizing.
+- Fetches Slack conversation history with `conversations.history` for the IVY DM/channel session window.
+- Supports `conversations.replies` when a thread timestamp is present for compatibility with older threaded Slack flows.
+- Cleans Slack text from message text, section fields, context blocks, rich text blocks, and attachment fallbacks.
+- Filters timeout/close boilerplate messages out of the audit transcript.
+- Builds a deterministic session summary with original request, last user message, last bot message, message counts, Lex/Jira metadata, and response source.
+- Uses Bedrock Claude to add a concise natural-language `ai_summary` when `ENABLE_AI_SUMMARY=true`.
+- Optionally posts the summary/audit payload to `SUMMARY_WEBHOOK_URL` or `POWER_AUTOMATE_URL`.
+- Optionally stores the raw Slack audit payload in S3.
+- Stores `summary_status`, `conversation_summary`, webhook status, optional audit S3 key, and timing/error metadata back to DynamoDB.
+
+Required:
+
+- `SLACK_BOT_TOKEN`
+
+Optional:
+
+- `AWS_REGION`, default `ap-southeast-2`
+- `DYNAMODB_TABLE`, default `o3_slack_sessions`
+- `SESSION_TTL_SECONDS`, default `86400`
+- `SLACK_API_TIMEOUT_SECONDS`, default `10`
+- `SUMMARY_HISTORY_LOOKBACK_SECONDS`, default `7200`
+- `SUMMARY_HISTORY_LIMIT`, default `100`
+- `SUMMARY_WEBHOOK_URL`, optional audit/log webhook
+- `POWER_AUTOMATE_URL`, fallback webhook variable compatible with the reference implementation
+- `SUMMARY_WEBHOOK_TIMEOUT_SECONDS`, default `15`
+- `AUDIT_S3_BUCKET`, optional bucket for raw Slack audit logs
+- `AUDIT_S3_PREFIX`, default `slack-audit`
+- `ENABLE_AI_SUMMARY`, default `true`
+- `BEDROCK_MODEL_ID`, default `au.anthropic.claude-sonnet-4-6`
+- `AI_SUMMARY_MAX_TOKENS`, default `220`
+- `AI_SUMMARY_TEMPERATURE`, default `0.1`
+- `SEND_CLOSE_NOTIFICATION`, default `false`
+- `SEND_FEEDBACK_PROMPT`, default `false`
+- `CLOSE_NOTIFICATION_TEXT`, default `This session has been closed.`
+- `FEEDBACK_PROMPT_TEXT`, default `How was your experience with IVY Assist today?`
+
+IAM:
+
+- Summarizer Lambda execution role needs `dynamodb:GetItem` and `dynamodb:UpdateItem` on `O3_slack_sessions`.
+- Summarizer Lambda execution role needs `s3:PutObject` on `AUDIT_S3_BUCKET` when audit storage is enabled.
+- Summarizer Lambda execution role needs `bedrock:InvokeModel` for `BEDROCK_MODEL_ID` when AI summaries are enabled.
+- Slack bot token scopes must allow `conversations:history`, `users:read.email` when email capture is needed, and `chat:write` when optional close/feedback messages are enabled.
+
 ### Claude Fallback Lambda
 
 Optional:
@@ -444,6 +500,9 @@ Implemented from diagram:
 - `O3_slack_timeout_handler -> Slack timeout prompt`
 - `O3_slack_timeout_handler -> O3_slack_sessions`
 - `O3_slack_timeout_handler -> O3_slack_summarizer` optional async hook
+- `O3_slack_summarizer -> Slack conversation history`
+- `O3_slack_summarizer -> summary webhook / Power Automate` optional log path
+- `O3_slack_summarizer -> audit S3` optional raw audit path
 - `LEX -> O3_lambda_router`
 - `O3_lambda_router -> O3_CreateJiraTicket` through worker confirmation
 - `O3_CreateJiraTicket -> Jira`
@@ -456,7 +515,6 @@ Implemented from diagram:
 
 Not implemented yet:
 
-- Actual `O3_slack_summarizer` implementation
 - `LEX -> O3_Escalation`
 - `O3_lambda_router -> O3_Image_rek` for text-only image-analysis intents
 - `O3_Image_rek -> O3-image-internal-db`
@@ -468,6 +526,8 @@ Not implemented yet:
 
 Current known tests/checks:
 
+- Python syntax parsing passed for `lambda_o3_slack_worker.py` and `lambda_o3_slack_summarizer.py` after adding the manual Close & summarize button on 2026-07-01.
+- Python syntax parsing passed for `lambda_o3_slack_summarizer.py` on 2026-07-01.
 - Python syntax parsing passed for handler, worker, timeout handler, and Claude fallback after recent edits.
 - Python syntax parsing passed for handler, worker, and image recognition Lambda on 2026-06-29.
 - PDF architecture extraction was run with:
@@ -481,6 +541,9 @@ Current known tests/checks:
 Manual Slack test scenarios:
 
 - DM bot with text: should process.
+- New top-level DM issue should create a thread-backed session whose id includes `thread_ts`.
+- Reply inside that Slack thread should continue the same IVY session.
+- A separate top-level DM issue should create a separate IVY session/thread.
 - Public channel without bot mention: should ignore.
 - Public channel with bot mention: should ignore.
 - Private channel message: should ignore.
@@ -502,6 +565,17 @@ Manual timeout-flow test:
 - Reply before the close schedule fires and confirm the worker writes a new `timeout_token`; the old close schedule should be ignored as stale.
 - Repeat without replying and confirm the close action sets `conversation_status=closed` and `timeout_status=closed`.
 - If `SUMMARIZER_FUNCTION_NAME` is configured, confirm the timeout handler invokes it asynchronously after closing.
+
+Manual Close & summarize button test:
+
+- DM the bot and confirm active answer-style replies include `Close & summarize`.
+- Click `Close & summarize` and confirm Slack replies `Closed this IVY session and started the summary.`
+- Confirm DynamoDB stores `conversation_status=closed`, `timeout_status=closed`, `manual_close_reason=button_close_summary`, and `manual_closed_at`.
+- Confirm the session row stores `thread_ts` and the summarizer uses the thread transcript.
+- Confirm prompt/close schedules are deleted or ignored.
+- Confirm worker logs `manual_close_summary_summarizer_invoked`.
+- Confirm summarizer stores `conversation_summary.ai_summary` and an audit S3 key.
+- Click the same button again and confirm the worker returns `That action is no longer active. Please send a new message.`
 
 Manual Claude fallback test:
 

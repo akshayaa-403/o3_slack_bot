@@ -15,6 +15,7 @@ QUEUE_URL = os.environ["SQS_QUEUE_URL"]
 # Slack signature verification is disabled by default for open testing.
 # Set VERIFY_SLACK_SIGNATURE=true and SLACK_SIGNING_SECRET to enforce it again.
 SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "")
+SLACK_BOT_USER_ID = os.environ.get("SLACK_BOT_USER_ID", "")
 VERIFY_SLACK_SIGNATURE = os.environ.get("VERIFY_SLACK_SIGNATURE", "false").lower() == "true"
 DEDUP_TABLE = os.environ.get("DEDUP_TABLE", "O3_EventDedup2")
 DEDUP_TTL_SECONDS = int(os.environ.get("DEDUP_TTL_SECONDS", "172800"))
@@ -104,8 +105,22 @@ def is_direct_message(slack_event):
     return slack_event.get("channel_type") == "im" or channel.startswith("D")
 
 
+def message_mentions_bot(slack_event):
+    text = slack_event.get("text") or ""
+
+    if SLACK_BOT_USER_ID and f"<@{SLACK_BOT_USER_ID}>" in text:
+        return True
+
+    return slack_event.get("type") == "app_mention"
+
+
 def clean_slack_text(text):
-    return (text or "").strip()
+    value = (text or "").strip()
+
+    if SLACK_BOT_USER_ID:
+        value = value.replace(f"<@{SLACK_BOT_USER_ID}>", "").strip()
+
+    return value
 
 
 def is_image_file(file_info):
@@ -185,6 +200,7 @@ def enqueue_interactive_action(payload):
     channel = payload.get("channel", {}) or {}
     message = payload.get("message", {}) or {}
     container = payload.get("container", {}) or {}
+    thread_ts = message.get("thread_ts") or container.get("thread_ts")
     action_id = action.get("action_id")
     action_value = action.get("value") or action_id or ""
     event_id = build_interactive_event_id(payload, action)
@@ -221,6 +237,7 @@ def enqueue_interactive_action(payload):
             "raw_text": action_value,
             "user": user.get("id"),
             "ts": action.get("action_ts") or container.get("message_ts") or message.get("ts"),
+            "thread_ts": thread_ts,
             "event_type": "interactive_action",
             "channel_type": "im" if (channel.get("id") or "").startswith("D") else None,
             "routing_reason": "interactive_action",
@@ -248,11 +265,17 @@ def enqueue_interactive_action(payload):
 def should_process_slack_event(slack_event):
     event_type = slack_event.get("type")
 
+    if event_type == "app_mention":
+        return True, "app_mention"
+
     if event_type != "message":
         return False, "unsupported_event_type"
 
     if is_direct_message(slack_event):
         return True, "direct_message"
+
+    if message_mentions_bot(slack_event):
+        return True, "bot_mentioned"
 
     return False, "non_dm_ignored"
 
@@ -364,6 +387,7 @@ def lambda_handler(event, context):
     image_files = extract_image_files(slack_event)
     user = slack_event.get("user")
     ts = slack_event.get("ts")
+    thread_ts = slack_event.get("thread_ts")
 
     log_json({
         "level": "INFO",
@@ -375,6 +399,7 @@ def lambda_handler(event, context):
         "routing_reason": routing_reason,
         "user": user,
         "text": text,
+        "thread_ts": thread_ts,
         "image_file_count": len(image_files)
     })
 
@@ -388,6 +413,7 @@ def lambda_handler(event, context):
                 "raw_text": raw_text,
                 "user": user,
                 "ts": ts,
+                "thread_ts": thread_ts,
                 "event_type": event_type,
                 "channel_type": channel_type,
                 "routing_reason": routing_reason,
