@@ -53,7 +53,13 @@ CLAUDE_FAILURE_REPLY = os.environ.get(
 CREATE_JIRA_TICKET_FUNCTION = os.environ.get("CREATE_JIRA_TICKET_FUNCTION")
 ENABLE_ROVO_ENRICHMENT = os.environ.get("ENABLE_ROVO_ENRICHMENT", "false").lower() == "true"
 ROVO_ENRICHMENT_FUNCTION = os.environ.get("ROVO_ENRICHMENT_FUNCTION")
+LIVE_AGENT_FUNCTION = os.environ.get("LIVE_AGENT_FUNCTION")
+LIVE_AGENT_WEBHOOK_URL = os.environ.get("LIVE_AGENT_WEBHOOK_URL") or os.environ.get("AUTOMATION_WEBHOOK_URL")
+LIVE_AGENT_CONFIG_TABLE = os.environ.get("LIVE_AGENT_CONFIG_TABLE") or os.environ.get("CONFIG_TABLE")
+LIVE_AGENT_CONFIG_INTENT = os.environ.get("LIVE_AGENT_CONFIG_INTENT", "LiveAgent")
+LIVE_AGENT_WEBHOOK_TIMEOUT_SECONDS = int(os.environ.get("LIVE_AGENT_WEBHOOK_TIMEOUT_SECONDS", "10"))
 SUMMARIZER_FUNCTION_NAME = os.environ.get("SUMMARIZER_FUNCTION_NAME")
+SUMMARIZER_INVOKE_TIMEOUT_SECONDS = int(os.environ.get("SUMMARIZER_INVOKE_TIMEOUT_SECONDS", "25"))
 IMAGE_REK_FUNCTION = os.environ.get("IMAGE_REK_FUNCTION")
 IMAGE_ANALYSIS_UNAVAILABLE_REPLY = os.environ.get(
     "IMAGE_ANALYSIS_UNAVAILABLE_REPLY",
@@ -145,7 +151,11 @@ CLAUDE_UNRESOLVED_REPLY = os.environ.get(
 )
 LIVE_AGENT_DEFERRED_REPLY = os.environ.get(
     "LIVE_AGENT_DEFERRED_REPLY",
-    "I have marked this for live agent support. Live-agent handoff is not wired yet."
+    "I have sent this to live agent support. Someone from the support team will follow up."
+)
+LIVE_AGENT_FAILED_REPLY = os.environ.get(
+    "LIVE_AGENT_FAILED_REPLY",
+    "I could not send this to live agent support. Please try again later or create a Jira ticket."
 )
 
 NEXT_ACTION_CREATE_JIRA_TICKET = "O3_CreateJiraTicket"
@@ -161,6 +171,23 @@ ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET = "ivy_assistance_create_jira_ticket"
 ACTION_ID_LIVE_AGENT_SUPPORT = "ivy_live_agent_support"
 ACTION_ID_CREATE_JIRA_TICKET = "ivy_create_jira_ticket"
 ACTION_ID_CLOSE_AND_SUMMARIZE = "ivy_close_and_summarize"
+
+SESSION_STATE_OPEN = "OPEN"
+SESSION_STATE_COLLECTING_DETAILS = "COLLECTING_DETAILS"
+SESSION_STATE_WAITING_FOR_USER = "WAITING_FOR_USER"
+SESSION_STATE_SUMMARIZING = "SUMMARIZING"
+SESSION_STATE_CLOSED = "CLOSED"
+SESSION_STATE_FAILED = "FAILED"
+
+GREETING_ONLY_TEXTS = {
+    "hi",
+    "hello",
+    "hey",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "test",
+}
 
 CLOSE_SUMMARY_RESPONSE_SOURCES = {
     "lex",
@@ -198,6 +225,7 @@ JIRA_CONFIRM_NO = {
 
 sessions_table = dynamodb.Table(DYNAMODB_TABLE)
 screenshot_issue_table = dynamodb.Table(SCREENSHOT_ISSUE_TABLE) if SCREENSHOT_ISSUE_TABLE else None
+live_agent_config_table = dynamodb.Table(LIVE_AGENT_CONFIG_TABLE) if LIVE_AGENT_CONFIG_TABLE else None
 
 
 def to_iso(dt):
@@ -272,6 +300,78 @@ def send_slack_message(channel, text, blocks=None, thread_ts=None):
     return result
 
 
+def slack_api(method, params=None, payload=None, http_method=None):
+    params = params or {}
+    url = f"https://slack.com/api/{method}"
+    data = None
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+        http_method = http_method or "POST"
+    else:
+        if params:
+            url = f"{url}?{urllib.parse.urlencode(params)}"
+        http_method = http_method or "GET"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=http_method)
+
+    with urllib.request.urlopen(req, timeout=10) as response:
+        result = json.loads(response.read().decode("utf-8"))
+
+    if not result.get("ok"):
+        raise Exception(f"Slack API {method} failed: {result.get('error')}")
+
+    return result
+
+
+def fetch_conversation_metadata(channel, fallback_type=None):
+    metadata = {
+        "conversation_type": fallback_type,
+        "is_dm": fallback_type == "im",
+        "is_mpim": fallback_type == "mpim",
+        "is_channel": fallback_type == "channel",
+        "is_private": fallback_type == "group",
+    }
+
+    if not channel:
+        return metadata
+
+    try:
+        response = slack_api("conversations.info", {"channel": channel})
+        info = response.get("channel") or {}
+        conversation_type = (
+            "im" if info.get("is_im")
+            else "mpim" if info.get("is_mpim")
+            else "group" if info.get("is_group") or info.get("is_private")
+            else "channel" if info.get("is_channel")
+            else fallback_type
+        )
+        metadata.update({
+            "conversation_type": conversation_type,
+            "conversation_name": info.get("name") or info.get("user"),
+            "is_dm": bool(info.get("is_im")),
+            "is_mpim": bool(info.get("is_mpim")),
+            "is_channel": bool(info.get("is_channel")),
+            "is_private": bool(info.get("is_group") or info.get("is_private")),
+        })
+
+    except Exception as e:
+        log_json({
+            "level": "WARN",
+            "message": "conversation_metadata_lookup_failed",
+            "channel": channel,
+            "error": str(e),
+        })
+
+    return metadata
+
+
+def is_dm_like_conversation(metadata):
+    return metadata.get("is_dm") or metadata.get("is_mpim") or metadata.get("conversation_type") in {"im", "mpim"}
+
+
 def slack_mrkdwn(text, limit=2900):
     value = (text or "").strip()
 
@@ -309,29 +409,19 @@ def assistance_blocks(lex_reply):
                     "type": "button",
                     "text": {
                         "type": "plain_text",
-                        "text": "Solved"
+                        "text": "Close & summarize"
                     },
-                    "action_id": ACTION_ID_ASSISTANCE_SOLVED,
-                    "value": "solved"
+                    "action_id": ACTION_ID_CLOSE_AND_SUMMARIZE,
+                    "value": "close_and_summarize"
                 },
                 {
                     "type": "button",
                     "text": {
                         "type": "plain_text",
-                        "text": "Need more help"
+                        "text": "I need more help"
                     },
                     "action_id": ACTION_ID_ASSISTANCE_NEED_MORE_HELP,
                     "value": "need_more_help"
-                },
-                {
-                    "type": "button",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "Create Jira ticket"
-                    },
-                    "style": "primary",
-                    "action_id": ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET,
-                    "value": "create_jira_ticket"
                 }
             ]
         }
@@ -395,7 +485,7 @@ def final_support_blocks(reply):
     ]
 
 
-def close_and_summarize_block():
+def close_summary_actions_block():
     return {
         "type": "actions",
         "block_id": "ivy_close_summary_actions",
@@ -408,12 +498,21 @@ def close_and_summarize_block():
                 },
                 "action_id": ACTION_ID_CLOSE_AND_SUMMARIZE,
                 "value": "close_and_summarize"
+            },
+            {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "I need more help"
+                },
+                "action_id": ACTION_ID_ASSISTANCE_NEED_MORE_HELP,
+                "value": "need_more_help"
             }
         ]
     }
 
 
-def add_close_and_summarize_button(blocks, reply=None):
+def add_close_summary_actions(blocks, reply=None):
     value = list(blocks or [])
 
     if not value and reply:
@@ -428,17 +527,79 @@ def add_close_and_summarize_button(blocks, reply=None):
     if any(block.get("block_id") == "ivy_close_summary_actions" for block in value):
         return value
 
-    value.append(close_and_summarize_block())
+    value.append(close_summary_actions_block())
     return value
 
 
-def should_offer_close_summary(response_source, jira_status, assistance_status, support_options_status):
+def normalized_user_text(text):
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def has_meaningful_user_issue(text):
+    value = normalized_user_text(text)
+    if not value or value in GREETING_ONLY_TEXTS:
+        return False
+
+    return len(value) >= 8 or any(char in value for char in "?!.") or len(value.split()) >= 3
+
+
+def has_meaningful_bot_answer(reply):
+    value = normalized_user_text(reply)
+    if not value:
+        return False
+
+    return len(value) >= 20 or len(value.split()) >= 5
+
+
+def should_offer_close_summary(
+    response_source,
+    jira_status,
+    assistance_status,
+    support_options_status,
+    session_item,
+    user_text,
+    bot_reply,
+):
+    if session_item.get("summary_status") in {"started", "completed"}:
+        return False
+
+    if session_item.get("conversation_status") in {"closed", "failed"}:
+        return False
+
     return (
         response_source in CLOSE_SUMMARY_RESPONSE_SOURCES
         and not jira_status
         and assistance_status not in {"pending_confirmation", "awaiting_details"}
         and support_options_status not in {"pending", "creating_jira"}
+        and has_meaningful_user_issue(user_text)
+        and has_meaningful_bot_answer(bot_reply)
     )
+
+
+def transcript_entry(sender, text, ts=None):
+    clean_text = (text or "").strip()
+    if not clean_text:
+        return None
+
+    return {
+        "sender": sender,
+        "text": clean_text,
+        "ts": ts,
+        "recorded_at": to_iso(datetime.now(timezone.utc)),
+    }
+
+
+def build_transcript_append(user_text, bot_text, user_ts, bot_ts=None):
+    entries = []
+    user_entry = transcript_entry("User", user_text, user_ts) if has_meaningful_user_issue(user_text) else None
+    bot_entry = transcript_entry("Bot", bot_text, bot_ts) if has_meaningful_bot_answer(bot_text) else None
+
+    if user_entry:
+        entries.append(user_entry)
+    if bot_entry:
+        entries.append(bot_entry)
+
+    return entries
 
 
 def simplify_slot(slot):
@@ -774,7 +935,7 @@ def invoke_summarizer(payload):
     try:
         response = lambda_client.invoke(
             FunctionName=SUMMARIZER_FUNCTION_NAME,
-            InvocationType="Event",
+            InvocationType="RequestResponse",
             Payload=json.dumps(payload).encode("utf-8")
         )
 
@@ -792,17 +953,26 @@ def invoke_summarizer(payload):
             "error_code": "summarizer_lambda_invoke_failed"
         }
 
-    status_code = response.get("StatusCode")
-    if status_code and 200 <= int(status_code) < 300:
+    response_payload = {}
+    if response.get("Payload"):
+        response_payload = json.loads(response["Payload"].read().decode("utf-8") or "{}")
+
+    if response.get("FunctionError"):
         return {
-            "ok": True,
-            "status_code": status_code
+            "ok": False,
+            "error": response_payload.get("error") or response.get("FunctionError"),
+            "error_code": response_payload.get("error_code") or "summarizer_lambda_error",
+            "status_code": response.get("StatusCode"),
         }
+
+    status_code = response.get("StatusCode")
+    if status_code and 200 <= int(status_code) < 300 and response_payload.get("ok"):
+        return {**response_payload, "status_code": status_code}
 
     return {
         "ok": False,
-        "error": f"Unexpected summarizer Lambda invoke status: {status_code}",
-        "error_code": "summarizer_lambda_invoke_rejected",
+        "error": response_payload.get("error") or f"Unexpected summarizer Lambda invoke status: {status_code}",
+        "error_code": response_payload.get("error_code") or "summarizer_lambda_invoke_rejected",
         "status_code": status_code
     }
 
@@ -2034,7 +2204,7 @@ def store_rovo_slack_message_target(session_id, slack_ts, slack_text):
         })
 
 
-def close_session_for_summary(session_id, timeout_token_value, closed_at):
+def mark_session_summarizing(session_id, timeout_token_value, started_at):
     remove_attributes = [
         "next_action",
         "jira_status",
@@ -2070,16 +2240,19 @@ def close_session_for_summary(session_id, timeout_token_value, closed_at):
         "support_requested_at",
         "live_agent_status",
         "live_agent_requested_at",
+        "live_agent_error",
+        "live_agent_error_code",
         "timeout_due_at",
         "timeout_schedule_name",
         "timeout_prompt_started_at",
         "timeout_prompted_at",
         "timeout_close_due_at",
     ]
-    now_iso = to_iso(closed_at)
+    now_iso = to_iso(started_at)
 
     expression_values = {
-        ":closed": "closed",
+        ":summarizing": "summarizing",
+        ":session_state": SESSION_STATE_SUMMARIZING,
         ":manual_reason": "button_close_summary",
         ":now": now_iso,
         ":ttl": ttl_epoch(),
@@ -2095,11 +2268,12 @@ def close_session_for_summary(session_id, timeout_token_value, closed_at):
         Key={"session_id": session_id},
         UpdateExpression=f"""
             SET
-                conversation_status = :closed,
-                timeout_status = :closed,
-                manual_closed_at = :now,
+                conversation_status = :summarizing,
+                session_state = :session_state,
+                timeout_status = :summarizing,
+                summary_status = :summarizing,
+                summary_started_at = :now,
                 manual_close_reason = :manual_reason,
-                timeout_closed_at = :now,
                 updated_at = :now,
                 #ttl = :ttl
             REMOVE {", ".join(remove_attributes)}
@@ -2167,6 +2341,8 @@ def base_interactive_result(session_item):
         "support_resolved_at": None,
         "live_agent_status": None,
         "live_agent_requested_at": None,
+        "live_agent_error": None,
+        "live_agent_error_code": None,
         "manual_close_summary": False,
         "manual_close_timeout_token": None,
     }
@@ -2530,13 +2706,246 @@ def handle_support_create_jira(session_item, body, session_id, now_iso):
     return result
 
 
+def get_live_agent_config():
+    if not live_agent_config_table:
+        return None
+
+    try:
+        response = live_agent_config_table.get_item(
+            Key={"intentName": LIVE_AGENT_CONFIG_INTENT}
+        )
+        return response.get("Item")
+
+    except ClientError as e:
+        log_json({
+            "level": "WARN",
+            "message": "live_agent_config_lookup_failed",
+            "intent_name": LIVE_AGENT_CONFIG_INTENT,
+            "error": str(e),
+        })
+        return None
+
+
+def parse_config_parameters(config):
+    parameters = (config or {}).get("parameters")
+    if isinstance(parameters, dict):
+        return parameters
+
+    if isinstance(parameters, str) and parameters.strip():
+        try:
+            parsed = json.loads(parameters)
+            return parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            log_json({
+                "level": "WARN",
+                "message": "live_agent_config_parameters_invalid",
+                "intent_name": LIVE_AGENT_CONFIG_INTENT,
+            })
+
+    return {}
+
+
+def compact_session_messages(session_item, limit=40):
+    messages = session_item.get("session_messages") or []
+    return messages[-limit:]
+
+
+def build_live_agent_payload(session_item, body, session_id, now_iso):
+    config = get_live_agent_config()
+    config_parameters = parse_config_parameters(config)
+    original_text = support_original_text(session_item) or session_item.get("last_user_text") or body.get("text") or ""
+    raw_text = support_raw_text(session_item) or session_item.get("last_raw_user_text") or original_text
+
+    payload = {
+        "type": "live_agent_handoff",
+        "source": "slack",
+        "session_id": session_id,
+        "intent_name": LIVE_AGENT_CONFIG_INTENT,
+        "configIntent": LIVE_AGENT_CONFIG_INTENT,
+        "requested_at": now_iso,
+        "title": (config or {}).get("title") or "Live agent support request",
+        "description": original_text,
+        "raw_text": raw_text,
+        "requestType": (config or {}).get("requestType"),
+        "branching": (config or {}).get("branching"),
+        "assignment": {
+            "assignee": config_parameters.get("assignee"),
+            "projectParams": config_parameters.get("projectParams") or config_parameters.get("assignee"),
+        },
+        "businessNotification": {
+            "description": (config or {}).get("description"),
+            "additionsDetails": [],
+            "slackMessage": [],
+        },
+        "slack": {
+            "channelId": body.get("channel") or session_item.get("channel"),
+            "threadTs": session_item.get("thread_ts") or body.get("thread_ts"),
+            "userId": body.get("user") or session_item.get("user"),
+            "eventTs": body.get("ts"),
+            "channelType": body.get("channel_type") or session_item.get("channel_type"),
+            "conversationType": session_item.get("conversation_type"),
+            "conversationMetadata": session_item.get("conversation_metadata") or {},
+        },
+        "user": body.get("user") or session_item.get("user"),
+        "email": session_item.get("email") or session_item.get("user_email"),
+        "atlassianAccountId": session_item.get("atlassianAccountId") or session_item.get("atlassian_account_id"),
+        "conversation": compact_session_messages(session_item),
+        "context": {
+            "last_bot_reply": session_item.get("last_bot_reply"),
+            "support_lex_reply": session_item.get("support_lex_reply"),
+            "support_claude_reply": session_item.get("support_claude_reply"),
+            "support_claude_error": session_item.get("support_claude_error"),
+            "lex_intent": session_item.get("lex_intent"),
+            "lex_state": session_item.get("lex_state"),
+            "response_source": session_item.get("response_source"),
+        },
+        "config": config,
+    }
+
+    return payload
+
+
+def invoke_live_agent_webhook(payload):
+    if not LIVE_AGENT_WEBHOOK_URL:
+        return {
+            "ok": False,
+            "error": "missing_live_agent_webhook_url",
+            "error_code": "missing_live_agent_webhook_url",
+        }
+
+    request = urllib.request.Request(
+        LIVE_AGENT_WEBHOOK_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=LIVE_AGENT_WEBHOOK_TIMEOUT_SECONDS) as response:
+            response_text = response.read().decode("utf-8")
+            if response.status < 200 or response.status >= 300:
+                return {
+                    "ok": False,
+                    "error": f"Live agent webhook returned HTTP {response.status}",
+                    "error_code": "live_agent_webhook_failed",
+                    "status": response.status,
+                }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "live_agent_webhook_failed",
+        }
+
+    parsed_response = None
+    if response_text.strip():
+        try:
+            parsed_response = json.loads(response_text)
+        except ValueError:
+            parsed_response = {"message": response_text.strip()}
+
+    return {
+        "ok": True,
+        "status": response.status,
+        "response": parsed_response,
+    }
+
+
+def invoke_live_agent_function(payload):
+    if not LIVE_AGENT_FUNCTION:
+        return {
+            "ok": False,
+            "error": "missing_live_agent_function",
+            "error_code": "missing_live_agent_function",
+        }
+
+    try:
+        response = lambda_client.invoke(
+            FunctionName=LIVE_AGENT_FUNCTION,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload).encode("utf-8")
+        )
+
+    except ClientError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "live_agent_lambda_invoke_failed",
+        }
+
+    raw_payload = response.get("Payload").read().decode("utf-8") if response.get("Payload") else ""
+    parsed_payload = {}
+    if raw_payload:
+        try:
+            parsed_payload = json.loads(raw_payload)
+        except ValueError:
+            parsed_payload = {"message": raw_payload}
+
+    if response.get("FunctionError"):
+        return {
+            "ok": False,
+            "error": parsed_payload.get("error") or response.get("FunctionError"),
+            "error_code": parsed_payload.get("error_code") or "live_agent_lambda_error",
+            "response": parsed_payload,
+        }
+
+    return {
+        "ok": parsed_payload.get("ok", True),
+        "status_code": response.get("StatusCode"),
+        "response": parsed_payload,
+        "error": parsed_payload.get("error"),
+        "error_code": parsed_payload.get("error_code"),
+    }
+
+
+def invoke_live_agent_handoff(payload):
+    if LIVE_AGENT_FUNCTION:
+        result = invoke_live_agent_function(payload)
+        result["target"] = "lambda"
+        return result
+
+    result = invoke_live_agent_webhook(payload)
+    result["target"] = "webhook"
+    return result
+
+
+def live_agent_reply(result):
+    response = result.get("response") if isinstance(result, dict) else None
+    if isinstance(response, dict):
+        for key in ("reply", "message", "text"):
+            value = response.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    return LIVE_AGENT_DEFERRED_REPLY if result.get("ok") else LIVE_AGENT_FAILED_REPLY
+
+
 def handle_interactive_action(session_item, body, session_id):
     action_id = body.get("action_id")
     now_iso = to_iso(datetime.now(timezone.utc))
     result = base_interactive_result(session_item)
 
     if action_id == ACTION_ID_CLOSE_AND_SUMMARIZE:
-        if session_item.get("conversation_status") != "active":
+        if session_item.get("conversation_status") == "summarizing" or session_item.get("summary_status") == "started":
+            result.update({
+                "response_source": "manual_close_summary_duplicate",
+                "reply": "This session is already being closed and summarized.",
+            })
+            return result
+
+        if session_item.get("conversation_status") == "closed" or session_item.get("summary_status") == "completed":
+            result.update({
+                "response_source": "manual_close_summary_duplicate",
+                "reply": "This session has already been closed.",
+            })
+            return result
+
+        if session_item.get("conversation_status") in {"failed"}:
+            result.update({
+                "response_source": "manual_close_summary_failed",
+                "reply": "This session is in a failed state. Please send a new message to start again.",
+            })
             return result
 
         result.update({
@@ -2566,7 +2975,11 @@ def handle_interactive_action(session_item, body, session_id):
         return result
 
     if action_id in {ACTION_ID_ASSISTANCE_YES, ACTION_ID_ASSISTANCE_NEED_MORE_HELP}:
-        if not has_pending_assistance_confirmation(session_item):
+        if not (
+            has_pending_assistance_confirmation(session_item)
+            or session_item.get("session_state") == SESSION_STATE_WAITING_FOR_USER
+            or session_item.get("conversation_status") == "active"
+        ):
             return result
 
         result.update({
@@ -2608,15 +3021,31 @@ def handle_interactive_action(session_item, body, session_id):
         if not has_pending_final_support_options(session_item):
             return result
 
+        live_agent_result = invoke_live_agent_handoff(
+            build_live_agent_payload(session_item, body, session_id, now_iso)
+        )
+        live_agent_ok = bool(live_agent_result.get("ok"))
+
+        log_json({
+            "level": "INFO" if live_agent_ok else "ERROR",
+            "message": "live_agent_handoff_completed",
+            "session_id": session_id,
+            "target": live_agent_result.get("target"),
+            "ok": live_agent_ok,
+            "error_code": live_agent_result.get("error_code"),
+        })
+
         result.update({
-            "lex_state": "Fulfilled",
+            "lex_state": "Fulfilled" if live_agent_ok else "Failed",
             "response_source": "live_agent",
-            "next_action": NEXT_ACTION_LIVE_AGENT_SUPPORT,
-            "reply": LIVE_AGENT_DEFERRED_REPLY,
-            "support_options_status": "live_agent_deferred",
-            "support_resolved_at": now_iso,
-            "live_agent_status": "deferred",
+            "next_action": None,
+            "reply": live_agent_reply(live_agent_result),
+            "support_options_status": "live_agent_requested" if live_agent_ok else "live_agent_failed",
+            "support_resolved_at": now_iso if live_agent_ok else None,
+            "live_agent_status": "requested" if live_agent_ok else "failed",
             "live_agent_requested_at": now_iso,
+            "live_agent_error": None if live_agent_ok else live_agent_result.get("error"),
+            "live_agent_error_code": None if live_agent_ok else live_agent_result.get("error_code"),
         })
         return result
 
@@ -2800,7 +3229,11 @@ def process_record(record):
     action_value = body.get("action_value")
     is_interactive_action = event_type == "interactive_action"
 
-    session_id = f"{channel}:{user}:{thread_ts}" if thread_ts else f"{channel}:{user}"
+    conversation_metadata = fetch_conversation_metadata(channel, body.get("conversation_type") or channel_type)
+    conversation_type = conversation_metadata.get("conversation_type") or channel_type
+    dm_like_conversation = is_dm_like_conversation(conversation_metadata)
+    session_thread_ts = None if dm_like_conversation else thread_ts
+    session_id = f"{channel}:{user}:{session_thread_ts}" if session_thread_ts else f"{channel}:{user}"
 
     log_json({
         "level": "INFO",
@@ -2810,9 +3243,11 @@ def process_record(record):
         "event_type": event_type,
         "channel_type": channel_type,
         "routing_reason": routing_reason,
+        "conversation_type": conversation_type,
+        "dm_like_conversation": dm_like_conversation,
         "user": user,
         "text": text,
-        "thread_ts": thread_ts,
+        "thread_ts": session_thread_ts,
         "image_file_count": len(image_files),
         "action_id": action_id
     })
@@ -2820,7 +3255,7 @@ def process_record(record):
     existing_session = get_session_item(session_id)
     reset_closed_session = (
         not is_interactive_action
-        and not thread_ts
+        and not session_thread_ts
         and existing_session.get("conversation_status") in {"closed", "failed"}
     )
     if reset_closed_session:
@@ -2900,6 +3335,8 @@ def process_record(record):
     support_resolved_at = None
     live_agent_status = None
     live_agent_requested_at = None
+    live_agent_error = None
+    live_agent_error_code = None
     slack_blocks = None
     jira_confirmation_handled = False
     interactive_action_handled = False
@@ -2972,6 +3409,8 @@ def process_record(record):
         support_resolved_at = interactive_result.get("support_resolved_at")
         live_agent_status = interactive_result.get("live_agent_status")
         live_agent_requested_at = interactive_result.get("live_agent_requested_at")
+        live_agent_error = interactive_result.get("live_agent_error")
+        live_agent_error_code = interactive_result.get("live_agent_error_code")
         manual_close_summary = interactive_result.get("manual_close_summary", False)
         manual_close_timeout_token = interactive_result.get("manual_close_timeout_token")
 
@@ -2992,7 +3431,7 @@ def process_record(record):
             closed_at = datetime.now(timezone.utc).replace(microsecond=0)
 
             try:
-                close_session_for_summary(
+                mark_session_summarizing(
                     session_id,
                     manual_close_timeout_token,
                     closed_at
@@ -3020,7 +3459,8 @@ def process_record(record):
                 "session_id": session_id,
                 "timeout_token": manual_close_timeout_token,
                 "closed_at": to_iso(closed_at),
-                "reason": "manual_close_summary"
+                "reason": "manual_close_summary",
+                "conversation_type": conversation_type,
             })
 
             log_json({
@@ -3034,7 +3474,11 @@ def process_record(record):
                 "error_code": summarizer_result.get("error_code")
             })
 
-            slack_response = send_slack_message(channel, lex_reply)
+            if not summarizer_result.get("ok"):
+                send_slack_message(
+                    channel,
+                    "I could not complete the summary/save step. This session has not been fully closed."
+                )
 
             log_json({
                 "level": "INFO",
@@ -3042,7 +3486,7 @@ def process_record(record):
                 "event_id": event_id,
                 "session_id": session_id,
                 "summarizer_ok": summarizer_result.get("ok"),
-                "slack_ts": slack_response.get("ts")
+                "error_code": summarizer_result.get("error_code")
             })
             return
 
@@ -3457,6 +3901,8 @@ def process_record(record):
         and lex_state != "Ignored"
         and not next_action
         and not jira_status
+        and has_meaningful_user_issue(text)
+        and has_meaningful_bot_answer(lex_reply)
     ):
         original_lex_reply = lex_reply
         lex_reply = assistance_reply_text(original_lex_reply)
@@ -3495,11 +3941,27 @@ def process_record(record):
             response_source,
             jira_status,
             assistance_status,
-            support_options_status
+            support_options_status,
+            existing_session,
+            text,
+            lex_reply,
         )
     )
     if offer_close_summary:
         conversation_status = "active"
+
+    if conversation_status == "failed":
+        session_state = SESSION_STATE_FAILED
+    elif offer_close_summary:
+        session_state = SESSION_STATE_WAITING_FOR_USER
+    elif assistance_status == "pending_confirmation":
+        session_state = SESSION_STATE_WAITING_FOR_USER
+    elif assistance_status == "awaiting_details" or support_options_status in {"pending", "creating_jira"}:
+        session_state = SESSION_STATE_COLLECTING_DETAILS
+    elif conversation_status == "closed":
+        session_state = SESSION_STATE_CLOSED
+    else:
+        session_state = SESSION_STATE_OPEN
 
     activity_at_dt = datetime.now(timezone.utc).replace(microsecond=0)
     updated_at = to_iso(activity_at_dt)
@@ -3519,11 +3981,13 @@ def process_record(record):
     if support_options_status == "pending":
         support_requested_at = support_requested_at or updated_at
 
-    if live_agent_status == "deferred":
+    if live_agent_status == "requested":
         live_agent_requested_at = live_agent_requested_at or updated_at
 
     if rovo_should_invoke and rovo_status == "pending":
         rovo_requested_at = rovo_requested_at or updated_at
+
+    transcript_append = build_transcript_append(text, lex_reply, ts)
 
     timeout_state = None
     if conversation_status == "active":
@@ -3537,7 +4001,7 @@ def process_record(record):
         }
 
     if offer_close_summary:
-        slack_blocks = add_close_and_summarize_button(slack_blocks, lex_reply)
+        slack_blocks = add_close_summary_actions(slack_blocks, lex_reply)
 
     created_at_expression = (
         "created_at = :created_at"
@@ -3561,11 +4025,14 @@ def process_record(record):
             event_type = :event_type,
             channel_type = :channel_type,
             routing_reason = :routing_reason,
+            conversation_type = :conversation_type,
+            conversation_metadata = :conversation_metadata,
             lex_session_id = :lex_session_id,
             lex_intent = :lex_intent,
             lex_state = :lex_state,
             lex_slots = :lex_slots,
             conversation_status = :conversation_status,
+            session_state = :session_state,
             timeout_status = :timeout_status,
             {created_at_expression},
             updated_at = :updated_at,
@@ -3579,7 +4046,7 @@ def process_record(record):
         ":last_user_text": text,
         ":last_raw_user_text": raw_text,
         ":last_bot_reply": lex_reply,
-        ":thread_ts": thread_ts,
+        ":thread_ts": session_thread_ts,
         ":response_source": response_source,
         ":claude_fallback_attempted": claude_fallback_attempted,
         ":last_ts": ts,
@@ -3587,11 +4054,14 @@ def process_record(record):
         ":event_type": event_type,
         ":channel_type": channel_type,
         ":routing_reason": routing_reason,
+        ":conversation_type": conversation_type,
+        ":conversation_metadata": conversation_metadata,
         ":lex_session_id": lex_session_id,
         ":lex_intent": lex_intent,
         ":lex_state": lex_state,
         ":lex_slots": lex_slots,
         ":conversation_status": conversation_status,
+        ":session_state": session_state,
         ":timeout_status": "scheduled" if timeout_state else "inactive",
         ":created_at": updated_at,
         ":updated_at": updated_at,
@@ -3903,6 +4373,8 @@ def process_record(record):
         "support_resolved_at": support_resolved_at,
         "live_agent_status": live_agent_status,
         "live_agent_requested_at": live_agent_requested_at,
+        "live_agent_error": live_agent_error,
+        "live_agent_error_code": live_agent_error_code,
     }
 
     for attribute_name, attribute_value in support_flow_attributes.items():
@@ -3915,6 +4387,14 @@ def process_record(record):
             expression_attribute_values[value_name] = attribute_value
         else:
             remove_attributes.append(attribute_name)
+
+    if transcript_append:
+        update_expression += """
+            ,
+            session_messages = list_append(if_not_exists(session_messages, :empty_list), :transcript_append)
+        """
+        expression_attribute_values[":empty_list"] = []
+        expression_attribute_values[":transcript_append"] = transcript_append
 
     remove_attributes = list(dict.fromkeys(remove_attributes))
 
@@ -4027,6 +4507,7 @@ def process_record(record):
         "assistance_status": assistance_status,
         "support_options_status": support_options_status,
         "live_agent_status": live_agent_status,
+        "live_agent_error_code": live_agent_error_code,
         "jira_status": jira_status,
         "jira_intent_name": jira_intent_name,
         "jira_request_id": jira_request_id,

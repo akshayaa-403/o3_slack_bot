@@ -164,3 +164,207 @@ Suggested next actions:
 | Claude success | `My VPN connects but internal apps fail with DNS_PROBE_FINISHED_NXDOMAIN. What should I check?` | Claude gives troubleshooting answer | `response_source=claude` |
 | Claude fail -> Jira | Temporarily break Claude, then send: `The ADAM portal shows a blank page after MFA and the KB does not mention this scenario.` | Bot asks to create Jira ticket | `response_source=claude_failed`, `jira_status=pending_confirmation` |
 | Jira failure handling | Temporarily use wrong Jira project key, then confirm `yes` | Safe failure message, no raw Jira error in Slack | `jira_status=create_failed` |
+=============================
+You are working on my AWS Lambda Slack bot project. Refactor the session closing and summarization flow.
+
+
+Main goal:
+Build a clean and reliable session closing flow for:
+- 1-to-1 Slack DMs
+- Group DMs / multi-person DMs
+
+
+Core Slack behavior:
+Do not decide whether something is a DM or channel only from the channel ID prefix.
+
+The bot must detect the Slack conversation type using Slack conversation metadata.
+
+Conversation behavior:
+- 1-to-1 DM: send normal DM messages, not thread replies.
+- Group DM / multi-person DM: send normal group DM messages, not thread replies.
+
+
+Important reason:
+A group DM can appear under “Direct messages” in Slack but may technically look like a private conversation/channel internally. So the bot must detect the actual conversation type before deciding whether to use thread replies.
+
+Close button display rule:
+The “Close & summarize” button should not appear immediately for simple greetings or test messages such as:
+- hi
+- hello
+- hey
+- good morning
+- test
+
+Show the “Close & summarize” button only after:
+- the user has described a real issue,
+- the bot has given a meaningful answer, troubleshooting step, or resolution suggestion,
+- and the session is active and waiting for the user.
+
+Do not show the close button when:
+- the conversation is only a greeting,
+- the bot is still collecting required details,
+- the session is already summarizing,
+- the session is already closed,
+- or the session has failed.
+
+After every meaningful bot answer, show two user actions:
+- Close & summarize
+- I need more help
+
+Button behavior:
+In 1-to-1 DMs and group DMs:
+- Show the button as a normal message.
+- Do not create a Slack thread reply.
+
+
+Recommended session states:
+- OPEN
+- COLLECTING_DETAILS
+- WAITING_FOR_USER
+- SUMMARIZING
+- CLOSED
+- FAILED
+
+Normal conversation flow:
+1. User sends a message.
+2. Bot creates or updates the session in DynamoDB.
+3. Bot determines whether the user has described a real issue.
+4. If more details are needed, bot asks follow-up questions.
+5. If enough information is available, bot gives a useful answer or troubleshooting step.
+6. After a meaningful answer, the session moves to WAITING_FOR_USER.
+7. Bot shows the “Close & summarize” and “I need more help” actions.
+8. User can continue chatting, ask for more help, close the session, or leave it inactive until timeout.
+
+Close and summarize flow:
+1. Close event is received.
+2. Bot validates the event and required configuration.
+3. Bot detects the Slack conversation type.
+4. Bot checks the DynamoDB session state.
+5. If the session is already summarizing or closed, do not run the close flow again.
+6. If the session is valid and active, mark it as SUMMARIZING.
+7. Remove or disable the close button if possible to prevent duplicate clicks.
+8. Collect the conversation.
+9. Clean the conversation.
+10. Send the cleaned conversation to Power Automate.
+11. Save the raw audit log to S3.
+12. Send a useful final closed message to Slack.
+13. Send the feedback rating prompt.
+14. Mark the DynamoDB session as CLOSED.
+15. Delete the related EventBridge Scheduler timeout.
+
+
+For 1-to-1 DMs and group DMs:
+- Do not depend on Slack thread replies because DM/group DM messages should not be posted in threads.
+- Use the session messages stored in DynamoDB during the active conversation.
+- Store meaningful user and bot messages during the active session so they are available for summarization later.
+
+Conversation cleaning rules:
+Remove system, timeout, close, and feedback messages such as:
+- inactivity warnings,
+- summarizing/closing notices,
+- no-response messages,
+- final closed messages,
+- feedback prompts.
+
+Preserve meaningful user and bot messages.
+
+The cleaned conversation should clearly distinguish:
+- User messages
+- Bot messages
+
+The summary should be based only on meaningful conversation content.
+
+Power Automate payload requirements:
+Send the cleaned conversation, user information if available, channel information, thread/session information, conversation type, close reason, and any raw audit context needed for follow-up or Jira integration.
+
+If Power Automate returns a structured summary, use that summary in the final Slack message.
+
+Final Slack message behavior:
+If a summary is available, send a message like:
+
+✅ This session is now closed.
+
+Summary:
+• Issue: ...
+• Resolution: ...
+• Next step: ...
+
+Saved successfully for follow-up.
+
+If no structured summary is returned but logging succeeds, send:
+
+✅ This session is now closed.
+
+Summary saved successfully for follow-up.
+
+Feedback prompt:
+After the final close message, send a star-rating prompt:
+- 1 star
+- 2 stars
+- 3 stars
+- 4 stars
+- 5 stars
+
+Feedback prompt behavior:
+- In 1-to-1 DMs and group DMs, send it as a normal message.
+
+
+Failure behavior:
+Do not mark the session as CLOSED before Power Automate and S3 audit logging succeed.
+
+If Power Automate or S3 fails:
+- Mark the session as FAILED.
+- Keep the session not fully closed.
+- Store the error message in DynamoDB.
+- Notify the user that the summary/save step could not be completed.
+- Avoid silently closing the session when the summary was not saved.
+
+Duplicate close prevention:
+If the user clicks “Close & summarize” more than once:
+- Do not run the summarization flow multiple times.
+- If the session is already summarizing, tell the user it is already being closed.
+- If the session is already closed, tell the user it has already been closed.
+
+Timeout behavior:
+If the user does not respond for the configured timeout period:
+- Trigger the same close-and-summarize flow.
+- Use a close reason indicating inactivity or no response.
+- Follow the same summarization, audit logging, final message, feedback, and cleanup process.
+
+Scheduler cleanup:
+After successful close, delete the related EventBridge Scheduler timeout.
+If the schedule is already deleted or missing, ignore that safely.
+Log unexpected scheduler cleanup errors.
+
+Security and logging:
+- Do not log Slack tokens.
+- Do not log Power Automate webhook URLs.
+- Do not log secrets.
+- Avoid logging full raw Slack history in CloudWatch unless needed for debugging.
+- Store full raw audit data in S3 instead.
+- Log only useful operational information such as session ID, channel type, state transition, and success/failure status.
+
+Expected output:
+Refactor the Lambda into clean production-friendly code.
+Keep the implementation readable and modular.
+Make the close-and-summarize behavior reliable for:
+- 1-to-1 DM
+- group DM / multi-person DM
+
+
+Most important rule:
+DM and group DM should not use Slack thread replies.
+
+Most important flow:
+Show “Close & summarize” only after a meaningful answer.
+For DMs and group DMs, summarize from stored session messages.
+Save the summary and audit log before marking the session CLOSED.
+=====================
+❌ posting new handoff into #ivy-live-support
+❌ assigning request to Agent A / Agent B
+❌ max 5 users per agent
+❌ queue if all agents are full
+❌ Claim / Reassign / Resolve buttons
+❌ agent reply in support thread → forwarded to user
+❌ user reply → forwarded back to assigned agent thread
+❌ storing support_channel + support_thread_ts mapping

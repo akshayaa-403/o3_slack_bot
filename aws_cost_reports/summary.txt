@@ -1,0 +1,8 @@
+AWS Cost Explorer Report
+Report period: 2026-04-01 to 2026-05-01 (latest available full month)
+Comparison period: 2026-03-01 to 2026-04-01
+Note: 2026-05, 2026-06, and current 2026-07 returned DataUnavailableException.
+
+Total unblended cost: 0 USD
+Services found: 0
+Top services by unblended cost:

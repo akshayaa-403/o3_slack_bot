@@ -1,0 +1,49 @@
+{
+    "GroupDefinitions": [
+        {
+            "Type": "DIMENSION",
+            "Key": "REGION"
+        }
+    ],
+    "ResultsByTime": [
+        {
+            "TimePeriod": {
+                "Start": "2026-04-01",
+                "End": "2026-05-01"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        }
+    ],
+    "DimensionValueAttributes": []
+}

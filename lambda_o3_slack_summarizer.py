@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import hashlib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -15,6 +16,7 @@ AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 s3_client = boto3.client("s3", region_name=AWS_REGION)
 bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+scheduler = boto3.client("scheduler", region_name=AWS_REGION)
 
 # Runtime configuration. Most values can be changed from Lambda environment
 # variables without redeploying code.
@@ -28,10 +30,13 @@ SUMMARY_WEBHOOK_URL = os.environ.get("SUMMARY_WEBHOOK_URL") or os.environ.get("P
 SUMMARY_WEBHOOK_TIMEOUT_SECONDS = int(os.environ.get("SUMMARY_WEBHOOK_TIMEOUT_SECONDS", "15"))
 AUDIT_S3_BUCKET = os.environ.get("AUDIT_S3_BUCKET")
 AUDIT_S3_PREFIX = os.environ.get("AUDIT_S3_PREFIX", "slack-audit")
-SEND_CLOSE_NOTIFICATION = os.environ.get("SEND_CLOSE_NOTIFICATION", "false").lower() == "true"
-SEND_FEEDBACK_PROMPT = os.environ.get("SEND_FEEDBACK_PROMPT", "false").lower() == "true"
+TIMEOUT_SCHEDULING_ENABLED = os.environ.get("TIMEOUT_SCHEDULING_ENABLED", "true").lower() == "true"
+SCHEDULER_GROUP_NAME = os.environ.get("SCHEDULER_GROUP_NAME", "default")
+SCHEDULER_NAME_PREFIX = os.environ.get("SCHEDULER_NAME_PREFIX", "o3-slack-timeout")
+SEND_CLOSE_NOTIFICATION = os.environ.get("SEND_CLOSE_NOTIFICATION", "true").lower() == "true"
+SEND_FEEDBACK_PROMPT = os.environ.get("SEND_FEEDBACK_PROMPT", "true").lower() == "true"
 ENABLE_AI_SUMMARY = os.environ.get("ENABLE_AI_SUMMARY", "true").lower() == "true"
-BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "au.anthropic.claude-sonnet-4-6")
+BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "amazon.nova-2-lite-v1:0")
 AI_SUMMARY_MAX_TOKENS = int(os.environ.get("AI_SUMMARY_MAX_TOKENS", "220"))
 AI_SUMMARY_TEMPERATURE = float(os.environ.get("AI_SUMMARY_TEMPERATURE", "0.1"))
 CLOSE_NOTIFICATION_TEXT = os.environ.get(
@@ -42,6 +47,14 @@ FEEDBACK_PROMPT_TEXT = os.environ.get(
     "FEEDBACK_PROMPT_TEXT",
     "How was your experience with IVY Assist today?"
 )
+SUMMARY_SAVE_FAILED_TEXT = os.environ.get(
+    "SUMMARY_SAVE_FAILED_TEXT",
+    "I could not complete the summary/save step. This session has not been fully closed."
+)
+
+SESSION_STATE_SUMMARIZING = "SUMMARIZING"
+SESSION_STATE_CLOSED = "CLOSED"
+SESSION_STATE_FAILED = "FAILED"
 
 sessions_table = dynamodb.Table(DYNAMODB_TABLE)
 
@@ -82,6 +95,41 @@ def parse_iso(value):
 
 def ttl_epoch():
     return int(time.time()) + SESSION_TTL_SECONDS
+
+
+def timeout_schedule_name(session_id, phase):
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+    suffix = f"-{phase}"
+    max_prefix_length = 64 - len(digest) - len(suffix) - 1
+    prefix = SCHEDULER_NAME_PREFIX[:max_prefix_length]
+    return f"{prefix}-{digest}{suffix}"
+
+
+def delete_timeout_schedule(session_id, phase):
+    if not TIMEOUT_SCHEDULING_ENABLED or not session_id:
+        return
+
+    name = timeout_schedule_name(session_id, phase)
+
+    try:
+        scheduler.delete_schedule(Name=name, GroupName=SCHEDULER_GROUP_NAME)
+        log_json({
+            "level": "INFO",
+            "message": "summary_timeout_schedule_deleted",
+            "session_id": session_id,
+            "schedule_name": name,
+        })
+    except ClientError as error:
+        if error.response["Error"]["Code"] == "ResourceNotFoundException":
+            return
+
+        log_json({
+            "level": "ERROR",
+            "message": "summary_timeout_schedule_delete_failed",
+            "session_id": session_id,
+            "schedule_name": name,
+            "error": str(error),
+        })
 
 
 def text_or_empty(value):
@@ -142,10 +190,26 @@ def mark_summary_started(session_id, timeout_token, started_at):
     # session.
     expression_values = {
         ":started": "started",
+        ":summarizing": "summarizing",
+        ":session_state": SESSION_STATE_SUMMARIZING,
+        ":active": "active",
+        ":failed": "failed",
         ":started_at": to_iso(started_at),
         ":ttl": ttl_epoch(),
     }
-    condition = "attribute_exists(session_id)"
+    condition = """
+        attribute_exists(session_id)
+        AND (
+            attribute_not_exists(summary_status)
+            OR summary_status = :summarizing
+            OR summary_status = :failed
+        )
+        AND (
+            attribute_not_exists(conversation_status)
+            OR conversation_status = :active
+            OR conversation_status = :summarizing
+        )
+    """
 
     if timeout_token:
         condition += " AND timeout_token = :timeout_token"
@@ -156,6 +220,9 @@ def mark_summary_started(session_id, timeout_token, started_at):
         UpdateExpression="""
             SET
                 summary_status = :started,
+                conversation_status = :summarizing,
+                session_state = :session_state,
+                timeout_status = :summarizing,
                 summary_started_at = :started_at,
                 updated_at = :started_at,
                 #ttl = :ttl
@@ -180,6 +247,9 @@ def mark_summary_completed(
     update_expression = """
         SET
             summary_status = :completed,
+            conversation_status = :closed,
+            session_state = :session_state,
+            timeout_status = :closed,
             summary_completed_at = :completed_at,
             conversation_summary = :summary,
             summary_webhook_sent = :webhook_sent,
@@ -188,6 +258,8 @@ def mark_summary_completed(
     """
     expression_values = {
         ":completed": "completed",
+        ":closed": "closed",
+        ":session_state": SESSION_STATE_CLOSED,
         ":completed_at": to_iso(completed_at),
         ":summary": summary,
         ":webhook_sent": webhook_sent,
@@ -223,6 +295,9 @@ def mark_summary_failed(session_id, failed_at, error, error_code):
             UpdateExpression="""
                 SET
                     summary_status = :failed,
+                    conversation_status = :failed_status,
+                    session_state = :session_state,
+                    timeout_status = :failed_status,
                     summary_failed_at = :failed_at,
                     summary_error = :error,
                     summary_error_code = :error_code,
@@ -232,6 +307,8 @@ def mark_summary_failed(session_id, failed_at, error, error_code):
             ExpressionAttributeNames={"#ttl": "ttl"},
             ExpressionAttributeValues={
                 ":failed": "failed",
+                ":failed_status": "failed",
+                ":session_state": SESSION_STATE_FAILED,
                 ":failed_at": to_iso(failed_at),
                 ":error": text_or_empty(error)[:1000],
                 ":error_code": error_code,
@@ -406,6 +483,43 @@ def clean_history(messages, session_user):
             cleaned.append(cleaned_message)
 
     return cleaned
+
+
+def clean_stored_history(session_item):
+    cleaned = []
+
+    for message in session_item.get("session_messages") or []:
+        text = clean_slack_text(message.get("text"))
+        if not text or any(marker in text for marker in EXCLUDED_MESSAGE_MARKERS):
+            continue
+
+        sender = message.get("sender")
+        if sender not in {"User", "Bot"}:
+            sender = "Bot" if message.get("bot_id") else "User"
+
+        cleaned.append({
+            "sender": sender,
+            "text": text,
+            "ts": message.get("ts"),
+            "user": message.get("user"),
+            "bot_id": message.get("bot_id"),
+        })
+
+    return cleaned
+
+
+def should_use_stored_history(session_item):
+    conversation_type = session_item.get("conversation_type")
+    metadata = session_item.get("conversation_metadata") or {}
+
+    return (
+        bool(session_item.get("session_messages"))
+        and (
+            conversation_type in {"im", "mpim"}
+            or metadata.get("is_dm")
+            or metadata.get("is_mpim")
+        )
+    )
 
 
 def get_user_email(user_id):
@@ -588,7 +702,7 @@ def post_summary_webhook(payload):
     # Send the completed audit payload to Power Automate or another configured
     # webhook endpoint.
     if not SUMMARY_WEBHOOK_URL:
-        return False
+        return False, None
 
     request = urllib.request.Request(
         SUMMARY_WEBHOOK_URL,
@@ -601,7 +715,15 @@ def post_summary_webhook(payload):
         if response.status < 200 or response.status >= 300:
             raise ValueError(f"Summary webhook returned HTTP {response.status}")
 
-    return True
+        response_text = response.read().decode("utf-8").strip()
+
+    if not response_text:
+        return True, None
+
+    try:
+        return True, json.loads(response_text)
+    except ValueError:
+        return True, {"summaryText": response_text}
 
 
 def put_audit_log(payload, closed_at):
@@ -626,8 +748,51 @@ def put_audit_log(payload, closed_at):
     return key
 
 
-def send_close_notification(channel):
-    # Optional Slack message confirming that the session is closed.
+def structured_summary_text(webhook_response, summary):
+    if isinstance(webhook_response, dict):
+        for key in ("summaryText", "summary_text", "summary", "message"):
+            value = webhook_response.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        issue = webhook_response.get("issue")
+        resolution = webhook_response.get("resolution")
+        next_step = webhook_response.get("nextStep") or webhook_response.get("next_step")
+        parts = []
+        if issue:
+            parts.append(f"* Issue: {issue}")
+        if resolution:
+            parts.append(f"* Resolution: {resolution}")
+        if next_step:
+            parts.append(f"* Next step: {next_step}")
+        if parts:
+            return "\n".join(parts)
+
+    return summary.get("ai_summary")
+
+
+def final_close_message(webhook_response, summary):
+    summary_text = structured_summary_text(webhook_response, summary)
+
+    if summary_text:
+        return "\n".join([
+            "This session is now closed.",
+            "",
+            "Summary:",
+            summary_text,
+            "",
+            "Saved successfully for follow-up.",
+        ])
+
+    return "\n".join([
+        "This session is now closed.",
+        "",
+        "Summary saved successfully for follow-up.",
+    ])
+
+
+def send_close_notification(channel, text):
+    # Send the final close message after audit persistence has succeeded.
     if not SEND_CLOSE_NOTIFICATION or not channel:
         return
 
@@ -635,7 +800,7 @@ def send_close_notification(channel):
         "chat.postMessage",
         payload={
             "channel": channel,
-            "text": CLOSE_NOTIFICATION_TEXT,
+            "text": text or CLOSE_NOTIFICATION_TEXT,
         },
     )
 
@@ -664,20 +829,27 @@ def send_feedback_prompt(channel):
                     "elements": [
                         {
                             "type": "button",
-                            "text": {"type": "plain_text", "text": stars, "emoji": True},
+                            "text": {"type": "plain_text", "text": f"{rating} star" if rating == 1 else f"{rating} stars", "emoji": True},
                             "action_id": f"feedback_{rating}",
                             "value": str(rating),
                         }
-                        for rating, stars in (
-                            (1, "*"),
-                            (2, "**"),
-                            (3, "***"),
-                            (4, "****"),
-                            (5, "*****"),
-                        )
+                        for rating in (1, 2, 3, 4, 5)
                     ],
                 },
             ],
+        },
+    )
+
+
+def notify_summary_failed(channel):
+    if not channel:
+        return
+
+    slack_api(
+        "chat.postMessage",
+        payload={
+            "channel": channel,
+            "text": SUMMARY_SAVE_FAILED_TEXT,
         },
     )
 
@@ -717,9 +889,19 @@ def lambda_handler(event, context):
 
         mark_summary_started(session_id, timeout_token, started_at)
 
-        # Fetch, clean, and summarize the Slack conversation.
-        raw_history, messages = fetch_history(session_item, closed_at)
-        cleaned_history = clean_history(messages, session_item.get("user"))
+        # Fetch, clean, and summarize the Slack conversation. DM and group-DM
+        # sessions use the transcript stored during active conversation so they
+        # do not depend on Slack thread replies.
+        if should_use_stored_history(session_item):
+            raw_history = {
+                "source": "dynamodb_session_messages",
+                "message_count": len(session_item.get("session_messages") or []),
+            }
+            cleaned_history = clean_stored_history(session_item)
+        else:
+            raw_history, messages = fetch_history(session_item, closed_at)
+            cleaned_history = clean_history(messages, session_item.get("user"))
+
         user_email = get_user_email(session_item.get("user"))
         summary = build_summary(cleaned_history, {**session_item, "session_id": session_id})
         ai_summary_error = None
@@ -759,8 +941,14 @@ def lambda_handler(event, context):
             "closed_at": to_iso(closed_at),
             "reason": event.get("reason"),
             "channel": session_item.get("channel"),
+            "channelInfo": {
+                "conversationType": session_item.get("conversation_type") or event.get("conversation_type"),
+                "conversationMetadata": session_item.get("conversation_metadata") or {},
+            },
             "user": session_item.get("user"),
             "userEmail": user_email,
+            "threadTs": session_item.get("thread_ts"),
+            "sessionState": session_item.get("session_state"),
             "conversation": [
                 f"{message['sender']}: {message['text']}"
                 for message in cleaned_history
@@ -774,9 +962,12 @@ def lambda_handler(event, context):
 
         # Webhook delivery is best-effort and recorded on the DynamoDB session.
         webhook_sent = False
+        webhook_response = None
         webhook_error = None
         try:
-            webhook_sent = post_summary_webhook(payload)
+            webhook_sent, webhook_response = post_summary_webhook(payload)
+            if webhook_response is not None:
+                payload["summaryWebhookResponse"] = webhook_response
         except Exception as error:
             webhook_error = str(error)
             log_json({
@@ -801,20 +992,37 @@ def lambda_handler(event, context):
                 "error": audit_error,
             })
 
-        # Optional Slack follow-up messages should not fail the summary workflow.
-        try:
-            send_close_notification(session_item.get("channel"))
-            send_feedback_prompt(session_item.get("channel"))
-        except Exception as error:
-            log_json({
-                "level": "ERROR",
-                "message": "summary_optional_slack_message_failed",
+        if webhook_error or audit_error:
+            failure_error = webhook_error or audit_error
+            mark_summary_failed(
+                session_id,
+                datetime.now(timezone.utc).replace(microsecond=0),
+                failure_error,
+                "summary_save_failed",
+            )
+            try:
+                notify_summary_failed(session_item.get("channel"))
+            except Exception as error:
+                log_json({
+                    "level": "ERROR",
+                    "message": "summary_failure_notification_failed",
+                    "session_id": session_id,
+                    "error": str(error),
+                })
+            return {
+                "ok": False,
                 "session_id": session_id,
-                "error": str(error),
-            })
+                "error": "Summary save step failed.",
+                "error_code": "summary_save_failed",
+                "webhook_sent": webhook_sent,
+                "webhook_error": webhook_error,
+                "audit_s3_key": audit_s3_key,
+                "audit_error": audit_error,
+            }
 
         # Record the completed summary and all delivery outcomes.
         completed_at = datetime.now(timezone.utc).replace(microsecond=0)
+        final_message = final_close_message(webhook_response, summary)
         mark_summary_completed(
             session_id,
             completed_at,
@@ -824,6 +1032,19 @@ def lambda_handler(event, context):
             webhook_error=webhook_error,
             audit_error=audit_error,
         )
+        delete_timeout_schedule(session_id, "prompt")
+        delete_timeout_schedule(session_id, "close")
+
+        try:
+            send_close_notification(session_item.get("channel"), final_message)
+            send_feedback_prompt(session_item.get("channel"))
+        except Exception as error:
+            log_json({
+                "level": "ERROR",
+                "message": "summary_optional_slack_message_failed",
+                "session_id": session_id,
+                "error": str(error),
+            })
 
         result = {
             "ok": True,

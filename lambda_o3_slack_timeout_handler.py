@@ -285,36 +285,6 @@ def mark_prompted(session_id, timeout_token_value, prompted_at, close_due_at):
     )
 
 
-def close_session(session_id, timeout_token_value, closed_at):
-    sessions_table.update_item(
-        Key={"session_id": session_id},
-        UpdateExpression="""
-            SET
-                conversation_status = :closed,
-                timeout_status = :closed,
-                timeout_closed_at = :closed_at,
-                updated_at = :closed_at,
-                #ttl = :ttl
-        """,
-        ConditionExpression="""
-            timeout_token = :timeout_token
-            AND conversation_status = :active
-            AND timeout_status = :prompted
-        """,
-        ExpressionAttributeNames={
-            "#ttl": "ttl"
-        },
-        ExpressionAttributeValues={
-            ":timeout_token": timeout_token_value,
-            ":active": "active",
-            ":prompted": "prompted",
-            ":closed": "closed",
-            ":closed_at": to_iso(closed_at),
-            ":ttl": ttl_epoch()
-        }
-    )
-
-
 def invoke_summarizer(session_id, timeout_token_value, closed_at):
     if not SUMMARIZER_FUNCTION_NAME:
         return False
@@ -327,19 +297,25 @@ def invoke_summarizer(session_id, timeout_token_value, closed_at):
     }
 
     try:
-        lambda_client.invoke(
+        response = lambda_client.invoke(
             FunctionName=SUMMARIZER_FUNCTION_NAME,
-            InvocationType="Event",
+            InvocationType="RequestResponse",
             Payload=json.dumps(payload).encode("utf-8")
         )
+        response_payload = {}
+        if response.get("Payload"):
+            response_payload = json.loads(response["Payload"].read().decode("utf-8") or "{}")
+        ok = not response.get("FunctionError") and response_payload.get("ok", False)
 
         log_json({
-            "level": "INFO",
+            "level": "INFO" if ok else "ERROR",
             "message": "timeout_summarizer_invoked",
             "session_id": session_id,
-            "summarizer_function": SUMMARIZER_FUNCTION_NAME
+            "summarizer_function": SUMMARIZER_FUNCTION_NAME,
+            "ok": ok,
+            "error_code": response_payload.get("error_code")
         })
-        return True
+        return ok
 
     except Exception as e:
         log_json({
@@ -445,19 +421,10 @@ def handle_close(event):
             }
         )
 
-    try:
-        close_session(session_id, timeout_token_value, now)
-
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            return ignored("close_condition_failed", session_id)
-
-        raise
-
-    invoke_summarizer(session_id, timeout_token_value, now)
+    summarizer_invoked = invoke_summarizer(session_id, timeout_token_value, now)
 
     result = {
-        "status": "closed",
+        "status": "summarizer_invoked" if summarizer_invoked else "summarizer_invoke_failed",
         "session_id": session_id,
         "timeout_token": timeout_token_value,
         "closed_at": to_iso(now)

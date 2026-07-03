@@ -1,0 +1,1145 @@
+{
+    "ResultsByTime": [
+        {
+            "TimePeriod": {
+                "Start": "2026-04-01",
+                "End": "2026-04-02"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-02",
+                "End": "2026-04-03"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-03",
+                "End": "2026-04-04"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-04",
+                "End": "2026-04-05"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-05",
+                "End": "2026-04-06"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-06",
+                "End": "2026-04-07"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-07",
+                "End": "2026-04-08"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-08",
+                "End": "2026-04-09"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-09",
+                "End": "2026-04-10"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-10",
+                "End": "2026-04-11"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-11",
+                "End": "2026-04-12"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-12",
+                "End": "2026-04-13"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-13",
+                "End": "2026-04-14"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-14",
+                "End": "2026-04-15"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-15",
+                "End": "2026-04-16"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-16",
+                "End": "2026-04-17"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-17",
+                "End": "2026-04-18"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-18",
+                "End": "2026-04-19"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-19",
+                "End": "2026-04-20"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-20",
+                "End": "2026-04-21"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-21",
+                "End": "2026-04-22"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-22",
+                "End": "2026-04-23"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-23",
+                "End": "2026-04-24"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-24",
+                "End": "2026-04-25"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-25",
+                "End": "2026-04-26"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-26",
+                "End": "2026-04-27"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-27",
+                "End": "2026-04-28"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-28",
+                "End": "2026-04-29"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-29",
+                "End": "2026-04-30"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        },
+        {
+            "TimePeriod": {
+                "Start": "2026-04-30",
+                "End": "2026-05-01"
+            },
+            "Total": {
+                "AmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "BlendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetAmortizedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NetUnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "NormalizedUsageAmount": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                },
+                "UnblendedCost": {
+                    "Amount": "0",
+                    "Unit": "USD"
+                },
+                "UsageQuantity": {
+                    "Amount": "0",
+                    "Unit": "N/A"
+                }
+            },
+            "Groups": [],
+            "Estimated": true
+        }
+    ],
+    "DimensionValueAttributes": []
+}

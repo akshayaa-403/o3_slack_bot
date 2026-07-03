@@ -101,8 +101,7 @@ def verify_slack_signature(event, raw_body):
 
 
 def is_direct_message(slack_event):
-    channel = slack_event.get("channel", "")
-    return slack_event.get("channel_type") == "im" or channel.startswith("D")
+    return slack_event.get("channel_type") in {"im", "mpim"}
 
 
 def message_mentions_bot(slack_event):
@@ -239,7 +238,8 @@ def enqueue_interactive_action(payload):
             "ts": action.get("action_ts") or container.get("message_ts") or message.get("ts"),
             "thread_ts": thread_ts,
             "event_type": "interactive_action",
-            "channel_type": "im" if (channel.get("id") or "").startswith("D") else None,
+            "channel_type": None,
+            "conversation_type": None,
             "routing_reason": "interactive_action",
             "action_id": action_id,
             "action_value": action_value,
@@ -416,6 +416,7 @@ def lambda_handler(event, context):
                 "thread_ts": thread_ts,
                 "event_type": event_type,
                 "channel_type": channel_type,
+                "conversation_type": channel_type,
                 "routing_reason": routing_reason,
                 "files": image_files,
                 "has_image": bool(image_files)
