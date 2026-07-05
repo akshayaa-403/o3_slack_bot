@@ -455,10 +455,16 @@ Optional:
 - `CLAUDE_MAX_TOKENS`, default `500`
 - `CLAUDE_TEMPERATURE`, default `0.2`
 - `CLAUDE_SYSTEM_PROMPT`, default concise IVY support-assistant instructions
+- `BEDROCK_GUARDRAIL_ID`, optional Bedrock Guardrail identifier or ARN
+- `BEDROCK_GUARDRAIL_VERSION`, optional Bedrock Guardrail version, for example `DRAFT` or a numbered version
+- `BEDROCK_GUARDRAIL_MODE`, default `invoke`; valid values are `invoke`, `pre_post`, and `disabled`
+- `BEDROCK_GUARDRAIL_TRACE`, default `ENABLED_FULL`, passed to native Bedrock Guardrails in `invoke` mode
+- `CLAUDE_GUARDRAIL_BLOCK_REPLY`, default safe fallback text when output guardrails intervene
 
 IAM:
 
 - Claude fallback Lambda execution role needs `bedrock:InvokeModel` for the configured Bedrock model.
+- Claude fallback Lambda execution role needs `bedrock:ApplyGuardrail` when `BEDROCK_GUARDRAIL_MODE=pre_post`.
 - Worker Lambda execution role needs `lambda:InvokeFunction` on the Claude fallback Lambda.
 - Bedrock model access must be enabled in the same AWS region used by `AWS_REGION`.
 
