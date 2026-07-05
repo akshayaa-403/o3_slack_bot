@@ -130,6 +130,7 @@ def adf_description(event):
     request_text = text_or_empty(event.get("text"))
     raw_text = text_or_empty(event.get("raw_text"))
     jira_request_id = text_or_empty(event.get("jira_request_id"))
+    conversation_summary = text_or_empty(event.get("conversation_summary"))
 
     lines = [
         f"Slack user: {text_or_empty(event.get('user')) or text_or_empty(slack.get('user'))}",
@@ -140,6 +141,9 @@ def adf_description(event):
         f"Confirmed at: {text_or_empty(event.get('jira_confirmed_at')) or '-'}",
         f"Matched Lex intent: {text_or_empty(lex.get('intent'))}",
         f"Routing source: Project IVY Slack bot",
+        "",
+        "Conversation summary:",
+        conversation_summary or "-",
         "",
         "Original user request:",
         request_text or raw_text or "-",

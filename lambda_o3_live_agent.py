@@ -12,6 +12,7 @@ dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 CONFIG_TABLE = os.environ.get("CONFIG_TABLE") or os.environ.get("LIVE_AGENT_CONFIG_TABLE")
 LIVE_AGENT_CONFIG_INTENT = os.environ.get("LIVE_AGENT_CONFIG_INTENT", "LiveAgent")
 LIVE_AGENT_WEBHOOK_URL = os.environ.get("LIVE_AGENT_WEBHOOK_URL") or os.environ.get("AUTOMATION_WEBHOOK_URL")
+LIVE_AGENT_WEBHOOK_SECRET = os.environ.get("LIVE_AGENT_WEBHOOK_SECRET", "").strip()
 LIVE_AGENT_WEBHOOK_TIMEOUT_SECONDS = int(os.environ.get("LIVE_AGENT_WEBHOOK_TIMEOUT_SECONDS", "10"))
 
 SUCCESS_REPLY = os.environ.get(
@@ -95,6 +96,22 @@ def get_slot_value(slots, slot_name):
     return value.get("interpretedValue") or value.get("originalValue") or ""
 
 
+def lex_conversation_summary(event, description):
+    attrs = lex_session_attributes(event)
+    parts = []
+
+    if description:
+        parts.append(f"User request: {description}")
+
+    if attrs.get("last_bot_reply"):
+        parts.append(f"Last IVY reply: {attrs.get('last_bot_reply')}")
+
+    if attrs.get("response_source"):
+        parts.append(f"Response source before handoff: {attrs.get('response_source')}")
+
+    return "\n".join(parts) or "User requested live agent support from IVY."
+
+
 def from_lex_event(event, config):
     attrs = lex_session_attributes(event)
     slots = ((event.get("sessionState") or {}).get("intent") or {}).get("slots") or {}
@@ -113,6 +130,7 @@ def from_lex_event(event, config):
         "intent_name": lex_intent_name(event),
         "title": attrs.get("title") or (config or {}).get("title") or "Live agent support request",
         "description": description,
+        "conversation_summary": attrs.get("conversation_summary") or lex_conversation_summary(event, description),
         "requestType": (config or {}).get("requestType"),
         "branching": (config or {}).get("branching"),
         "assignment": {
@@ -148,6 +166,7 @@ def from_worker_event(event, config):
         "source": event.get("source") or "slack",
         "title": event.get("title") or effective_config.get("title") or "Live agent support request",
         "description": event.get("description") or event.get("raw_text") or "",
+        "conversation_summary": event.get("conversation_summary"),
         "requestType": event.get("requestType") or effective_config.get("requestType"),
         "branching": event.get("branching") or effective_config.get("branching"),
         "assignment": {
@@ -188,11 +207,16 @@ def call_webhook(payload):
             "error_code": "missing_live_agent_webhook_url",
         }
 
+    headers = {"Content-Type": "application/json"}
+
+    if LIVE_AGENT_WEBHOOK_SECRET:
+          headers["X-Automation-Webhook-Token"] = LIVE_AGENT_WEBHOOK_SECRET
+
     request = urllib.request.Request(
-        LIVE_AGENT_WEBHOOK_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+         LIVE_AGENT_WEBHOOK_URL,
+         data=json.dumps(payload).encode("utf-8"),
+         headers=headers,
+         method="POST",
     )
 
     with urllib.request.urlopen(request, timeout=LIVE_AGENT_WEBHOOK_TIMEOUT_SECONDS) as response:

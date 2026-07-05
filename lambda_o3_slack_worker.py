@@ -58,6 +58,10 @@ LIVE_AGENT_WEBHOOK_URL = os.environ.get("LIVE_AGENT_WEBHOOK_URL") or os.environ.
 LIVE_AGENT_CONFIG_TABLE = os.environ.get("LIVE_AGENT_CONFIG_TABLE") or os.environ.get("CONFIG_TABLE")
 LIVE_AGENT_CONFIG_INTENT = os.environ.get("LIVE_AGENT_CONFIG_INTENT", "LiveAgent")
 LIVE_AGENT_WEBHOOK_TIMEOUT_SECONDS = int(os.environ.get("LIVE_AGENT_WEBHOOK_TIMEOUT_SECONDS", "10"))
+ENABLE_REQUEST_AI_SUMMARY = os.environ.get("ENABLE_REQUEST_AI_SUMMARY", "true").lower() == "true"
+REQUEST_SUMMARY_MODEL_ID = os.environ.get("REQUEST_SUMMARY_MODEL_ID", "amazon.nova-2-lite-v1:0")
+REQUEST_SUMMARY_MAX_TOKENS = int(os.environ.get("REQUEST_SUMMARY_MAX_TOKENS", "180"))
+REQUEST_SUMMARY_TEMPERATURE = float(os.environ.get("REQUEST_SUMMARY_TEMPERATURE", "0.1"))
 SUMMARIZER_FUNCTION_NAME = os.environ.get("SUMMARIZER_FUNCTION_NAME")
 SUMMARIZER_INVOKE_TIMEOUT_SECONDS = int(os.environ.get("SUMMARIZER_INVOKE_TIMEOUT_SECONDS", "25"))
 IMAGE_REK_FUNCTION = os.environ.get("IMAGE_REK_FUNCTION")
@@ -379,6 +383,10 @@ def slack_mrkdwn(text, limit=2900):
         return value
 
     return value[:limit - 3].rstrip() + "..."
+
+
+def compact_json(data):
+    return json.dumps(data or {}, default=str, ensure_ascii=True, sort_keys=True)
 
 
 def assistance_reply_text(lex_reply):
@@ -2039,6 +2047,10 @@ def build_jira_payload(session_item, body, session_id, text, raw_text):
         or text
     )
     request_raw_text = session_item.get("last_raw_user_text") or request_text
+    summary_result = build_request_conversation_summary({
+        **session_item,
+        "session_id": session_id,
+    })
 
     return {
         "jira_request_id": session_item.get("jira_request_id"),
@@ -2050,6 +2062,11 @@ def build_jira_payload(session_item, body, session_id, text, raw_text):
         "user": body.get("user"),
         "text": request_text,
         "raw_text": request_raw_text,
+        "conversation_summary": summary_result.get("text"),
+        "conversation_summary_model_id": summary_result.get("model_id"),
+        "conversation_summary_usage": summary_result.get("usage", {}),
+        "conversation_summary_error": summary_result.get("error"),
+        "conversation_summary_fallback_used": summary_result.get("fallback_used", False),
         "confirmation_text": text,
         "lex": {
             "intent": intent_name,
@@ -2434,6 +2451,213 @@ def build_support_jira_request_text(session_item):
     return "\n\n".join(parts) or original_text or "User requested support from IVY."
 
 
+def compact_text(value, limit=1200):
+    text = re.sub(r"\s+", " ", (value or "").strip())
+
+    if len(text) <= limit:
+        return text
+
+    return text[:limit - 3].rstrip() + "..."
+
+
+def request_summary_transcript(session_item, limit=40):
+    messages = session_item.get("session_messages") or []
+    transcript = []
+
+    if isinstance(messages, list):
+        for message in messages[-limit:]:
+            if not isinstance(message, dict):
+                continue
+
+            sender = compact_text(message.get("sender") or "Unknown", 80)
+            text = compact_text(message.get("text"), 1200)
+            if text:
+                transcript.append({
+                    "sender": sender,
+                    "text": text,
+                    "ts": message.get("ts"),
+                    "recorded_at": message.get("recorded_at")
+                })
+
+    if transcript:
+        return transcript
+
+    fallback_entries = [
+        ("User", support_original_text(session_item)),
+        ("IVY Lex", session_item.get("support_lex_reply") or session_item.get("assistance_lex_reply")),
+        ("IVY Claude", session_item.get("support_claude_reply")),
+        (
+            "IVY Claude",
+            f"Unable to resolve automatically ({session_item.get('support_claude_error')})."
+            if session_item.get("support_claude_error")
+            else None
+        ),
+        ("User", session_item.get("last_user_text")),
+        ("IVY", session_item.get("last_bot_reply")),
+    ]
+
+    seen = set()
+    for sender, text in fallback_entries:
+        clean_text = compact_text(text, 1200)
+        if not clean_text:
+            continue
+
+        key = (sender, clean_text)
+        if key in seen:
+            continue
+
+        seen.add(key)
+        transcript.append({
+            "sender": sender,
+            "text": clean_text,
+            "ts": None,
+            "recorded_at": None
+        })
+
+    return transcript
+
+
+def transcript_for_request_summary(transcript):
+    lines = []
+
+    for message in transcript or []:
+        sender = compact_text(message.get("sender") or "Unknown", 80)
+        text = compact_text(message.get("text"), 1200)
+        if sender and text:
+            lines.append(f"{sender}: {text}")
+
+    return "\n".join(lines)
+
+
+def deterministic_request_summary(session_item, transcript):
+    parts = []
+    original_text = compact_text(support_original_text(session_item), 800)
+    lex_reply = compact_text(session_item.get("support_lex_reply") or session_item.get("assistance_lex_reply"), 800)
+    claude_reply = compact_text(session_item.get("support_claude_reply"), 800)
+    claude_error = compact_text(session_item.get("support_claude_error"), 300)
+    last_bot_reply = compact_text(session_item.get("last_bot_reply"), 800)
+
+    if original_text:
+        parts.append(f"User request: {original_text}")
+
+    if lex_reply:
+        parts.append(f"Lex answer shown: {lex_reply}")
+
+    if claude_reply:
+        parts.append(f"Claude answer shown: {claude_reply}")
+    elif claude_error:
+        parts.append(f"Claude fallback result: unable to resolve automatically ({claude_error}).")
+
+    if not lex_reply and not claude_reply and last_bot_reply:
+        parts.append(f"Last IVY reply: {last_bot_reply}")
+
+    if not parts and transcript:
+        first_message = transcript[0]
+        parts.append(f"Conversation: {compact_text(first_message.get('text'), 1000)}")
+
+    return "\n".join(parts) or "User requested support from IVY."
+
+
+def request_summary_prompt(session_item, transcript, fallback_summary):
+    return "\n".join([
+        "Summarize this IVY Slack support conversation for a human IT support agent.",
+        "Use only the supplied transcript and metadata.",
+        "Include the user's issue, what IVY already answered or tried, and what still needs agent attention.",
+        "Do not invent ticket keys, user names, troubleshooting steps, or resolution details.",
+        "Return 2-4 concise sentences only.",
+        "",
+        "Session metadata:",
+        compact_json({
+            "session_id": session_item.get("session_id"),
+            "lex_intent": session_item.get("support_lex_intent") or session_item.get("lex_intent"),
+            "lex_state": session_item.get("support_lex_state") or session_item.get("lex_state"),
+            "response_source": session_item.get("response_source"),
+            "jira_status": session_item.get("jira_status"),
+        }),
+        "",
+        "Deterministic context:",
+        fallback_summary,
+        "",
+        "Transcript:",
+        transcript_for_request_summary(transcript),
+    ])
+
+
+def extract_converse_text(response):
+    parts = []
+    message = ((response or {}).get("output") or {}).get("message") or {}
+
+    for item in message.get("content", []):
+        text = (item.get("text") or "").strip()
+        if text:
+            parts.append(text)
+
+    return "\n".join(parts).strip()
+
+
+def build_request_conversation_summary(session_item):
+    transcript = request_summary_transcript(session_item)
+    fallback_summary = deterministic_request_summary(session_item, transcript)
+
+    if not ENABLE_REQUEST_AI_SUMMARY:
+        return {
+            "text": fallback_summary,
+            "model_id": None,
+            "usage": {},
+            "error": None,
+            "fallback_used": True,
+            "transcript": transcript,
+        }
+
+    try:
+        response = bedrock_runtime.converse(
+            modelId=REQUEST_SUMMARY_MODEL_ID,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "text": request_summary_prompt(session_item, transcript, fallback_summary)
+                        }
+                    ]
+                }
+            ],
+            inferenceConfig={
+                "maxTokens": REQUEST_SUMMARY_MAX_TOKENS,
+                "temperature": REQUEST_SUMMARY_TEMPERATURE,
+            },
+        )
+        summary_text = extract_converse_text(response)
+
+        if not summary_text:
+            raise ValueError("Bedrock returned an empty request summary")
+
+        return {
+            "text": summary_text,
+            "model_id": REQUEST_SUMMARY_MODEL_ID,
+            "usage": response.get("usage", {}),
+            "error": None,
+            "fallback_used": False,
+            "transcript": transcript,
+        }
+
+    except Exception as e:
+        log_json({
+            "level": "WARN",
+            "message": "request_conversation_summary_failed",
+            "model_id": REQUEST_SUMMARY_MODEL_ID,
+            "error": str(e),
+        })
+        return {
+            "text": fallback_summary,
+            "model_id": REQUEST_SUMMARY_MODEL_ID,
+            "usage": {},
+            "error": str(e),
+            "fallback_used": True,
+            "transcript": transcript,
+        }
+
+
 def build_final_support_result(session_item, claude_result, now_iso):
     result = base_interactive_result(session_item)
     original_text = (
@@ -2755,6 +2979,10 @@ def build_live_agent_payload(session_item, body, session_id, now_iso):
     config_parameters = parse_config_parameters(config)
     original_text = support_original_text(session_item) or session_item.get("last_user_text") or body.get("text") or ""
     raw_text = support_raw_text(session_item) or session_item.get("last_raw_user_text") or original_text
+    summary_result = build_request_conversation_summary({
+        **session_item,
+        "session_id": session_id,
+    })
 
     payload = {
         "type": "live_agent_handoff",
@@ -2766,6 +2994,11 @@ def build_live_agent_payload(session_item, body, session_id, now_iso):
         "title": (config or {}).get("title") or "Live agent support request",
         "description": original_text,
         "raw_text": raw_text,
+        "conversation_summary": summary_result.get("text"),
+        "conversation_summary_model_id": summary_result.get("model_id"),
+        "conversation_summary_usage": summary_result.get("usage", {}),
+        "conversation_summary_error": summary_result.get("error"),
+        "conversation_summary_fallback_used": summary_result.get("fallback_used", False),
         "requestType": (config or {}).get("requestType"),
         "branching": (config or {}).get("branching"),
         "assignment": {
@@ -2798,6 +3031,9 @@ def build_live_agent_payload(session_item, body, session_id, now_iso):
             "lex_intent": session_item.get("lex_intent"),
             "lex_state": session_item.get("lex_state"),
             "response_source": session_item.get("response_source"),
+            "conversation_summary": summary_result.get("text"),
+            "conversation_summary_model_id": summary_result.get("model_id"),
+            "conversation_summary_fallback_used": summary_result.get("fallback_used", False),
         },
         "config": config,
     }
