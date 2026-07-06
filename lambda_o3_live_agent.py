@@ -131,6 +131,7 @@ def from_lex_event(event, config):
         "title": attrs.get("title") or (config or {}).get("title") or "Live agent support request",
         "description": description,
         "conversation_summary": attrs.get("conversation_summary") or lex_conversation_summary(event, description),
+        "conversation_text": attrs.get("conversation_text") or lex_conversation_summary(event, description),
         "requestType": (config or {}).get("requestType"),
         "branching": (config or {}).get("branching"),
         "assignment": {
@@ -167,6 +168,7 @@ def from_worker_event(event, config):
         "title": event.get("title") or effective_config.get("title") or "Live agent support request",
         "description": event.get("description") or event.get("raw_text") or "",
         "conversation_summary": event.get("conversation_summary"),
+        "conversation_text": event.get("conversation_text"),
         "requestType": event.get("requestType") or effective_config.get("requestType"),
         "branching": event.get("branching") or effective_config.get("branching"),
         "assignment": {

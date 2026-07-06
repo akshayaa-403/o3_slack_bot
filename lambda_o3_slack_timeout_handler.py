@@ -360,7 +360,7 @@ def handle_prompt(event, context):
     if not claim_prompt(session_id, timeout_token_value, now):
         return ignored("prompt_claim_failed", session_id)
 
-    slack_response = send_slack_message(channel, TIMEOUT_PROMPT_TEXT)
+    slack_response = send_slack_message(channel, TIMEOUT_PROMPT_TEXT, thread_ts=item.get("thread_ts"))
     close_due_at = now + timedelta(seconds=TIMEOUT_CLOSE_GRACE_SECONDS)
     schedule_close(session_id, timeout_token_value, item.get("timeout_due_at"), close_due_at, context)
 

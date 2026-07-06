@@ -63,6 +63,7 @@ def get_jira_secret():
     for key in ("site_url", "email", "api_token"):
         if not secret.get(key):
             raise ValueError(f"Jira secret is missing required key: {key}")
+        secret[key] = str(secret[key]).strip()
 
     secret["site_url"] = secret["site_url"].rstrip("/")
     _jira_secret_cache = secret
@@ -131,11 +132,13 @@ def adf_description(event):
     raw_text = text_or_empty(event.get("raw_text"))
     jira_request_id = text_or_empty(event.get("jira_request_id"))
     conversation_summary = text_or_empty(event.get("conversation_summary"))
+    conversation_text = text_or_empty(event.get("conversation_text"))
 
     lines = [
         f"Slack user: {text_or_empty(event.get('user')) or text_or_empty(slack.get('user'))}",
         f"Slack channel: {text_or_empty(event.get('channel')) or text_or_empty(slack.get('channel'))}",
         f"Session ID: {text_or_empty(event.get('session_id'))}",
+        f"Session root timestamp: {text_or_empty(event.get('session_root_ts')) or '-'}",
         f"Project IVY request ID: {jira_request_id or '-'}",
         f"Requested at: {text_or_empty(event.get('jira_requested_at')) or '-'}",
         f"Confirmed at: {text_or_empty(event.get('jira_confirmed_at')) or '-'}",
@@ -144,6 +147,9 @@ def adf_description(event):
         "",
         "Conversation summary:",
         conversation_summary or "-",
+        "",
+        "Conversation transcript:",
+        conversation_text or "-",
         "",
         "Original user request:",
         request_text or raw_text or "-",
@@ -222,7 +228,33 @@ def create_jira_issue(event):
     }
 
 
-def http_error_code(status):
+def parse_jira_error_body(body):
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return {}
+
+
+def jira_error_mentions_project_or_permission(error_payload):
+    messages = error_payload.get("errorMessages") or []
+    errors = error_payload.get("errors") or {}
+    combined = " ".join(
+        [str(message) for message in messages]
+        + [str(key) for key in errors.keys()]
+        + [str(value) for value in errors.values()]
+    ).lower()
+
+    return (
+        "project" in combined
+        and (
+            "permission" in combined
+            or "doesn't exist" in combined
+            or "does not exist" in combined
+        )
+    )
+
+
+def http_error_code(status, error_payload=None):
     if status in {401, 403}:
         return "jira_auth_or_permission_error"
 
@@ -236,12 +268,15 @@ def http_error_code(status):
         return "jira_service_error"
 
     if status == 400:
+        if jira_error_mentions_project_or_permission(error_payload or {}):
+            return "jira_project_or_permission_error"
+
         return "jira_request_rejected"
 
     return "jira_http_error"
 
 
-def http_error_message(status):
+def http_error_message(status, error_payload=None):
     if status in {401, 403, 404}:
         return "Jira rejected the request. Check Jira credentials, project key, issue type, and create-issue permissions."
 
@@ -252,6 +287,9 @@ def http_error_message(status):
         return "Jira returned a temporary service error."
 
     if status == 400:
+        if jira_error_mentions_project_or_permission(error_payload or {}):
+            return "Jira rejected the request. Check Jira credentials, project key, issue type, and create-issue permissions."
+
         return "Jira rejected the issue payload. Check project key, issue type, and required fields."
 
     return f"Jira returned HTTP {status}."
@@ -299,17 +337,20 @@ def lambda_handler(event, context):
 
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
+        error_payload = parse_jira_error_body(body)
         log_json({
             "level": "ERROR",
             "message": "jira_create_http_error",
             "session_id": event.get("session_id"),
             "jira_request_id": event.get("jira_request_id"),
+            "project_key": JIRA_PROJECT_KEY,
+            "issue_type": JIRA_ISSUE_TYPE_NAME,
             "status": e.code,
             "body": body,
         })
         return error_response(
-            http_error_message(e.code),
-            http_error_code(e.code),
+            http_error_message(e.code, error_payload),
+            http_error_code(e.code, error_payload),
             e.code
         )
 

@@ -199,7 +199,9 @@ def enqueue_interactive_action(payload):
     channel = payload.get("channel", {}) or {}
     message = payload.get("message", {}) or {}
     container = payload.get("container", {}) or {}
-    thread_ts = message.get("thread_ts") or container.get("thread_ts")
+    channel_id = channel.get("id")
+    channel_type = "im" if str(channel_id or "").startswith("D") else None
+    thread_ts = None if channel_type == "im" else (message.get("thread_ts") or container.get("thread_ts"))
     action_id = action.get("action_id")
     action_value = action.get("value") or action_id or ""
     event_id = build_interactive_event_id(payload, action)
@@ -238,8 +240,8 @@ def enqueue_interactive_action(payload):
             "ts": action.get("action_ts") or container.get("message_ts") or message.get("ts"),
             "thread_ts": thread_ts,
             "event_type": "interactive_action",
-            "channel_type": None,
-            "conversation_type": None,
+            "channel_type": channel_type,
+            "conversation_type": channel_type,
             "routing_reason": "interactive_action",
             "action_id": action_id,
             "action_value": action_value,

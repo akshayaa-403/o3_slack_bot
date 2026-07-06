@@ -72,14 +72,21 @@ Responsibilities:
 - Simplifies Lex slots.
 - Stores session state in DynamoDB table `o3_slack_sessions` by default.
 - Stores `last_activity_at`, `timeout_due_at`, `timeout_token`, and timeout status fields in the session record.
-- Uses Slack DM `thread_ts` in the session key so each top-level DM issue becomes its own thread-backed IVY session.
+- Uses the Slack root message timestamp in the session key so each Slack issue gets a stable IVY session root.
+- Stores `session_root_ts`, `session_id_version=v2_issue_thread`, and `session_scope=support_issue` for new issue-scoped sessions.
+- Embeds `session_id` and `session_root_ts` in Slack button values so interactive actions target the correct issue session.
+- Does not send 1:1 DM replies with Slack `thread_ts`; group DMs and channel-style conversations still use the issue thread.
+- Continues an unthreaded 1:1 DM issue only when IVY is explicitly waiting for user text, such as Jira confirmation or assistance details.
 - Refreshes a per-session EventBridge Scheduler prompt schedule after active user messages.
 - Resets stale timeout prompt/close fields when a user resumes an active session.
-- Sends Lex response back to Slack through `chat.postMessage`, using `thread_ts` so replies stay in the current issue thread.
+- Sends Lex response back to Slack through `chat.postMessage`, using `thread_ts` only when the conversation should be threaded.
 - Adds a `Close & summarize` button to active answer-style Slack replies so users can close the IVY session manually.
 - Reads Lex fulfillment `sessionAttributes` from the router and stores action metadata in the session record.
 - Handles pending Jira ticket confirmations before calling Lex.
 - Invokes the CreateJiraTicket Lambda only after the user confirms ticket creation.
+- Generates a best-effort Nova conversation summary before live-agent handoff or Jira ticket creation, with deterministic fallback text if Bedrock summary generation fails.
+- Sends plain `conversation_text` as well as structured conversation history to live-agent and Jira request payloads.
+- Uses DynamoDB conditional locks to prevent duplicate Jira ticket creation and duplicate live-agent handoffs from retries or repeated clicks.
 - Optionally invokes the Rovo enrichment Lambda asynchronously after successful Jira ticket creation.
 - Detects Slack image uploads from DM `file_share` messages and invokes the ImageRek Lambda when `IMAGE_REK_FUNCTION` is configured.
 - Resolves image-derived issues in this order: Rekognition extraction, Lex, Bedrock Knowledge Base, Gemini fallback.
@@ -93,7 +100,7 @@ Responsibilities:
 Current gap:
 
 - Worker is still a thin implementation of the diagram's `O3_slack_node_handler`.
-- It does not yet implement live agent handoff, full Forge Rovo agent integration, escalation, or the full image KB/internal DB workflow.
+- It does not yet implement full live-agent queue/thread relay, full Forge Rovo agent integration, escalation, or the full image KB/internal DB workflow.
 
 ### Image Recognition
 
@@ -177,6 +184,7 @@ Responsibilities:
 - Reads Jira Cloud credentials from AWS Secrets Manager.
 - Creates Jira issues through Jira Cloud REST API v3.
 - Builds Jira issue descriptions using Atlassian Document Format.
+- Includes the IVY conversation summary in the Jira issue description when the worker provides one.
 - Returns normalized `ticket_key` and `ticket_url` to the worker.
 
 Current behavior:
@@ -217,7 +225,7 @@ Responsibilities:
 - Handles EventBridge Scheduler `prompt` and `close` actions.
 - Validates scheduled events against the session's current `timeout_token`.
 - Ignores stale schedules when a user has already replied or a conversation is no longer active.
-- Sends the inactivity timeout prompt into the session thread when `thread_ts` is stored.
+- Sends the inactivity timeout prompt into the session thread when `thread_ts` is stored; 1:1 DM prompts are sent unthreaded.
 - Creates the close schedule after the timeout prompt is sent.
 - Closes sessions that remain inactive through the grace window.
 - Invokes an optional summarizer Lambda asynchronously when configured.
@@ -265,6 +273,10 @@ Optional:
 - `CREATE_JIRA_TICKET_FUNCTION`, required for confirmed Jira ticket creation
 - `ENABLE_ROVO_ENRICHMENT`, default `false`
 - `ROVO_ENRICHMENT_FUNCTION`, required when `ENABLE_ROVO_ENRICHMENT=true`
+- `ENABLE_REQUEST_AI_SUMMARY`, default `true`
+- `REQUEST_SUMMARY_MODEL_ID`, default `amazon.nova-2-lite-v1:0`
+- `REQUEST_SUMMARY_MAX_TOKENS`, default `180`
+- `REQUEST_SUMMARY_TEMPERATURE`, default `0.1`
 - `SUMMARIZER_FUNCTION_NAME`, optional Lambda name or ARN for manual Close & summarize button invocation
 - `IMAGE_REK_FUNCTION`, required for Slack image upload analysis
 - `IMAGE_ANALYSIS_UNAVAILABLE_REPLY`, default `I received the image, but image analysis is not configured yet.`
@@ -296,6 +308,7 @@ IAM:
 - Worker Lambda execution role needs `lambda:InvokeFunction` on the Summarizer Lambda when `SUMMARIZER_FUNCTION_NAME` is configured.
 - Worker Lambda execution role needs `lambda:InvokeFunction` on the ImageRek Lambda when `IMAGE_REK_FUNCTION` is configured.
 - Worker Lambda execution role needs `bedrock:RetrieveAndGenerate` for the configured Bedrock Knowledge Base.
+- Worker Lambda execution role needs `bedrock:InvokeModel` for `REQUEST_SUMMARY_MODEL_ID` when `ENABLE_REQUEST_AI_SUMMARY=true`.
 
 ### Router Lambda
 
@@ -547,9 +560,14 @@ Current known tests/checks:
 Manual Slack test scenarios:
 
 - DM bot with text: should process.
-- New top-level DM issue should create a thread-backed session whose id includes `thread_ts`.
-- Reply inside that Slack thread should continue the same IVY session.
-- A separate top-level DM issue should create a separate IVY session/thread.
+- New 1:1 DM issue should create a session whose id is `issue:{channel}:{root_ts}` without sending bot replies in a Slack thread.
+- A second unrelated 1:1 DM message after a normal fulfilled answer should start a new `issue:{channel}:{new_ts}` session.
+- A second unrelated 1:1 DM message after button-only prompts such as `Was this helpful?` should also start a new issue unless the user clicks a button.
+- A 1:1 DM reply to pending Jira confirmation or assistance-detail collection should continue the pending session.
+- Group DM/thread replies should continue the same IVY session through the Slack root thread.
+- A separate group DM/channel top-level issue should create a separate IVY session/thread.
+- Button values should include the target `session_id` and `session_root_ts`.
+- Replying to a closed/failed/ticketed/live-agent-requested session should not reopen it.
 - Public channel without bot mention: should ignore.
 - Public channel with bot mention: should ignore.
 - Private channel message: should ignore.
@@ -566,7 +584,7 @@ Manual timeout-flow test:
 - Temporarily set `INACTIVITY_TIMEOUT_SECONDS=60` and `TIMEOUT_CLOSE_GRACE_SECONDS=60` for a faster test.
 - DM the bot and confirm the session row has `timeout_status=scheduled`, `timeout_due_at`, `timeout_token`, and `timeout_schedule_name`.
 - Confirm the EventBridge Scheduler prompt schedule exists for the session.
-- Wait for the prompt schedule to fire and confirm Slack receives the timeout prompt.
+- Wait for the prompt schedule to fire and confirm Slack receives the timeout prompt unthreaded for 1:1 DMs and threaded for group DM/channel sessions.
 - Confirm the session row moves to `timeout_status=prompted` and gets `timeout_close_due_at`.
 - Reply before the close schedule fires and confirm the worker writes a new `timeout_token`; the old close schedule should be ignored as stale.
 - Repeat without replying and confirm the close action sets `conversation_status=closed` and `timeout_status=closed`.
@@ -577,7 +595,7 @@ Manual Close & summarize button test:
 - DM the bot and confirm active answer-style replies include `Close & summarize`.
 - Click `Close & summarize` and confirm Slack replies `Closed this IVY session and started the summary.`
 - Confirm DynamoDB stores `conversation_status=closed`, `timeout_status=closed`, `manual_close_reason=button_close_summary`, and `manual_closed_at`.
-- Confirm the session row stores `thread_ts` and the summarizer uses the thread transcript.
+- Confirm the session row stores `session_root_ts`; `thread_ts` is omitted for 1:1 DMs and stored for threaded conversations.
 - Confirm prompt/close schedules are deleted or ignored.
 - Confirm worker logs `manual_close_summary_summarizer_invoked`.
 - Confirm summarizer stores `conversation_summary.ai_summary` and an audit S3 key.
@@ -609,6 +627,8 @@ Manual router/Jira confirmation test:
 - Reply `no` and confirm `jira_status=cancelled` and no Jira ticket is created.
 - Repeat and reply `yes`; confirm Jira ticket creation and `jira_status=created`, `jira_ticket_key`, `jira_ticket_url`, and `jira_request_id`.
 - Reply `yes` again and confirm no duplicate Jira issue is created; Slack should return the existing ticket or in-progress reply.
+- Confirm the Jira issue description includes `Conversation summary` and `Conversation transcript` sections above the original user request.
+- Click live-agent support twice from the same support options message and confirm only one handoff is sent.
 - With `ENABLE_ROVO_ENRICHMENT=true`, confirm Jira receives a `Project IVY enrichment` comment and DynamoDB moves from `rovo_status=pending` to `completed`.
 - Temporarily break Jira comment permission and confirm `rovo_status=failed` while `jira_status=created` stays unchanged.
 - Send a static FAQ phrase such as `reset adam password` and confirm it still stores `response_source=lex`.

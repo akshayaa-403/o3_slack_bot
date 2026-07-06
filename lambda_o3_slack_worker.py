@@ -331,12 +331,16 @@ def slack_api(method, params=None, payload=None, http_method=None):
 
 
 def fetch_conversation_metadata(channel, fallback_type=None):
+    inferred_type = fallback_type
+    if not inferred_type and str(channel or "").startswith("D"):
+        inferred_type = "im"
+
     metadata = {
-        "conversation_type": fallback_type,
-        "is_dm": fallback_type == "im",
-        "is_mpim": fallback_type == "mpim",
-        "is_channel": fallback_type == "channel",
-        "is_private": fallback_type == "group",
+        "conversation_type": inferred_type,
+        "is_dm": inferred_type == "im",
+        "is_mpim": inferred_type == "mpim",
+        "is_channel": inferred_type == "channel",
+        "is_private": inferred_type == "group",
     }
 
     if not channel:
@@ -350,7 +354,7 @@ def fetch_conversation_metadata(channel, fallback_type=None):
             else "mpim" if info.get("is_mpim")
             else "group" if info.get("is_group") or info.get("is_private")
             else "channel" if info.get("is_channel")
-            else fallback_type
+            else inferred_type
         )
         metadata.update({
             "conversation_type": conversation_type,
@@ -376,6 +380,17 @@ def is_dm_like_conversation(metadata):
     return metadata.get("is_dm") or metadata.get("is_mpim") or metadata.get("conversation_type") in {"im", "mpim"}
 
 
+def is_one_to_one_dm_conversation(metadata):
+    return bool(metadata.get("is_dm") or metadata.get("conversation_type") == "im")
+
+
+def slack_thread_ts_for_conversation(session_root_ts, metadata):
+    if is_one_to_one_dm_conversation(metadata):
+        return None
+
+    return session_root_ts
+
+
 def slack_mrkdwn(text, limit=2900):
     value = (text or "").strip()
 
@@ -389,11 +404,138 @@ def compact_json(data):
     return json.dumps(data or {}, default=str, ensure_ascii=True, sort_keys=True)
 
 
+def action_button_value(action, session_id=None, session_root_ts=None):
+    if not (session_id or session_root_ts):
+        return action
+
+    return json.dumps(
+        {
+            "action": action,
+            "session_id": session_id,
+            "session_root_ts": session_root_ts,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def parse_action_value(value):
+    if not isinstance(value, str) or not value.strip():
+        return {}
+
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, dict):
+            return parsed
+    except ValueError:
+        pass
+
+    return {
+        "action": value
+    }
+
+
+def root_ts_from_session_id(session_id):
+    value = (session_id or "").strip()
+    if value.startswith("issue:"):
+        parts = value.split(":", 2)
+        if len(parts) == 3:
+            return parts[2]
+
+    return None
+
+
+def active_dm_pointer_id(channel, user):
+    if not channel or not user:
+        return None
+
+    return f"dm_active:{channel}:{user}"
+
+
+def resolve_session_identity(body, channel, user):
+    action_payload = body.get("action_payload")
+    if not isinstance(action_payload, dict):
+        action_payload = parse_action_value(body.get("action_value"))
+
+    explicit_session_id = (action_payload.get("session_id") or "").strip()
+    explicit_root_ts = (action_payload.get("session_root_ts") or action_payload.get("root_ts") or "").strip()
+    ts_candidates = [(body.get("thread_ts") or "").strip()]
+    if body.get("event_type") == "interactive_action":
+        ts_candidates.extend([
+            (body.get("message_ts") or "").strip(),
+            (body.get("ts") or "").strip(),
+        ])
+    else:
+        ts_candidates.extend([
+            (body.get("ts") or "").strip(),
+            (body.get("message_ts") or "").strip(),
+        ])
+    session_root_ts = explicit_root_ts or next((value for value in ts_candidates if value), "")
+
+    if explicit_session_id:
+        return {
+            "session_id": explicit_session_id,
+            "session_root_ts": session_root_ts or root_ts_from_session_id(explicit_session_id),
+            "session_id_version": "v2_issue_thread" if explicit_session_id.startswith("issue:") else "legacy",
+            "session_scope": "support_issue" if explicit_session_id.startswith("issue:") else "legacy_user_channel",
+            "legacy": not explicit_session_id.startswith("issue:"),
+            "explicit": True,
+        }
+
+    if channel and session_root_ts:
+        return {
+            "session_id": f"issue:{channel}:{session_root_ts}",
+            "session_root_ts": session_root_ts,
+            "session_id_version": "v2_issue_thread",
+            "session_scope": "support_issue",
+            "legacy": False,
+            "explicit": False,
+        }
+
+    return {
+        "session_id": f"{channel}:{user}",
+        "session_root_ts": None,
+        "session_id_version": "legacy",
+        "session_scope": "legacy_user_channel",
+        "legacy": True,
+        "explicit": False,
+    }
+
+
+def session_is_terminal(session_item):
+    if not session_item:
+        return False
+
+    return (
+        session_item.get("conversation_status") in {"closed", "failed"}
+        or session_item.get("summary_status") in {"started", "completed"}
+        or session_item.get("jira_status") == "created"
+        or session_item.get("support_options_status") in {"jira_created", "live_agent_requested"}
+        or session_item.get("live_agent_status") == "requested"
+    )
+
+
+def terminal_session_reply(session_item):
+    ticket_key = session_item.get("jira_ticket_key") or session_item.get("last_jira_ticket_key")
+    ticket_url = session_item.get("jira_ticket_url") or session_item.get("last_jira_ticket_url")
+
+    if session_item.get("jira_status") == "created":
+        return existing_jira_ticket_reply(ticket_key, ticket_url)
+
+    if session_item.get("live_agent_status") == "requested":
+        return "This issue has already been sent to live agent support. Please start a new message for a different issue."
+
+    if session_item.get("conversation_status") == "failed":
+        return "This IVY session is in a failed state. Please start a new message for a new issue."
+
+    return "This IVY session is already closed. Please start a new message for a new issue."
+
+
 def assistance_reply_text(lex_reply):
     return f"{(lex_reply or '').strip()}\n\n{LEX_ASSISTANCE_PROMPT_TEXT}"
 
 
-def assistance_blocks(lex_reply):
+def assistance_blocks(lex_reply, session_id=None, session_root_ts=None):
     return [
         {
             "type": "section",
@@ -420,7 +562,7 @@ def assistance_blocks(lex_reply):
                         "text": "Close & summarize"
                     },
                     "action_id": ACTION_ID_CLOSE_AND_SUMMARIZE,
-                    "value": "close_and_summarize"
+                    "value": action_button_value("close_and_summarize", session_id, session_root_ts)
                 },
                 {
                     "type": "button",
@@ -429,7 +571,7 @@ def assistance_blocks(lex_reply):
                         "text": "I need more help"
                     },
                     "action_id": ACTION_ID_ASSISTANCE_NEED_MORE_HELP,
-                    "value": "need_more_help"
+                    "value": action_button_value("need_more_help", session_id, session_root_ts)
                 }
             ]
         }
@@ -440,7 +582,7 @@ def final_support_reply_text(reply):
     return f"{(reply or '').strip()}\n\n{CLAUDE_FINAL_ACTION_PROMPT_TEXT}"
 
 
-def final_support_blocks(reply):
+def final_support_blocks(reply, session_id=None, session_root_ts=None):
     return [
         {
             "type": "section",
@@ -467,7 +609,7 @@ def final_support_blocks(reply):
                         "text": "Live agent support"
                     },
                     "action_id": ACTION_ID_LIVE_AGENT_SUPPORT,
-                    "value": "live_agent_support"
+                    "value": action_button_value("live_agent_support", session_id, session_root_ts)
                 },
                 {
                     "type": "button",
@@ -477,7 +619,7 @@ def final_support_blocks(reply):
                     },
                     "style": "primary",
                     "action_id": ACTION_ID_CREATE_JIRA_TICKET,
-                    "value": "create_jira_ticket"
+                    "value": action_button_value("create_jira_ticket", session_id, session_root_ts)
                 },
                 {
                     "type": "button",
@@ -486,14 +628,14 @@ def final_support_blocks(reply):
                         "text": "Close & summarize"
                     },
                     "action_id": ACTION_ID_CLOSE_AND_SUMMARIZE,
-                    "value": "close_and_summarize"
+                    "value": action_button_value("close_and_summarize", session_id, session_root_ts)
                 }
             ]
         }
     ]
 
 
-def close_summary_actions_block():
+def close_summary_actions_block(session_id=None, session_root_ts=None):
     return {
         "type": "actions",
         "block_id": "ivy_close_summary_actions",
@@ -505,7 +647,7 @@ def close_summary_actions_block():
                     "text": "Close & summarize"
                 },
                 "action_id": ACTION_ID_CLOSE_AND_SUMMARIZE,
-                "value": "close_and_summarize"
+                "value": action_button_value("close_and_summarize", session_id, session_root_ts)
             },
             {
                 "type": "button",
@@ -514,13 +656,13 @@ def close_summary_actions_block():
                     "text": "I need more help"
                 },
                 "action_id": ACTION_ID_ASSISTANCE_NEED_MORE_HELP,
-                "value": "need_more_help"
+                "value": action_button_value("need_more_help", session_id, session_root_ts)
             }
         ]
     }
 
 
-def add_close_summary_actions(blocks, reply=None):
+def add_close_summary_actions(blocks, reply=None, session_id=None, session_root_ts=None):
     value = list(blocks or [])
 
     if not value and reply:
@@ -535,7 +677,7 @@ def add_close_summary_actions(blocks, reply=None):
     if any(block.get("block_id") == "ivy_close_summary_actions" for block in value):
         return value
 
-    value.append(close_summary_actions_block())
+    value.append(close_summary_actions_block(session_id, session_root_ts))
     return value
 
 
@@ -1476,10 +1618,11 @@ def find_matching_screenshot_issue(image_result):
     }
 
 
-def build_image_payload(body, session_id, text, raw_text, image_files):
+def build_image_payload(body, session_id, text, raw_text, image_files, session_root_ts=None, slack_thread_ts=None):
     return {
         "event_id": body.get("event_id"),
         "session_id": session_id,
+        "session_root_ts": session_root_ts,
         "channel": body.get("channel"),
         "channel_type": body.get("channel_type"),
         "routing_reason": body.get("routing_reason"),
@@ -1491,7 +1634,7 @@ def build_image_payload(body, session_id, text, raw_text, image_files):
             "channel": body.get("channel"),
             "user": body.get("user"),
             "event_ts": body.get("ts"),
-            "thread_ts": body.get("thread_ts"),
+            "thread_ts": slack_thread_ts,
         }
     }
 
@@ -1775,6 +1918,77 @@ def get_session_item(session_id):
     return response.get("Item") or {}
 
 
+def get_active_dm_session(channel, user, text=None):
+    pointer_id = active_dm_pointer_id(channel, user)
+    if not pointer_id:
+        return {}
+
+    pointer = get_session_item(pointer_id)
+    active_session_id = pointer.get("active_session_id")
+    if not active_session_id:
+        return {}
+
+    session_item = get_session_item(active_session_id)
+    if not session_item or session_is_terminal(session_item):
+        delete_active_dm_session(channel, user)
+        return {}
+
+    if not session_waits_for_dm_text(session_item, text):
+        delete_active_dm_session(channel, user)
+        return {}
+
+    return session_item
+
+
+def upsert_active_dm_session(channel, user, session_id, session_root_ts, now_iso):
+    pointer_id = active_dm_pointer_id(channel, user)
+    if not pointer_id or not session_id:
+        return
+
+    sessions_table.put_item(
+        Item={
+            "session_id": pointer_id,
+            "active_session_id": session_id,
+            "session_root_ts": session_root_ts,
+            "channel": channel,
+            "user": user,
+            "session_id_version": "v2_dm_active_pointer",
+            "session_scope": "one_to_one_dm_active_issue",
+            "updated_at": now_iso,
+            "ttl": ttl_epoch(),
+        }
+    )
+
+
+def delete_active_dm_session(channel, user):
+    pointer_id = active_dm_pointer_id(channel, user)
+    if not pointer_id:
+        return
+
+    sessions_table.update_item(
+        Key={
+            "session_id": pointer_id
+        },
+        UpdateExpression="""
+            SET
+                pointer_status = :inactive,
+                updated_at = :updated_at,
+                #ttl = :ttl
+            REMOVE
+                active_session_id,
+                session_root_ts
+        """,
+        ExpressionAttributeNames={
+            "#ttl": "ttl"
+        },
+        ExpressionAttributeValues={
+            ":inactive": "inactive",
+            ":updated_at": to_iso(datetime.now(timezone.utc)),
+            ":ttl": ttl_epoch(),
+        }
+    )
+
+
 def has_pending_jira_confirmation(session_item):
     return (
         session_item.get("next_action") == NEXT_ACTION_CREATE_JIRA_TICKET
@@ -1800,6 +2014,25 @@ def has_pending_final_support_options(session_item):
     return (
         session_item.get("next_action") == NEXT_ACTION_FINAL_SUPPORT_OPTIONS
         and session_item.get("support_options_status") == "pending"
+    )
+
+
+def session_waits_for_dm_text(session_item, text=None):
+    if not session_item or session_is_terminal(session_item):
+        return False
+
+    if has_pending_jira_confirmation(session_item):
+        return True
+
+    if has_pending_assistance_details(session_item):
+        return True
+
+    if has_jira_confirmation_state(session_item, text or ""):
+        return True
+
+    return (
+        session_item.get("support_options_status") in {"creating_jira", "live_agent_creating"}
+        or session_item.get("live_agent_status") == "creating"
     )
 
 
@@ -2051,6 +2284,12 @@ def build_jira_payload(session_item, body, session_id, text, raw_text):
         **session_item,
         "session_id": session_id,
     })
+    conversation_text = request_conversation_text(session_item)
+    session_root_ts = session_item.get("session_root_ts") or session_item.get("thread_ts") or body.get("thread_ts")
+    conversation_metadata = session_item.get("conversation_metadata") or {}
+    slack_thread_ts = None if is_one_to_one_dm_conversation(conversation_metadata) else (
+        session_item.get("thread_ts") or body.get("thread_ts") or session_root_ts
+    )
 
     return {
         "jira_request_id": session_item.get("jira_request_id"),
@@ -2058,11 +2297,13 @@ def build_jira_payload(session_item, body, session_id, text, raw_text):
         "jira_confirmed_at": session_item.get("jira_confirmed_at"),
         "event_id": body.get("event_id"),
         "session_id": session_id,
+        "session_root_ts": session_root_ts,
         "channel": body.get("channel"),
         "user": body.get("user"),
         "text": request_text,
         "raw_text": request_raw_text,
         "conversation_summary": summary_result.get("text"),
+        "conversation_text": conversation_text,
         "conversation_summary_model_id": summary_result.get("model_id"),
         "conversation_summary_usage": summary_result.get("usage", {}),
         "conversation_summary_error": summary_result.get("error"),
@@ -2077,7 +2318,7 @@ def build_jira_payload(session_item, body, session_id, text, raw_text):
             "channel": body.get("channel"),
             "user": body.get("user"),
             "event_ts": body.get("ts"),
-            "thread_ts": body.get("thread_ts"),
+            "thread_ts": slack_thread_ts,
         }
     }
 
@@ -2529,6 +2770,10 @@ def transcript_for_request_summary(transcript):
     return "\n".join(lines)
 
 
+def request_conversation_text(session_item):
+    return transcript_for_request_summary(request_summary_transcript(session_item))
+
+
 def deterministic_request_summary(session_item, transcript):
     parts = []
     original_text = compact_text(support_original_text(session_item), 800)
@@ -2703,7 +2948,11 @@ def build_final_support_result(session_item, claude_result, now_iso):
         "response_source": "claude" if claude_ok else "claude_failed",
         "next_action": NEXT_ACTION_FINAL_SUPPORT_OPTIONS,
         "reply": final_support_reply_text(final_answer),
-        "blocks": final_support_blocks(final_answer),
+        "blocks": final_support_blocks(
+            final_answer,
+            session_item.get("session_id"),
+            session_item.get("session_root_ts") or session_item.get("thread_ts"),
+        ),
         "claude_fallback_attempted": True,
         "claude_fallback_error": None if claude_ok else claude_result.get("error", "unknown_claude_error"),
         "claude_model_id": claude_result.get("model_id"),
@@ -2983,11 +3232,18 @@ def build_live_agent_payload(session_item, body, session_id, now_iso):
         **session_item,
         "session_id": session_id,
     })
+    conversation_text = request_conversation_text(session_item)
+    session_root_ts = session_item.get("session_root_ts") or session_item.get("thread_ts") or body.get("thread_ts")
+    conversation_metadata = session_item.get("conversation_metadata") or {}
+    slack_thread_ts = None if is_one_to_one_dm_conversation(conversation_metadata) else (
+        session_item.get("thread_ts") or body.get("thread_ts") or session_root_ts
+    )
 
     payload = {
         "type": "live_agent_handoff",
         "source": "slack",
         "session_id": session_id,
+        "session_root_ts": session_root_ts,
         "intent_name": LIVE_AGENT_CONFIG_INTENT,
         "configIntent": LIVE_AGENT_CONFIG_INTENT,
         "requested_at": now_iso,
@@ -2995,6 +3251,7 @@ def build_live_agent_payload(session_item, body, session_id, now_iso):
         "description": original_text,
         "raw_text": raw_text,
         "conversation_summary": summary_result.get("text"),
+        "conversation_text": conversation_text,
         "conversation_summary_model_id": summary_result.get("model_id"),
         "conversation_summary_usage": summary_result.get("usage", {}),
         "conversation_summary_error": summary_result.get("error"),
@@ -3012,7 +3269,7 @@ def build_live_agent_payload(session_item, body, session_id, now_iso):
         },
         "slack": {
             "channelId": body.get("channel") or session_item.get("channel"),
-            "threadTs": session_item.get("thread_ts") or body.get("thread_ts"),
+            "threadTs": slack_thread_ts,
             "userId": body.get("user") or session_item.get("user"),
             "eventTs": body.get("ts"),
             "channelType": body.get("channel_type") or session_item.get("channel_type"),
@@ -3032,6 +3289,7 @@ def build_live_agent_payload(session_item, body, session_id, now_iso):
             "lex_state": session_item.get("lex_state"),
             "response_source": session_item.get("response_source"),
             "conversation_summary": summary_result.get("text"),
+            "conversation_text": conversation_text,
             "conversation_summary_model_id": summary_result.get("model_id"),
             "conversation_summary_fallback_used": summary_result.get("fallback_used", False),
         },
@@ -3157,6 +3415,97 @@ def live_agent_reply(result):
     return LIVE_AGENT_DEFERRED_REPLY if result.get("ok") else LIVE_AGENT_FAILED_REPLY
 
 
+def existing_live_agent_state_result(session_item, base_result):
+    live_agent_status = session_item.get("live_agent_status")
+    support_options_status = session_item.get("support_options_status")
+
+    if live_agent_status == "requested" or support_options_status == "live_agent_requested":
+        return {
+            **base_result,
+            "lex_state": "Fulfilled",
+            "response_source": "live_agent",
+            "next_action": None,
+            "support_options_status": "live_agent_requested",
+            "live_agent_status": "requested",
+            "live_agent_requested_at": session_item.get("live_agent_requested_at"),
+            "reply": LIVE_AGENT_DEFERRED_REPLY,
+        }
+
+    if live_agent_status == "creating" or support_options_status == "live_agent_creating":
+        return {
+            **base_result,
+            "lex_state": "InProgress",
+            "response_source": "live_agent",
+            "next_action": NEXT_ACTION_FINAL_SUPPORT_OPTIONS,
+            "support_options_status": "live_agent_creating",
+            "live_agent_status": "creating",
+            "live_agent_requested_at": session_item.get("live_agent_requested_at"),
+            "reply": "Live agent handoff is already in progress. Please wait a moment.",
+        }
+
+    return {
+        **base_result,
+        "response_source": "interactive_stale",
+        "reply": "That live-agent action is no longer active. Please send a new message.",
+    }
+
+
+def acquire_live_agent_handoff_lock(session_id, event_id, now_iso):
+    try:
+        sessions_table.update_item(
+            Key={
+                "session_id": session_id
+            },
+            UpdateExpression="""
+                SET
+                    support_options_status = :support_creating,
+                    live_agent_status = :live_agent_creating,
+                    live_agent_requested_at = :now,
+                    live_agent_request_event_id = :event_id,
+                    updated_at = :now
+                REMOVE
+                    live_agent_error,
+                    live_agent_error_code
+            """,
+            ConditionExpression="""
+                next_action = :next_action
+                AND support_options_status = :pending
+                AND (
+                    attribute_not_exists(live_agent_status)
+                    OR live_agent_status IN (:failed, :cancelled)
+                )
+            """,
+            ExpressionAttributeValues={
+                ":support_creating": "live_agent_creating",
+                ":live_agent_creating": "creating",
+                ":next_action": NEXT_ACTION_FINAL_SUPPORT_OPTIONS,
+                ":pending": "pending",
+                ":failed": "failed",
+                ":cancelled": "cancelled",
+                ":event_id": event_id or "unknown-event",
+                ":now": now_iso,
+            }
+        )
+
+        log_json({
+            "level": "INFO",
+            "message": "live_agent_handoff_lock_acquired",
+            "session_id": session_id
+        })
+        return True
+
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            log_json({
+                "level": "INFO",
+                "message": "live_agent_handoff_lock_conflict",
+                "session_id": session_id
+            })
+            return False
+
+        raise
+
+
 def handle_interactive_action(session_item, body, session_id):
     action_id = body.get("action_id")
     now_iso = to_iso(datetime.now(timezone.utc))
@@ -3254,11 +3603,28 @@ def handle_interactive_action(session_item, body, session_id):
         return handle_support_create_jira(support_session, body, session_id, now_iso)
 
     if action_id == ACTION_ID_LIVE_AGENT_SUPPORT:
+        if session_item.get("live_agent_status") in {"creating", "requested"}:
+            return existing_live_agent_state_result(session_item, result)
+
         if not has_pending_final_support_options(session_item):
             return result
 
+        if not acquire_live_agent_handoff_lock(
+            session_id,
+            body.get("event_id"),
+            now_iso
+        ):
+            latest_session = get_session_item(session_id)
+            return existing_live_agent_state_result(latest_session, result)
+
+        locked_session = {
+            **session_item,
+            "support_options_status": "live_agent_creating",
+            "live_agent_status": "creating",
+            "live_agent_requested_at": now_iso,
+        }
         live_agent_result = invoke_live_agent_handoff(
-            build_live_agent_payload(session_item, body, session_id, now_iso)
+            build_live_agent_payload(locked_session, body, session_id, now_iso)
         )
         live_agent_ok = bool(live_agent_result.get("ok"))
 
@@ -3464,12 +3830,22 @@ def process_record(record):
     action_id = body.get("action_id")
     action_value = body.get("action_value")
     is_interactive_action = event_type == "interactive_action"
+    action_payload = parse_action_value(action_value)
+    body["action_payload"] = action_payload
+    if is_interactive_action and action_payload.get("action"):
+        action_value = action_payload["action"]
+        body["action_value"] = action_value
+        text = action_value
+        raw_text = action_value
 
     conversation_metadata = fetch_conversation_metadata(channel, body.get("conversation_type") or channel_type)
     conversation_type = conversation_metadata.get("conversation_type") or channel_type
     dm_like_conversation = is_dm_like_conversation(conversation_metadata)
-    session_thread_ts = None if dm_like_conversation else thread_ts
-    session_id = f"{channel}:{user}:{session_thread_ts}" if session_thread_ts else f"{channel}:{user}"
+    one_to_one_dm = is_one_to_one_dm_conversation(conversation_metadata)
+    session_identity = resolve_session_identity(body, channel, user)
+    session_id = session_identity["session_id"]
+    session_root_ts = session_identity.get("session_root_ts")
+    session_thread_ts = slack_thread_ts_for_conversation(session_root_ts, conversation_metadata)
 
     log_json({
         "level": "INFO",
@@ -3481,17 +3857,65 @@ def process_record(record):
         "routing_reason": routing_reason,
         "conversation_type": conversation_type,
         "dm_like_conversation": dm_like_conversation,
+        "one_to_one_dm": one_to_one_dm,
         "user": user,
         "text": text,
         "thread_ts": session_thread_ts,
+        "session_id": session_id,
+        "session_id_version": session_identity.get("session_id_version"),
+        "session_scope": session_identity.get("session_scope"),
         "image_file_count": len(image_files),
         "action_id": action_id
     })
 
     existing_session = get_session_item(session_id)
+    if (
+        one_to_one_dm
+        and not existing_session
+        and not session_identity.get("explicit")
+        and not body.get("thread_ts")
+    ):
+        active_dm_session = get_active_dm_session(channel, user, text)
+        if active_dm_session:
+            session_id = active_dm_session["session_id"]
+            session_root_ts = active_dm_session.get("session_root_ts") or root_ts_from_session_id(session_id)
+            session_thread_ts = slack_thread_ts_for_conversation(session_root_ts, conversation_metadata)
+            session_identity = {
+                "session_id": session_id,
+                "session_root_ts": session_root_ts,
+                "session_id_version": active_dm_session.get("session_id_version") or "v2_issue_thread",
+                "session_scope": active_dm_session.get("session_scope") or "support_issue",
+                "legacy": not str(session_id).startswith("issue:"),
+                "explicit": False,
+            }
+            existing_session = active_dm_session
+
+    legacy_session_id = f"{channel}:{user}"
+    if (
+        not existing_session
+        and is_interactive_action
+        and not session_identity.get("explicit")
+        and not body.get("thread_ts")
+        and legacy_session_id != session_id
+    ):
+        legacy_session = get_session_item(legacy_session_id)
+        if legacy_session:
+            session_id = legacy_session_id
+            session_root_ts = legacy_session.get("session_root_ts") or legacy_session.get("thread_ts")
+            session_thread_ts = slack_thread_ts_for_conversation(session_root_ts, conversation_metadata)
+            session_identity = {
+                "session_id": session_id,
+                "session_root_ts": session_root_ts,
+                "session_id_version": legacy_session.get("session_id_version") or "legacy",
+                "session_scope": legacy_session.get("session_scope") or "legacy_user_channel",
+                "legacy": True,
+                "explicit": False,
+            }
+            existing_session = legacy_session
+
     reset_closed_session = (
         not is_interactive_action
-        and not session_thread_ts
+        and session_identity.get("legacy")
         and existing_session.get("conversation_status") in {"closed", "failed"}
     )
     if reset_closed_session:
@@ -3507,6 +3931,30 @@ def process_record(record):
         existing_session = {}
     else:
         lex_session_id = existing_session.get("lex_session_id") or session_id
+
+    if existing_session and session_is_terminal(existing_session) and not reset_closed_session:
+        reply = terminal_session_reply(existing_session)
+        if one_to_one_dm:
+            delete_active_dm_session(channel, user)
+
+        send_slack_message(
+            channel,
+            reply,
+            thread_ts=slack_thread_ts_for_conversation(
+                session_root_ts or existing_session.get("session_root_ts") or existing_session.get("thread_ts"),
+                conversation_metadata
+            )
+        )
+        log_json({
+            "level": "INFO",
+            "message": "terminal_session_not_reopened",
+            "event_id": event_id,
+            "session_id": session_id,
+            "conversation_status": existing_session.get("conversation_status"),
+            "jira_status": existing_session.get("jira_status"),
+            "live_agent_status": existing_session.get("live_agent_status")
+        })
+        return
 
     response_source = "lex"
     claude_fallback_attempted = False
@@ -3676,7 +4124,7 @@ def process_record(record):
             except ClientError as e:
                 if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                     lex_reply = "That action is no longer active. Please send a new message."
-                    send_slack_message(channel, lex_reply)
+                    send_slack_message(channel, lex_reply, thread_ts=session_thread_ts)
                     log_json({
                         "level": "INFO",
                         "message": "manual_close_summary_ignored",
@@ -3713,7 +4161,8 @@ def process_record(record):
             if not summarizer_result.get("ok"):
                 send_slack_message(
                     channel,
-                    "I could not complete the summary/save step. This session has not been fully closed."
+                    "I could not complete the summary/save step. This session has not been fully closed.",
+                    thread_ts=session_thread_ts
                 )
 
             log_json({
@@ -3729,7 +4178,7 @@ def process_record(record):
     elif has_image and not is_interactive_action:
         image_requested_at = to_iso(datetime.now(timezone.utc))
         image_result = invoke_image_analysis(
-            build_image_payload(body, session_id, text, raw_text, image_files)
+            build_image_payload(body, session_id, text, raw_text, image_files, session_root_ts, session_thread_ts)
         )
         image_analyzed_at = to_iso(datetime.now(timezone.utc))
         image_status = "analysis_completed" if image_result.get("ok") else "failed"
@@ -3890,6 +4339,9 @@ def process_record(record):
 
         details_session = {
             **existing_session,
+            "session_id": session_id,
+            "session_root_ts": session_root_ts,
+            "thread_ts": session_thread_ts,
             "assistance_followup_text": text,
             "assistance_followup_raw_text": raw_text,
             "assistance_followup_at": to_iso(datetime.now(timezone.utc)),
@@ -4079,6 +4531,9 @@ def process_record(record):
         claude_result = invoke_claude_fallback(claude_payload)
         final_support_session = {
             **existing_session,
+            "session_id": session_id,
+            "session_root_ts": session_root_ts,
+            "thread_ts": session_thread_ts,
             "assistance_original_text": text,
             "assistance_raw_text": raw_text,
             "assistance_lex_intent": lex_intent,
@@ -4142,7 +4597,7 @@ def process_record(record):
     ):
         original_lex_reply = lex_reply
         lex_reply = assistance_reply_text(original_lex_reply)
-        slack_blocks = assistance_blocks(original_lex_reply)
+        slack_blocks = assistance_blocks(original_lex_reply, session_id, session_root_ts)
         next_action = NEXT_ACTION_CLAUDE_ASSISTANCE
         assistance_status = "pending_confirmation"
         assistance_original_text = text
@@ -4168,7 +4623,9 @@ def process_record(record):
         conversation_status = "active"
     if assistance_status in {"pending_confirmation", "awaiting_details"}:
         conversation_status = "active"
-    if support_options_status in {"pending", "creating_jira"}:
+    if support_options_status in {"pending", "creating_jira", "live_agent_creating"}:
+        conversation_status = "active"
+    if live_agent_status == "creating":
         conversation_status = "active"
 
     offer_close_summary = (
@@ -4192,7 +4649,7 @@ def process_record(record):
         session_state = SESSION_STATE_WAITING_FOR_USER
     elif assistance_status == "pending_confirmation":
         session_state = SESSION_STATE_WAITING_FOR_USER
-    elif assistance_status == "awaiting_details" or support_options_status in {"pending", "creating_jira"}:
+    elif assistance_status == "awaiting_details" or support_options_status in {"pending", "creating_jira", "live_agent_creating"}:
         session_state = SESSION_STATE_COLLECTING_DETAILS
     elif conversation_status == "closed":
         session_state = SESSION_STATE_CLOSED
@@ -4237,7 +4694,7 @@ def process_record(record):
         }
 
     if offer_close_summary:
-        slack_blocks = add_close_summary_actions(slack_blocks, lex_reply)
+        slack_blocks = add_close_summary_actions(slack_blocks, lex_reply, session_id, session_root_ts)
 
     created_at_expression = (
         "created_at = :created_at"
@@ -4254,6 +4711,9 @@ def process_record(record):
             last_raw_user_text = :last_raw_user_text,
             last_bot_reply = :last_bot_reply,
             thread_ts = :thread_ts,
+            session_root_ts = :session_root_ts,
+            session_id_version = :session_id_version,
+            session_scope = :session_scope,
             response_source = :response_source,
             claude_fallback_attempted = :claude_fallback_attempted,
             last_ts = :last_ts,
@@ -4283,6 +4743,9 @@ def process_record(record):
         ":last_raw_user_text": raw_text,
         ":last_bot_reply": lex_reply,
         ":thread_ts": session_thread_ts,
+        ":session_root_ts": session_root_ts,
+        ":session_id_version": session_identity.get("session_id_version"),
+        ":session_scope": session_identity.get("session_scope"),
         ":response_source": response_source,
         ":claude_fallback_attempted": claude_fallback_attempted,
         ":last_ts": ts,
@@ -4642,18 +5105,196 @@ def process_record(record):
             message_count :one
     """
 
-    sessions_table.update_item(
-        Key={
-            "session_id": session_id
-        },
-        UpdateExpression=update_expression,
-        ExpressionAttributeNames={
-            "#channel": "channel",
-            "#user": "user",
-            "#ttl": "ttl"
-        },
-        ExpressionAttributeValues=expression_attribute_values
-    )
+    try:
+        sessions_table.update_item(
+            Key={
+                "session_id": session_id
+            },
+            UpdateExpression=update_expression,
+            ExpressionAttributeNames={
+                "#channel": "channel",
+                "#user": "user",
+                "#ttl": "ttl"
+            },
+            ExpressionAttributeValues=expression_attribute_values
+        )
+    except ClientError as e:
+        error = e.response.get("Error", {})
+        if (
+            error.get("Code") != "ValidationException"
+            or "Expression size has exceeded" not in error.get("Message", "")
+        ):
+            raise
+
+        log_json({
+            "level": "WARN",
+            "message": "session_full_update_too_large_compacting",
+            "event_id": event_id,
+            "session_id": session_id,
+            "jira_request_id": jira_request_id,
+            "jira_status": jira_status,
+            "update_expression_length": len(update_expression),
+        })
+
+        compact_update_expression = """
+            SET
+                #channel = :channel,
+                #user = :user,
+                last_event_id = :event_id,
+                last_user_text = :last_user_text,
+                last_raw_user_text = :last_raw_user_text,
+                last_bot_reply = :last_bot_reply,
+                thread_ts = :thread_ts,
+                session_root_ts = :session_root_ts,
+                response_source = :response_source,
+                last_ts = :last_ts,
+                last_activity_at = :last_activity_at,
+                event_type = :event_type,
+                channel_type = :channel_type,
+                routing_reason = :routing_reason,
+                conversation_type = :conversation_type,
+                lex_session_id = :lex_session_id,
+                lex_intent = :lex_intent,
+                lex_state = :lex_state,
+                lex_slots = :lex_slots,
+                conversation_status = :conversation_status,
+                session_state = :session_state,
+                timeout_status = :timeout_status,
+                updated_at = :updated_at,
+                #ttl = :ttl
+        """
+        compact_values = {
+            key: expression_attribute_values[key]
+            for key in (
+                ":channel",
+                ":user",
+                ":event_id",
+                ":last_user_text",
+                ":last_raw_user_text",
+                ":last_bot_reply",
+                ":thread_ts",
+                ":session_root_ts",
+                ":response_source",
+                ":last_ts",
+                ":last_activity_at",
+                ":event_type",
+                ":channel_type",
+                ":routing_reason",
+                ":conversation_type",
+                ":lex_session_id",
+                ":lex_intent",
+                ":lex_state",
+                ":lex_slots",
+                ":conversation_status",
+                ":session_state",
+                ":timeout_status",
+                ":updated_at",
+                ":ttl",
+                ":one",
+            )
+        }
+
+        compact_optional_attributes = {
+            "next_action": next_action,
+            "jira_status": jira_status,
+            "jira_intent_name": jira_intent_name,
+            "jira_request_text": jira_request_text,
+            "jira_request_id": jira_request_id,
+            "jira_requested_at": jira_requested_at,
+            "jira_confirmed_at": jira_confirmed_at,
+            "jira_create_started_at": jira_create_started_at,
+            "jira_created_at": jira_created_at,
+            "jira_ticket_key": jira_ticket_key,
+            "jira_ticket_url": jira_ticket_url,
+            "jira_error": jira_error,
+            "jira_error_code": jira_error_code,
+            "jira_error_status": jira_error_status,
+            "last_jira_ticket_key": last_jira_ticket_key,
+            "last_jira_ticket_url": last_jira_ticket_url,
+            "last_jira_created_at": last_jira_created_at,
+            "rovo_status": rovo_status,
+            "rovo_requested_at": rovo_requested_at,
+            "support_options_status": support_options_status,
+            "support_resolved_at": support_resolved_at,
+            "live_agent_status": live_agent_status,
+            "live_agent_error": live_agent_error,
+            "live_agent_error_code": live_agent_error_code,
+        }
+
+        compact_remove_attributes = []
+        for attribute_name, attribute_value in compact_optional_attributes.items():
+            if attribute_value is None:
+                compact_remove_attributes.append(attribute_name)
+                continue
+
+            value_name = f":compact_{attribute_name}"
+            compact_update_expression += f", {attribute_name} = {value_name}"
+            compact_values[value_name] = attribute_value
+
+        if timeout_state:
+            compact_update_expression += """
+                ,
+                timeout_due_at = :timeout_due_at,
+                timeout_token = :timeout_token,
+                timeout_schedule_name = :timeout_schedule_name
+            """
+            compact_values[":timeout_due_at"] = timeout_state["timeout_due_at"]
+            compact_values[":timeout_token"] = timeout_state["timeout_token"]
+            compact_values[":timeout_schedule_name"] = timeout_state["timeout_schedule_name"]
+
+        if transcript_append:
+            compact_update_expression += """
+                ,
+                session_messages = list_append(if_not_exists(session_messages, :empty_list), :transcript_append)
+            """
+            compact_values[":empty_list"] = []
+            compact_values[":transcript_append"] = transcript_append
+
+        compact_remove_attributes = [
+            attribute_name
+            for attribute_name in dict.fromkeys(compact_remove_attributes)
+            if attribute_name not in {
+                "last_jira_ticket_key",
+                "last_jira_ticket_url",
+                "last_jira_created_at",
+            }
+        ]
+        if compact_remove_attributes:
+            compact_update_expression += " REMOVE " + ", ".join(compact_remove_attributes)
+
+        compact_update_expression += " ADD message_count :one"
+
+        sessions_table.update_item(
+            Key={
+                "session_id": session_id
+            },
+            UpdateExpression=compact_update_expression,
+            ExpressionAttributeNames={
+                "#channel": "channel",
+                "#user": "user",
+                "#ttl": "ttl"
+            },
+            ExpressionAttributeValues=compact_values
+        )
+
+    if one_to_one_dm and not session_identity.get("legacy"):
+        updated_session_state = {
+            **existing_session,
+            "conversation_status": conversation_status,
+            "summary_status": None,
+            "jira_status": jira_status,
+            "jira_ticket_key": jira_ticket_key,
+            "last_jira_ticket_key": last_jira_ticket_key,
+            "jira_created_at": jira_created_at,
+            "next_action": next_action,
+            "assistance_status": assistance_status,
+            "support_options_status": support_options_status,
+            "live_agent_status": live_agent_status,
+        }
+        if conversation_status == "active" and session_waits_for_dm_text(updated_session_state, text):
+            upsert_active_dm_session(channel, user, session_id, session_root_ts, updated_at)
+        else:
+            delete_active_dm_session(channel, user)
 
     if rovo_should_invoke:
         rovo_payload = build_rovo_payload(
@@ -4715,7 +5356,7 @@ def process_record(record):
         delete_timeout_schedule(session_id, "prompt")
         delete_timeout_schedule(session_id, "close")
 
-    slack_response = send_slack_message(channel, lex_reply, slack_blocks)
+    slack_response = send_slack_message(channel, lex_reply, slack_blocks, thread_ts=session_thread_ts)
     if rovo_should_invoke and jira_ticket_key:
         store_rovo_slack_message_target(
             session_id,
