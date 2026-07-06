@@ -511,16 +511,22 @@ def session_is_terminal(session_item):
         or session_item.get("summary_status") in {"started", "completed"}
         or session_item.get("jira_status") == "created"
         or session_item.get("support_options_status") in {"jira_created", "live_agent_requested"}
-        or session_item.get("live_agent_status") == "requested"
+        or session_item.get("live_agent_status") in {"requested", "ticket_created", "waiting_for_customer", "resolved"}
+        or bool(session_item.get("live_agent_ticket_key") or session_item.get("last_live_agent_ticket_key"))
     )
 
 
 def terminal_session_reply(session_item):
     ticket_key = session_item.get("jira_ticket_key") or session_item.get("last_jira_ticket_key")
     ticket_url = session_item.get("jira_ticket_url") or session_item.get("last_jira_ticket_url")
+    live_agent_ticket_key = session_item.get("live_agent_ticket_key") or session_item.get("last_live_agent_ticket_key")
+    live_agent_ticket_url = session_item.get("live_agent_ticket_url") or session_item.get("last_live_agent_ticket_url")
 
     if session_item.get("jira_status") == "created":
         return existing_jira_ticket_reply(ticket_key, ticket_url)
+
+    if session_item.get("live_agent_status") in {"ticket_created", "waiting_for_customer", "resolved"} or live_agent_ticket_key:
+        return existing_live_agent_ticket_reply(live_agent_ticket_key, live_agent_ticket_url)
 
     if session_item.get("live_agent_status") == "requested":
         return "This issue has already been sent to live agent support. Please start a new message for a different issue."
@@ -2032,7 +2038,7 @@ def session_waits_for_dm_text(session_item, text=None):
 
     return (
         session_item.get("support_options_status") in {"creating_jira", "live_agent_creating"}
-        or session_item.get("live_agent_status") == "creating"
+        or session_item.get("live_agent_status") in {"creating", "in_progress"}
     )
 
 
@@ -2122,6 +2128,26 @@ def existing_jira_ticket_reply(ticket_key, ticket_url):
         return f"Jira ticket already created {ticket_key}."
 
     return "Jira ticket already created."
+
+
+def live_agent_ticket_reply(ticket_key, ticket_url):
+    if ticket_key and ticket_url:
+        return f"Live agent support ticket created: {ticket_key} {ticket_url}"
+
+    if ticket_key:
+        return f"Live agent support ticket created: {ticket_key}"
+
+    return LIVE_AGENT_DEFERRED_REPLY
+
+
+def existing_live_agent_ticket_reply(ticket_key, ticket_url):
+    if ticket_key and ticket_url:
+        return f"Live agent support ticket already created: {ticket_key} {ticket_url}"
+
+    if ticket_key:
+        return f"Live agent support ticket already created: {ticket_key}"
+
+    return "This issue has already been sent to live agent support. Please start a new message for a different issue."
 
 
 def jira_failure_reply(jira_result):
@@ -2599,6 +2625,14 @@ def base_interactive_result(session_item):
         "support_resolved_at": None,
         "live_agent_status": None,
         "live_agent_requested_at": None,
+        "live_agent_ticket_key": None,
+        "live_agent_ticket_url": None,
+        "live_agent_jira_project": None,
+        "live_agent_issue_type": None,
+        "live_agent_portal_request_type": None,
+        "live_agent_updated_at": None,
+        "last_live_agent_ticket_key": None,
+        "last_live_agent_ticket_url": None,
         "live_agent_error": None,
         "live_agent_error_code": None,
         "manual_close_summary": False,
@@ -3405,6 +3439,13 @@ def invoke_live_agent_handoff(payload):
 
 
 def live_agent_reply(result):
+    live_agent_ticket = live_agent_ticket_fields(result)
+    if live_agent_ticket.get("ticket_key"):
+        return live_agent_ticket_reply(
+            live_agent_ticket.get("ticket_key"),
+            live_agent_ticket.get("ticket_url"),
+        )
+
     response = result.get("response") if isinstance(result, dict) else None
     if isinstance(response, dict):
         for key in ("reply", "message", "text"):
@@ -3415,9 +3456,101 @@ def live_agent_reply(result):
     return LIVE_AGENT_DEFERRED_REPLY if result.get("ok") else LIVE_AGENT_FAILED_REPLY
 
 
+def live_agent_ticket_fields(result):
+    response = result.get("response") if isinstance(result, dict) else None
+    response = response if isinstance(response, dict) else {}
+    issue = response.get("issue") if isinstance(response.get("issue"), dict) else {}
+    fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+    project = fields.get("project") if isinstance(fields.get("project"), dict) else {}
+    issue_type = fields.get("issuetype") if isinstance(fields.get("issuetype"), dict) else {}
+
+    ticket_key = (
+        result.get("ticket_key")
+        or result.get("issue_key")
+        or response.get("ticket_key")
+        or response.get("issue_key")
+        or response.get("key")
+        or issue.get("key")
+    )
+    ticket_url = (
+        result.get("ticket_url")
+        or result.get("issue_url")
+        or response.get("ticket_url")
+        or response.get("issue_url")
+        or response.get("url")
+        or issue.get("url")
+        or issue.get("self")
+    )
+
+    return {
+        "ticket_key": str(ticket_key).strip() if ticket_key else None,
+        "ticket_url": str(ticket_url).strip() if ticket_url else None,
+        "jira_project": str(
+            result.get("live_agent_jira_project")
+            or result.get("jira_project")
+            or result.get("project_key")
+            or response.get("live_agent_jira_project")
+            or response.get("jira_project")
+            or response.get("project_key")
+            or project.get("key")
+            or (str(ticket_key).split("-", 1)[0] if ticket_key and "-" in str(ticket_key) else "")
+        ).strip() or None,
+        "issue_type": str(
+            result.get("live_agent_issue_type")
+            or result.get("issue_type")
+            or result.get("issueType")
+            or response.get("live_agent_issue_type")
+            or response.get("issue_type")
+            or response.get("issueType")
+            or issue_type.get("name")
+            or ""
+        ).strip() or None,
+        "portal_request_type": str(
+            result.get("live_agent_portal_request_type")
+            or result.get("portal_request_type")
+            or result.get("portalRequestType")
+            or result.get("request_type")
+            or result.get("requestType")
+            or response.get("live_agent_portal_request_type")
+            or response.get("portal_request_type")
+            or response.get("portalRequestType")
+            or response.get("request_type")
+            or response.get("requestType")
+            or ""
+        ).strip() or None,
+    }
+
+
 def existing_live_agent_state_result(session_item, base_result):
     live_agent_status = session_item.get("live_agent_status")
     support_options_status = session_item.get("support_options_status")
+    live_agent_ticket_key = session_item.get("live_agent_ticket_key") or session_item.get("last_live_agent_ticket_key")
+    live_agent_ticket_url = session_item.get("live_agent_ticket_url") or session_item.get("last_live_agent_ticket_url")
+    live_agent_jira_project = session_item.get("live_agent_jira_project")
+    live_agent_issue_type = session_item.get("live_agent_issue_type")
+    live_agent_portal_request_type = session_item.get("live_agent_portal_request_type")
+
+    if live_agent_status in {"ticket_created", "waiting_for_customer", "resolved"} or live_agent_ticket_key:
+        reply = existing_live_agent_ticket_reply(live_agent_ticket_key, live_agent_ticket_url)
+
+        return {
+            **base_result,
+            "lex_state": "Fulfilled",
+            "response_source": "live_agent",
+            "next_action": None,
+            "support_options_status": "live_agent_requested",
+            "live_agent_status": live_agent_status,
+            "live_agent_requested_at": session_item.get("live_agent_requested_at"),
+            "live_agent_updated_at": session_item.get("live_agent_updated_at"),
+            "live_agent_ticket_key": live_agent_ticket_key,
+            "live_agent_ticket_url": live_agent_ticket_url,
+            "live_agent_jira_project": live_agent_jira_project,
+            "live_agent_issue_type": live_agent_issue_type,
+            "live_agent_portal_request_type": live_agent_portal_request_type,
+            "last_live_agent_ticket_key": live_agent_ticket_key,
+            "last_live_agent_ticket_url": live_agent_ticket_url,
+            "reply": reply,
+        }
 
     if live_agent_status == "requested" or support_options_status == "live_agent_requested":
         return {
@@ -3431,15 +3564,16 @@ def existing_live_agent_state_result(session_item, base_result):
             "reply": LIVE_AGENT_DEFERRED_REPLY,
         }
 
-    if live_agent_status == "creating" or support_options_status == "live_agent_creating":
+    if live_agent_status in {"creating", "in_progress"} or support_options_status == "live_agent_creating":
         return {
             **base_result,
             "lex_state": "InProgress",
             "response_source": "live_agent",
             "next_action": NEXT_ACTION_FINAL_SUPPORT_OPTIONS,
             "support_options_status": "live_agent_creating",
-            "live_agent_status": "creating",
+            "live_agent_status": "in_progress",
             "live_agent_requested_at": session_item.get("live_agent_requested_at"),
+            "live_agent_updated_at": session_item.get("live_agent_updated_at"),
             "reply": "Live agent handoff is already in progress. Please wait a moment.",
         }
 
@@ -3459,8 +3593,9 @@ def acquire_live_agent_handoff_lock(session_id, event_id, now_iso):
             UpdateExpression="""
                 SET
                     support_options_status = :support_creating,
-                    live_agent_status = :live_agent_creating,
+                    live_agent_status = :live_agent_in_progress,
                     live_agent_requested_at = :now,
+                    live_agent_updated_at = :now,
                     live_agent_request_event_id = :event_id,
                     updated_at = :now
                 REMOVE
@@ -3477,7 +3612,7 @@ def acquire_live_agent_handoff_lock(session_id, event_id, now_iso):
             """,
             ExpressionAttributeValues={
                 ":support_creating": "live_agent_creating",
-                ":live_agent_creating": "creating",
+                ":live_agent_in_progress": "in_progress",
                 ":next_action": NEXT_ACTION_FINAL_SUPPORT_OPTIONS,
                 ":pending": "pending",
                 ":failed": "failed",
@@ -3603,7 +3738,7 @@ def handle_interactive_action(session_item, body, session_id):
         return handle_support_create_jira(support_session, body, session_id, now_iso)
 
     if action_id == ACTION_ID_LIVE_AGENT_SUPPORT:
-        if session_item.get("live_agent_status") in {"creating", "requested"}:
+        if session_item.get("live_agent_status") in {"creating", "in_progress", "requested", "waiting_for_customer", "resolved"}:
             return existing_live_agent_state_result(session_item, result)
 
         if not has_pending_final_support_options(session_item):
@@ -3620,13 +3755,20 @@ def handle_interactive_action(session_item, body, session_id):
         locked_session = {
             **session_item,
             "support_options_status": "live_agent_creating",
-            "live_agent_status": "creating",
+            "live_agent_status": "in_progress",
             "live_agent_requested_at": now_iso,
+            "live_agent_updated_at": now_iso,
         }
         live_agent_result = invoke_live_agent_handoff(
             build_live_agent_payload(locked_session, body, session_id, now_iso)
         )
         live_agent_ok = bool(live_agent_result.get("ok"))
+        live_agent_ticket = live_agent_ticket_fields(live_agent_result)
+        live_agent_ticket_key = live_agent_ticket.get("ticket_key")
+        live_agent_ticket_url = live_agent_ticket.get("ticket_url")
+        live_agent_jira_project = live_agent_ticket.get("jira_project")
+        live_agent_issue_type = live_agent_ticket.get("issue_type")
+        live_agent_portal_request_type = live_agent_ticket.get("portal_request_type")
 
         log_json({
             "level": "INFO" if live_agent_ok else "ERROR",
@@ -3634,6 +3776,7 @@ def handle_interactive_action(session_item, body, session_id):
             "session_id": session_id,
             "target": live_agent_result.get("target"),
             "ok": live_agent_ok,
+            "ticket_key": live_agent_ticket_key,
             "error_code": live_agent_result.get("error_code"),
         })
 
@@ -3646,6 +3789,14 @@ def handle_interactive_action(session_item, body, session_id):
             "support_resolved_at": now_iso if live_agent_ok else None,
             "live_agent_status": "requested" if live_agent_ok else "failed",
             "live_agent_requested_at": now_iso,
+            "live_agent_updated_at": now_iso,
+            "live_agent_ticket_key": live_agent_ticket_key if live_agent_ok else None,
+            "live_agent_ticket_url": live_agent_ticket_url if live_agent_ok else None,
+            "live_agent_jira_project": live_agent_jira_project if live_agent_ok else None,
+            "live_agent_issue_type": live_agent_issue_type if live_agent_ok else None,
+            "live_agent_portal_request_type": live_agent_portal_request_type if live_agent_ok else None,
+            "last_live_agent_ticket_key": live_agent_ticket_key if live_agent_ok else None,
+            "last_live_agent_ticket_url": live_agent_ticket_url if live_agent_ok else None,
             "live_agent_error": None if live_agent_ok else live_agent_result.get("error"),
             "live_agent_error_code": None if live_agent_ok else live_agent_result.get("error_code"),
         })
@@ -4019,6 +4170,14 @@ def process_record(record):
     support_resolved_at = None
     live_agent_status = None
     live_agent_requested_at = None
+    live_agent_updated_at = None
+    live_agent_ticket_key = None
+    live_agent_ticket_url = None
+    live_agent_jira_project = None
+    live_agent_issue_type = None
+    live_agent_portal_request_type = None
+    last_live_agent_ticket_key = None
+    last_live_agent_ticket_url = None
     live_agent_error = None
     live_agent_error_code = None
     slack_blocks = None
@@ -4093,6 +4252,14 @@ def process_record(record):
         support_resolved_at = interactive_result.get("support_resolved_at")
         live_agent_status = interactive_result.get("live_agent_status")
         live_agent_requested_at = interactive_result.get("live_agent_requested_at")
+        live_agent_updated_at = interactive_result.get("live_agent_updated_at")
+        live_agent_ticket_key = interactive_result.get("live_agent_ticket_key")
+        live_agent_ticket_url = interactive_result.get("live_agent_ticket_url")
+        live_agent_jira_project = interactive_result.get("live_agent_jira_project")
+        live_agent_issue_type = interactive_result.get("live_agent_issue_type")
+        live_agent_portal_request_type = interactive_result.get("live_agent_portal_request_type")
+        last_live_agent_ticket_key = interactive_result.get("last_live_agent_ticket_key")
+        last_live_agent_ticket_url = interactive_result.get("last_live_agent_ticket_url")
         live_agent_error = interactive_result.get("live_agent_error")
         live_agent_error_code = interactive_result.get("live_agent_error_code")
         manual_close_summary = interactive_result.get("manual_close_summary", False)
@@ -4625,7 +4792,7 @@ def process_record(record):
         conversation_status = "active"
     if support_options_status in {"pending", "creating_jira", "live_agent_creating"}:
         conversation_status = "active"
-    if live_agent_status == "creating":
+    if live_agent_status in {"creating", "in_progress"}:
         conversation_status = "active"
 
     offer_close_summary = (
@@ -4674,8 +4841,9 @@ def process_record(record):
     if support_options_status == "pending":
         support_requested_at = support_requested_at or updated_at
 
-    if live_agent_status == "requested":
+    if live_agent_status in {"requested", "in_progress", "waiting_for_customer", "resolved"}:
         live_agent_requested_at = live_agent_requested_at or updated_at
+        live_agent_updated_at = live_agent_updated_at or updated_at
 
     if rovo_should_invoke and rovo_status == "pending":
         rovo_requested_at = rovo_requested_at or updated_at
@@ -5072,6 +5240,7 @@ def process_record(record):
         "support_resolved_at": support_resolved_at,
         "live_agent_status": live_agent_status,
         "live_agent_requested_at": live_agent_requested_at,
+        "live_agent_updated_at": live_agent_updated_at,
         "live_agent_error": live_agent_error,
         "live_agent_error_code": live_agent_error_code,
     }
@@ -5086,6 +5255,27 @@ def process_record(record):
             expression_attribute_values[value_name] = attribute_value
         else:
             remove_attributes.append(attribute_name)
+
+    live_agent_ticket_attributes = {
+        "live_agent_ticket_key": live_agent_ticket_key,
+        "live_agent_ticket_url": live_agent_ticket_url,
+        "live_agent_jira_project": live_agent_jira_project,
+        "live_agent_issue_type": live_agent_issue_type,
+        "live_agent_portal_request_type": live_agent_portal_request_type,
+        "last_live_agent_ticket_key": last_live_agent_ticket_key,
+        "last_live_agent_ticket_url": last_live_agent_ticket_url,
+    }
+
+    for attribute_name, attribute_value in live_agent_ticket_attributes.items():
+        if attribute_value is None:
+            continue
+
+        value_name = f":{attribute_name}"
+        update_expression += f"""
+            ,
+            {attribute_name} = {value_name}
+        """
+        expression_attribute_values[value_name] = attribute_value
 
     if transcript_append:
         update_expression += """
@@ -5217,6 +5407,15 @@ def process_record(record):
             "support_options_status": support_options_status,
             "support_resolved_at": support_resolved_at,
             "live_agent_status": live_agent_status,
+            "live_agent_requested_at": live_agent_requested_at,
+            "live_agent_updated_at": live_agent_updated_at,
+            "live_agent_ticket_key": live_agent_ticket_key,
+            "live_agent_ticket_url": live_agent_ticket_url,
+            "live_agent_jira_project": live_agent_jira_project,
+            "live_agent_issue_type": live_agent_issue_type,
+            "live_agent_portal_request_type": live_agent_portal_request_type,
+            "last_live_agent_ticket_key": last_live_agent_ticket_key,
+            "last_live_agent_ticket_url": last_live_agent_ticket_url,
             "live_agent_error": live_agent_error,
             "live_agent_error_code": live_agent_error_code,
         }
@@ -5257,6 +5456,14 @@ def process_record(record):
                 "last_jira_ticket_key",
                 "last_jira_ticket_url",
                 "last_jira_created_at",
+                "live_agent_ticket_key",
+                "live_agent_ticket_url",
+                "live_agent_jira_project",
+                "live_agent_issue_type",
+                "live_agent_portal_request_type",
+                "live_agent_updated_at",
+                "last_live_agent_ticket_key",
+                "last_live_agent_ticket_url",
             }
         ]
         if compact_remove_attributes:
