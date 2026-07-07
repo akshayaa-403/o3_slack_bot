@@ -673,6 +673,17 @@ Jira deployment checks:
 
 ## Change Log
 
+### 2026-07-06
+
+- Hardened CreateJiraTicket Jira error handling so a Jira 400 response that says the project does not exist or the user lacks create permission is returned as `jira_project_or_permission_error`.
+- Added CreateJiraTicket CloudWatch diagnostics for the configured Jira project key and issue type on Jira HTTP failures.
+- Normalized Jira secret string values before authentication.
+- Verified deployed `o3_create_jira_ticket` is configured with `JIRA_PROJECT_KEY=O3` and `JIRA_SECRET_ID=project-ivy/jira`; Jira authentication for the stored service account currently returns 401 and project `O3` is not visible.
+- Fixed Slack worker Jira confirmation delivery after ticket creation by retrying an oversized DynamoDB session update with a compact critical-field update.
+- Deployed `o3-slack-worker` and verified the Jira creation flow created `O3-39`, persisted `jira_status=created`, and sent the Slack confirmation message.
+- Added live-agent JSM ticket detail normalization for synchronous webhook responses using `ticket_key` / `ticket_url` and common aliases.
+- Added Slack worker persistence for `live_agent_ticket_key`, `live_agent_ticket_url`, `last_live_agent_ticket_key`, and `last_live_agent_ticket_url`, including ticket-aware duplicate replies.
+
 ### 2026-06-29
 
 - Added Slack DM image upload handling for `file_share` messages.

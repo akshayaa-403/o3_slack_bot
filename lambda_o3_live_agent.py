@@ -1,11 +1,15 @@
 import json
 import os
 import base64
+import hashlib
 from datetime import datetime, timezone
+import time
 import urllib.error
 import urllib.request
 
 import boto3
+from boto3.dynamodb.conditions import Attr
+from botocore.exceptions import ClientError
 
 AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
 
@@ -16,8 +20,10 @@ SESSION_TABLE = os.environ.get("DYNAMODB_TABLE") or os.environ.get("SESSION_TABL
 LIVE_AGENT_CONFIG_INTENT = os.environ.get("LIVE_AGENT_CONFIG_INTENT", "LiveAgent")
 LIVE_AGENT_WEBHOOK_URL = os.environ.get("LIVE_AGENT_WEBHOOK_URL") or os.environ.get("AUTOMATION_WEBHOOK_URL")
 LIVE_AGENT_WEBHOOK_SECRET = os.environ.get("LIVE_AGENT_WEBHOOK_SECRET", "").strip()
+LIVE_AGENT_CALLBACK_SECRET = os.environ.get("LIVE_AGENT_CALLBACK_SECRET", "").strip()
 LIVE_AGENT_WEBHOOK_TIMEOUT_SECONDS = int(os.environ.get("LIVE_AGENT_WEBHOOK_TIMEOUT_SECONDS", "10"))
 LIVE_AGENT_TICKET_BASE_URL = os.environ.get("LIVE_AGENT_TICKET_BASE_URL", "https://innovyq.atlassian.net").rstrip("/")
+SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "86400"))
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
 
 SUCCESS_REPLY = os.environ.get(
@@ -62,6 +68,10 @@ def utc_now_iso():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def ttl_epoch():
+    return int(time.time()) + SESSION_TTL_SECONDS
+
+
 def api_response(status_code, body):
     return {
         "statusCode": status_code,
@@ -91,6 +101,31 @@ def parse_api_gateway_body(event):
         return parsed if isinstance(parsed, dict) else {}
     except ValueError:
         return {}
+
+
+def header_value(event, header_name):
+    headers = event.get("headers") if isinstance(event, dict) else {}
+    headers = headers if isinstance(headers, dict) else {}
+    multi_value_headers = event.get("multiValueHeaders") if isinstance(event, dict) else {}
+    multi_value_headers = multi_value_headers if isinstance(multi_value_headers, dict) else {}
+    target = header_name.lower()
+
+    for key, value in headers.items():
+        if str(key).lower() == target:
+            return text_or_empty(value)
+
+    for key, values in multi_value_headers.items():
+        if str(key).lower() == target and isinstance(values, list) and values:
+            return text_or_empty(values[0])
+
+    return ""
+
+
+def validate_callback_secret(event):
+    if not LIVE_AGENT_CALLBACK_SECRET:
+        return True
+
+    return header_value(event, "X-IVY-Callback-Secret") == LIVE_AGENT_CALLBACK_SECRET
 
 
 def nested_get(data, *keys):
@@ -146,15 +181,33 @@ def is_jsm_callback(event):
     if not isinstance(callback, dict):
         return False
 
-    source = text_or_empty(callback.get("source")).lower()
     event_type = text_or_empty(callback.get("event_type")).lower()
-    session_id = text_or_empty(callback.get("session_id") or callback.get("sessionId"))
-    ticket_key = normalize_ticket_key(callback)
+
+    return event_type in {
+        "live_agent_ticket_created",
+        "live_agent_status_changed",
+        "status_changed",
+        "live_agent_public_comment_added",
+        "public_comment_added",
+        "agent_comment_added",
+    }
+
+
+def is_unsupported_jsm_callback(event):
+    callback = parse_api_gateway_body(event) if isinstance(event, dict) and "body" in event else event
+    if not isinstance(callback, dict):
+        return False
 
     return (
-        source == "jsm_automation"
-        or event_type == "live_agent_ticket_created"
-        or bool(session_id and ticket_key)
+        text_or_empty(callback.get("source")).lower() == "jsm_automation"
+        and text_or_empty(callback.get("event_type")).lower() not in {
+            "live_agent_ticket_created",
+            "live_agent_status_changed",
+            "status_changed",
+            "live_agent_public_comment_added",
+            "public_comment_added",
+            "agent_comment_added",
+        }
     )
 
 
@@ -168,9 +221,16 @@ def normalize_callback(event):
 
     return {
         "session_id": first_text(callback.get("session_id"), callback.get("sessionId")),
+        "session_root_ts": first_text(callback.get("session_root_ts"), callback.get("sessionRootTs")),
         "ticket_key": ticket_key,
         "ticket_url": ticket_url,
-        "status": first_text(callback.get("status"), callback.get("issue_status"), nested_get(callback, "issue", "status", "name")),
+        "ticket_status": first_text(
+            callback.get("ticket_status"),
+            callback.get("status"),
+            callback.get("issue_status"),
+            nested_get(callback, "issue", "status", "name"),
+            nested_get(callback, "createdIssue", "status", "name"),
+        ),
         "jira_project": first_text(
             callback.get("jira_project"),
             callback.get("project_key"),
@@ -192,6 +252,7 @@ def normalize_callback(event):
         ),
         "slack_channel": first_text(callback.get("slack_channel"), callback.get("slackChannel"), slack.get("channelId"), slack.get("channel")),
         "slack_thread_ts": first_text(callback.get("slack_thread_ts"), callback.get("slackThreadTs"), slack.get("threadTs"), slack.get("thread_ts")),
+        "slack_user": first_text(callback.get("slack_user"), callback.get("slackUser"), slack.get("userId"), slack.get("user")),
         "raw_callback": callback,
     }
 
@@ -201,21 +262,35 @@ def normalize_live_agent_status(status):
     normalized = value.replace("-", " ").replace("_", " ")
 
     if not normalized:
-        return "requested"
+        return ""
 
     if any(marker in normalized for marker in ("waiting for customer", "customer", "pending customer")):
         return "waiting_for_customer"
 
+    if "waiting for support" in normalized:
+        return "waiting_for_support"
+
     if any(marker in normalized for marker in ("resolved", "done", "closed", "complete")):
         return "resolved"
 
-    if any(marker in normalized for marker in ("failed", "error", "cancelled", "canceled")):
+    if any(marker in normalized for marker in ("failed", "cancelled", "canceled")):
         return "failed"
 
-    if any(marker in normalized for marker in ("progress", "open", "to do", "new", "triage")):
+    if any(marker in normalized for marker in ("in progress", "open", "to do", "triage")):
         return "in_progress"
 
-    return "requested"
+    return normalized.replace(" ", "_")
+
+
+def display_status(status, normalized_status=""):
+    value = text_or_empty(status)
+    if value:
+        return value
+
+    if normalized_status:
+        return normalized_status.replace("_", " ").title()
+
+    return "Unknown"
 
 
 def live_agent_ticket_reply(ticket_key, ticket_url):
@@ -233,23 +308,29 @@ def update_live_agent_session(callback):
         return
 
     now_iso = utc_now_iso()
-    live_agent_status = normalize_live_agent_status(callback.get("status"))
     expression_values = {
-        ":live_agent_status": live_agent_status,
+        ":live_agent_status": "ticket_created",
+        ":support_options_status": "live_agent_requested",
         ":ticket_key": callback["ticket_key"],
         ":callback_at": now_iso,
         ":updated_at": now_iso,
+        ":ttl": ttl_epoch(),
     }
     update_expression = """
         SET
             live_agent_status = :live_agent_status,
+            support_options_status = :support_options_status,
             live_agent_ticket_key = :ticket_key,
             last_live_agent_ticket_key = :ticket_key,
             live_agent_requested_at = if_not_exists(live_agent_requested_at, :updated_at),
             live_agent_callback_at = :callback_at,
             live_agent_updated_at = :updated_at,
-            updated_at = :updated_at
+            updated_at = :updated_at,
+            #ttl = :ttl
     """
+    expression_attribute_names = {
+        "#ttl": "ttl",
+    }
 
     remove_attributes = []
     if callback.get("ticket_url"):
@@ -261,11 +342,11 @@ def update_live_agent_session(callback):
     else:
         remove_attributes.extend(["live_agent_ticket_url", "last_live_agent_ticket_url"])
 
-    if callback.get("status"):
+    if callback.get("ticket_status"):
         update_expression += """,
             live_agent_jira_status = :jira_status
         """
-        expression_values[":jira_status"] = callback["status"]
+        expression_values[":jira_status"] = callback["ticket_status"]
     else:
         remove_attributes.append("live_agent_jira_status")
 
@@ -293,23 +374,154 @@ def update_live_agent_session(callback):
             "session_id": callback["session_id"]
         },
         UpdateExpression=update_expression,
+        ExpressionAttributeNames=expression_attribute_names,
         ExpressionAttributeValues=expression_values,
     )
 
 
-def post_slack_ticket(callback):
-    if not (SLACK_BOT_TOKEN and callback.get("slack_channel")):
+def put_live_agent_ticket_pointer(callback):
+    if not session_table:
+        return None
+
+    now_iso = utc_now_iso()
+    pointer_session_id = f"live_agent_ticket:{callback['ticket_key']}"
+    item = {
+        "session_id": pointer_session_id,
+        "pointer_type": "live_agent_ticket",
+        "target_session_id": callback["session_id"],
+        "ticket_key": callback["ticket_key"],
+        "ticket_url": callback.get("ticket_url") or "",
+        "ticket_status": callback.get("ticket_status") or "",
+        "live_agent_status": "ticket_created",
+        "slack_channel": callback.get("slack_channel") or "",
+        "slack_thread_ts": callback.get("slack_thread_ts") or "",
+        "slack_user": callback.get("slack_user") or "",
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "ttl": ttl_epoch(),
+    }
+
+    session_table.update_item(
+        Key={"session_id": pointer_session_id},
+        UpdateExpression="""
+            SET
+                pointer_type = :pointer_type,
+                target_session_id = :target_session_id,
+                ticket_key = :ticket_key,
+                ticket_url = :ticket_url,
+                ticket_status = :ticket_status,
+                live_agent_status = :live_agent_status,
+                slack_channel = :slack_channel,
+                slack_thread_ts = :slack_thread_ts,
+                slack_user = :slack_user,
+                created_at = if_not_exists(created_at, :created_at),
+                updated_at = :updated_at,
+                #ttl = :ttl
+        """,
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues={
+            ":pointer_type": item["pointer_type"],
+            ":target_session_id": item["target_session_id"],
+            ":ticket_key": item["ticket_key"],
+            ":ticket_url": item["ticket_url"],
+            ":ticket_status": item["ticket_status"],
+            ":live_agent_status": item["live_agent_status"],
+            ":slack_channel": item["slack_channel"],
+            ":slack_thread_ts": item["slack_thread_ts"],
+            ":slack_user": item["slack_user"],
+            ":created_at": item["created_at"],
+            ":updated_at": item["updated_at"],
+            ":ttl": item["ttl"],
+        },
+    )
+
+    return pointer_session_id
+
+
+def acquire_slack_confirmation(callback, pointer_session_id):
+    if not (session_table and pointer_session_id and callback.get("slack_channel")):
+        return False
+
+    now_iso = utc_now_iso()
+    try:
+        session_table.update_item(
+            Key={"session_id": pointer_session_id},
+            UpdateExpression="""
+                SET
+                    live_agent_slack_confirmation_status = :posting,
+                    live_agent_slack_confirmation_started_at = :now,
+                    updated_at = :now,
+                    #ttl = :ttl
+            """,
+            ConditionExpression=(
+                Attr("live_agent_slack_confirmation_status").not_exists()
+                | Attr("live_agent_slack_confirmation_status").eq("failed")
+            ),
+            ExpressionAttributeNames={"#ttl": "ttl"},
+            ExpressionAttributeValues={
+                ":posting": "posting",
+                ":now": now_iso,
+                ":ttl": ttl_epoch(),
+            },
+        )
+        return True
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def mark_slack_confirmation(pointer_session_id, status, result=None, error=None):
+    if not (session_table and pointer_session_id):
+        return
+
+    now_iso = utc_now_iso()
+    expression_values = {
+        ":status": status,
+        ":now": now_iso,
+        ":ttl": ttl_epoch(),
+    }
+    update_expression = """
+        SET
+            live_agent_slack_confirmation_status = :status,
+            updated_at = :now,
+            #ttl = :ttl
+    """
+
+    if result and result.get("ts"):
+        update_expression += """,
+            live_agent_slack_confirmation_ts = :slack_ts,
+            live_agent_slack_confirmation_sent_at = :now
+        """
+        expression_values[":slack_ts"] = result["ts"]
+
+    if error:
+        update_expression += """,
+            live_agent_slack_confirmation_error = :error
+        """
+        expression_values[":error"] = str(error)
+
+    session_table.update_item(
+        Key={"session_id": pointer_session_id},
+        UpdateExpression=update_expression,
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues=expression_values,
+    )
+
+
+def post_slack_message(channel, text, thread_ts=""):
+    if not (SLACK_BOT_TOKEN and channel):
         return {
             "attempted": False
         }
 
     message = {
-        "channel": callback["slack_channel"],
-        "text": live_agent_ticket_reply(callback.get("ticket_key"), callback.get("ticket_url")),
+        "channel": channel,
+        "text": text,
     }
 
-    if callback.get("slack_thread_ts"):
-        message["thread_ts"] = callback["slack_thread_ts"]
+    if thread_ts:
+        message["thread_ts"] = thread_ts
 
     request = urllib.request.Request(
         "https://slack.com/api/chat.postMessage",
@@ -333,6 +545,516 @@ def post_slack_ticket(callback):
     }
 
 
+def post_slack_ticket(callback):
+    if not (SLACK_BOT_TOKEN and callback.get("slack_channel")):
+        return {
+            "attempted": False
+        }
+
+    return post_slack_message(
+        callback["slack_channel"],
+        live_agent_ticket_reply(callback.get("ticket_key"), callback.get("ticket_url")),
+        callback.get("slack_thread_ts"),
+    )
+
+
+def callback_event_type(callback):
+    return text_or_empty(callback.get("event_type")).lower()
+
+
+def is_status_changed_callback(callback):
+    return callback_event_type(callback) in {"live_agent_status_changed", "status_changed"}
+
+
+def is_public_comment_callback(callback):
+    return callback_event_type(callback) in {
+        "live_agent_public_comment_added",
+        "public_comment_added",
+        "agent_comment_added",
+    }
+
+
+def normalize_status_callback(event):
+    callback = parse_api_gateway_body(event) if isinstance(event, dict) and "body" in event else event
+    callback = callback if isinstance(callback, dict) else {}
+    status = first_text(
+        callback.get("ticket_status"),
+        callback.get("status"),
+        callback.get("transition_to"),
+        callback.get("transitionTo"),
+        callback.get("to_status"),
+        callback.get("toStatus"),
+        nested_get(callback, "issue", "status", "name"),
+        nested_get(callback, "createdIssue", "status", "name"),
+    )
+    normalized_status = normalize_live_agent_status(status)
+
+    return {
+        "event_type": callback_event_type(callback),
+        "ticket_key": normalize_ticket_key(callback),
+        "ticket_status": status,
+        "live_agent_status": normalized_status,
+        "transition_to": first_text(
+            callback.get("transition_to"),
+            callback.get("transitionTo"),
+            callback.get("to_status"),
+            callback.get("toStatus"),
+        ),
+        "updated_at": first_text(
+            callback.get("updated_at"),
+            callback.get("updatedAt"),
+            nested_get(callback, "issue", "fields", "updated"),
+            nested_get(callback, "createdIssue", "fields", "updated"),
+        ),
+        "raw_callback": callback,
+    }
+
+
+def boolish_true(value):
+    if isinstance(value, bool):
+        return value
+
+    return text_or_empty(value).lower() in {"true", "1", "yes", "y"}
+
+
+def normalize_public_comment_callback(event):
+    callback = parse_api_gateway_body(event) if isinstance(event, dict) and "body" in event else event
+    callback = callback if isinstance(callback, dict) else {}
+
+    comment = callback.get("comment") if isinstance(callback.get("comment"), dict) else {}
+    author = comment.get("author") if isinstance(comment.get("author"), dict) else {}
+
+    return {
+        "event_type": callback_event_type(callback),
+        "source": text_or_empty(callback.get("source")),
+        "from_slack": boolish_true(callback.get("from_slack")),
+        "ticket_key": normalize_ticket_key(callback),
+        "ticket_url": normalize_ticket_url(callback, normalize_ticket_key(callback)),
+        "ticket_status": first_text(
+            callback.get("ticket_status"),
+            callback.get("status"),
+            nested_get(callback, "issue", "status", "name"),
+        ),
+        "comment_id": first_text(callback.get("comment_id"), callback.get("commentId"), comment.get("id")),
+        "comment_body": first_text(
+            callback.get("comment_body"),
+            callback.get("commentBody"),
+            callback.get("body"),
+            comment.get("body"),
+        ),
+        "comment_author": first_text(
+            callback.get("comment_author"),
+            callback.get("commentAuthor"),
+            callback.get("author"),
+            author.get("displayName"),
+            author.get("name"),
+        ),
+        "comment_created": first_text(
+            callback.get("comment_created"),
+            callback.get("commentCreated"),
+            callback.get("created"),
+            comment.get("created"),
+        ),
+        "raw_callback": callback,
+    }
+
+
+def is_echo_loop_comment(callback):
+    return (
+        "[From Slack]" in callback.get("comment_body", "")
+        or text_or_empty(callback.get("source")).lower() == "slack_user"
+        or boolish_true(callback.get("from_slack"))
+    )
+
+
+def live_agent_event_marker_id(callback):
+    if callback.get("comment_body") or callback.get("comment_id"):
+        marker_payload = {
+            "event_type": callback.get("event_type") or "",
+            "ticket_key": callback.get("ticket_key") or "",
+            "comment_id": callback.get("comment_id") or "",
+        }
+        if not marker_payload["comment_id"]:
+            marker_payload.update({
+                "comment_body": callback.get("comment_body") or "",
+                "comment_author": callback.get("comment_author") or "",
+                "comment_created": callback.get("comment_created") or "",
+            })
+    else:
+        marker_payload = {
+            "event_type": callback.get("event_type") or "",
+            "ticket_key": callback.get("ticket_key") or "",
+            "status": callback.get("ticket_status") or "",
+            "transition_to": callback.get("transition_to") or "",
+            "updated_at": callback.get("updated_at") or "",
+        }
+    marker_hash = hashlib.sha256(
+        json.dumps(marker_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"live_agent_event:{marker_hash}"
+
+
+def create_live_agent_event_marker(callback, pointer_session_id):
+    if not session_table:
+        return {
+            "created": True,
+            "session_id": None,
+        }
+
+    now_iso = utc_now_iso()
+    marker_session_id = live_agent_event_marker_id(callback)
+    try:
+        session_table.put_item(
+            Item={
+                "session_id": marker_session_id,
+                "record_type": "live_agent_event_marker",
+                "pointer_session_id": pointer_session_id,
+                "event_type": callback.get("event_type") or "",
+                "ticket_key": callback.get("ticket_key") or "",
+                "ticket_status": callback.get("ticket_status") or "",
+                "live_agent_status": callback.get("live_agent_status") or "",
+                "transition_to": callback.get("transition_to") or "",
+                "source_updated_at": callback.get("updated_at") or "",
+                "comment_id": callback.get("comment_id") or "",
+                "comment_author": callback.get("comment_author") or "",
+                "comment_created": callback.get("comment_created") or "",
+                "created_at": now_iso,
+                "updated_at": now_iso,
+                "ttl": ttl_epoch(),
+            },
+            ConditionExpression=Attr("session_id").not_exists(),
+        )
+        return {
+            "created": True,
+            "session_id": marker_session_id,
+        }
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return {
+                "created": False,
+                "session_id": marker_session_id,
+            }
+        raise
+
+
+def get_live_agent_ticket_pointer(ticket_key):
+    if not session_table:
+        return None
+
+    response = session_table.get_item(Key={"session_id": f"live_agent_ticket:{ticket_key}"})
+    return response.get("Item")
+
+
+def live_agent_status_message(ticket_key, ticket_status, live_agent_status):
+    status_text = display_status(ticket_status, live_agent_status)
+
+    if live_agent_status == "in_progress":
+        return f"🔄 Live agent update for {ticket_key}: status changed to In Progress."
+
+    if live_agent_status == "waiting_for_customer":
+        return f"🙋 Support is waiting for your response on {ticket_key}."
+
+    if live_agent_status == "waiting_for_support":
+        return f"ℹ️ Live agent update for {ticket_key}: status changed to Waiting for support."
+
+    if live_agent_status == "resolved":
+        return f"✅ Live agent request {ticket_key} is now Resolved."
+
+    return f"ℹ️ Live agent update for {ticket_key}: status changed to {status_text}."
+
+
+def update_status_pointer(pointer_session_id, callback):
+    if not session_table:
+        return
+
+    now_iso = utc_now_iso()
+    session_table.update_item(
+        Key={"session_id": pointer_session_id},
+        UpdateExpression="""
+            SET
+                ticket_status = :ticket_status,
+                live_agent_status = :live_agent_status,
+                live_agent_status_changed_at = :now,
+                live_agent_updated_at = :now,
+                updated_at = :now,
+                #ttl = :ttl
+        """,
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues={
+            ":ticket_status": callback.get("ticket_status") or "",
+            ":live_agent_status": callback.get("live_agent_status") or "",
+            ":now": now_iso,
+            ":ttl": ttl_epoch(),
+        },
+    )
+
+
+def update_status_target_session(target_session_id, callback):
+    if not (session_table and target_session_id):
+        return
+
+    now_iso = utc_now_iso()
+    live_agent_status = callback.get("live_agent_status") or ""
+    expression_values = {
+        ":live_agent_status": live_agent_status,
+        ":ticket_status": callback.get("ticket_status") or "",
+        ":now": now_iso,
+        ":ttl": ttl_epoch(),
+    }
+    update_expression = """
+        SET
+            live_agent_status = :live_agent_status,
+            live_agent_jira_status = :ticket_status,
+            live_agent_updated_at = :now,
+            updated_at = :now,
+            #ttl = :ttl
+    """
+
+    if live_agent_status == "resolved":
+        update_expression += """,
+            conversation_status = :conversation_closed,
+            support_options_status = :support_resolved,
+            live_agent_resolved_at = :now
+        """
+        expression_values[":conversation_closed"] = "closed"
+        expression_values[":support_resolved"] = "live_agent_resolved"
+
+    session_table.update_item(
+        Key={"session_id": target_session_id},
+        UpdateExpression=update_expression,
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues=expression_values,
+    )
+
+
+def live_agent_comment_message(ticket_key, comment_author, comment_body):
+    author = text_or_empty(comment_author) or "Support"
+    return f"💬 Support update on {ticket_key} from {author}:\n\n{comment_body}"
+
+
+def update_comment_pointer(pointer_session_id, callback):
+    if not session_table:
+        return
+
+    now_iso = utc_now_iso()
+    session_table.update_item(
+        Key={"session_id": pointer_session_id},
+        UpdateExpression="""
+            SET
+                last_agent_comment = :comment_body,
+                last_agent_comment_author = :comment_author,
+                last_agent_comment_at = :comment_at,
+                updated_at = :now,
+                #ttl = :ttl
+        """,
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues={
+            ":comment_body": callback.get("comment_body") or "",
+            ":comment_author": callback.get("comment_author") or "",
+            ":comment_at": callback.get("comment_created") or now_iso,
+            ":now": now_iso,
+            ":ttl": ttl_epoch(),
+        },
+    )
+
+
+def update_comment_target_session(target_session_id):
+    if not (session_table and target_session_id):
+        return
+
+    now_iso = utc_now_iso()
+    session_table.update_item(
+        Key={"session_id": target_session_id},
+        UpdateExpression="""
+            SET
+                live_agent_updated_at = :now,
+                updated_at = :now,
+                #ttl = :ttl
+        """,
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues={
+            ":now": now_iso,
+            ":ttl": ttl_epoch(),
+        },
+    )
+
+
+def handle_live_agent_public_comment_added(event):
+    callback = normalize_public_comment_callback(event)
+    if not callback.get("ticket_key"):
+        return {
+            "ok": False,
+            "error": "Missing callback ticket_key",
+            "error_code": "missing_ticket_key",
+        }
+
+    if not callback.get("comment_body"):
+        return {
+            "ok": False,
+            "error": "Missing callback comment_body",
+            "error_code": "missing_comment_body",
+            "ticket_key": callback.get("ticket_key"),
+        }
+
+    pointer_session_id = f"live_agent_ticket:{callback['ticket_key']}"
+    pointer = get_live_agent_ticket_pointer(callback["ticket_key"])
+    if not pointer:
+        return {
+            "ok": False,
+            "error": "Missing live agent ticket pointer",
+            "error_code": "missing_live_agent_ticket_pointer",
+            "ticket_key": callback["ticket_key"],
+        }
+
+    if is_echo_loop_comment(callback):
+        return {
+            "ok": True,
+            "ignored": True,
+            "reason": "echo_loop_guard",
+            "ticket_key": callback["ticket_key"],
+        }
+
+    marker = create_live_agent_event_marker(callback, pointer_session_id)
+    if not marker.get("created"):
+        return {
+            "ok": True,
+            "duplicate": True,
+            "ticket_key": callback["ticket_key"],
+            "comment_id": callback.get("comment_id"),
+            "event_marker_session_id": marker.get("session_id"),
+            "slack": {
+                "attempted": False,
+                "deduped": True,
+            },
+        }
+
+    update_comment_pointer(pointer_session_id, callback)
+
+    target_session_id = text_or_empty(pointer.get("target_session_id"))
+    if target_session_id:
+        update_comment_target_session(target_session_id)
+
+    slack_result = {"attempted": False}
+    slack_channel = text_or_empty(pointer.get("slack_channel"))
+    if slack_channel:
+        message = live_agent_comment_message(
+            callback["ticket_key"],
+            callback.get("comment_author"),
+            callback.get("comment_body"),
+        )
+        try:
+            slack_result = post_slack_message(
+                slack_channel,
+                message,
+                text_or_empty(pointer.get("slack_thread_ts")),
+            )
+        except Exception as error:
+            log_json({
+                "level": "ERROR",
+                "message": "live_agent_comment_slack_notify_failed",
+                "ticket_key": callback["ticket_key"],
+                "comment_id": callback.get("comment_id"),
+                "error": str(error),
+            })
+            slack_result = {
+                "attempted": True,
+                "ok": False,
+                "error": str(error),
+            }
+
+    return {
+        "ok": True,
+        "event_type": callback.get("event_type"),
+        "ticket_key": callback["ticket_key"],
+        "comment_id": callback.get("comment_id"),
+        "comment_author": callback.get("comment_author"),
+        "pointer_session_id": pointer_session_id,
+        "target_session_id": target_session_id,
+        "event_marker_session_id": marker.get("session_id"),
+        "slack": slack_result,
+    }
+
+
+def handle_live_agent_status_changed(event):
+    callback = normalize_status_callback(event)
+    if not callback.get("ticket_key"):
+        return {
+            "ok": False,
+            "error": "Missing callback ticket_key",
+            "error_code": "missing_ticket_key",
+        }
+
+    pointer_session_id = f"live_agent_ticket:{callback['ticket_key']}"
+    pointer = get_live_agent_ticket_pointer(callback["ticket_key"])
+    if not pointer:
+        return {
+            "ok": False,
+            "error": "Missing live agent ticket pointer",
+            "error_code": "missing_live_agent_ticket_pointer",
+            "ticket_key": callback["ticket_key"],
+        }
+
+    marker = create_live_agent_event_marker(callback, pointer_session_id)
+    if not marker.get("created"):
+        return {
+            "ok": True,
+            "duplicate": True,
+            "ticket_key": callback["ticket_key"],
+            "ticket_status": callback.get("ticket_status"),
+            "live_agent_status": callback.get("live_agent_status"),
+            "event_marker_session_id": marker.get("session_id"),
+            "slack": {
+                "attempted": False,
+                "deduped": True,
+            },
+        }
+
+    update_status_pointer(pointer_session_id, callback)
+
+    target_session_id = text_or_empty(pointer.get("target_session_id"))
+    if target_session_id:
+        update_status_target_session(target_session_id, callback)
+
+    slack_result = {"attempted": False}
+    slack_channel = text_or_empty(pointer.get("slack_channel"))
+    if slack_channel:
+        message = live_agent_status_message(
+            callback["ticket_key"],
+            callback.get("ticket_status"),
+            callback.get("live_agent_status"),
+        )
+        try:
+            slack_result = post_slack_message(
+                slack_channel,
+                message,
+                text_or_empty(pointer.get("slack_thread_ts")),
+            )
+        except Exception as error:
+            log_json({
+                "level": "ERROR",
+                "message": "live_agent_status_slack_notify_failed",
+                "ticket_key": callback["ticket_key"],
+                "error": str(error),
+            })
+            slack_result = {
+                "attempted": True,
+                "ok": False,
+                "error": str(error),
+            }
+
+    return {
+        "ok": True,
+        "event_type": callback.get("event_type"),
+        "ticket_key": callback["ticket_key"],
+        "ticket_status": callback.get("ticket_status"),
+        "live_agent_status": callback.get("live_agent_status"),
+        "pointer_session_id": pointer_session_id,
+        "target_session_id": target_session_id,
+        "event_marker_session_id": marker.get("session_id"),
+        "slack": slack_result,
+    }
+
+
 def handle_jsm_callback(event):
     callback = normalize_callback(event)
     if not callback.get("session_id"):
@@ -350,23 +1072,30 @@ def handle_jsm_callback(event):
         }
 
     update_live_agent_session(callback)
+    pointer_session_id = put_live_agent_ticket_pointer(callback)
 
-    slack_result = {"attempted": False}
-    try:
-        slack_result = post_slack_ticket(callback)
-    except Exception as error:
-        log_json({
-            "level": "ERROR",
-            "message": "live_agent_callback_slack_notify_failed",
-            "session_id": callback["session_id"],
-            "ticket_key": callback["ticket_key"],
-            "error": str(error),
-        })
-        slack_result = {
-            "attempted": True,
-            "ok": False,
-            "error": str(error),
-        }
+    slack_result = {"attempted": False, "deduped": False}
+    if callback.get("slack_channel"):
+        if acquire_slack_confirmation(callback, pointer_session_id):
+            try:
+                slack_result = post_slack_ticket(callback)
+                mark_slack_confirmation(pointer_session_id, "sent", result=slack_result)
+            except Exception as error:
+                mark_slack_confirmation(pointer_session_id, "failed", error=error)
+                log_json({
+                    "level": "ERROR",
+                    "message": "live_agent_callback_slack_notify_failed",
+                    "session_id": callback["session_id"],
+                    "ticket_key": callback["ticket_key"],
+                    "error": str(error),
+                })
+                slack_result = {
+                    "attempted": True,
+                    "ok": False,
+                    "error": str(error),
+                }
+        else:
+            slack_result = {"attempted": False, "deduped": True}
 
     reply = live_agent_ticket_reply(callback.get("ticket_key"), callback.get("ticket_url"))
     return {
@@ -374,11 +1103,13 @@ def handle_jsm_callback(event):
         "session_id": callback["session_id"],
         "ticket_key": callback["ticket_key"],
         "ticket_url": callback.get("ticket_url"),
+        "pointer_session_id": pointer_session_id,
         "live_agent_jira_project": callback.get("jira_project"),
         "live_agent_issue_type": callback.get("issue_type"),
         "live_agent_portal_request_type": callback.get("portal_request_type"),
-        "status": callback.get("status"),
-        "live_agent_status": normalize_live_agent_status(callback.get("status")),
+        "ticket_status": callback.get("ticket_status"),
+        "status": callback.get("ticket_status"),
+        "live_agent_status": "ticket_created",
         "reply": reply,
         "message": reply,
         "slack": slack_result,
@@ -605,7 +1336,20 @@ def lambda_handler(event, context):
 
     try:
         if is_jsm_callback(effective_event):
-            result = handle_jsm_callback(effective_event)
+            if api_gateway_event and not validate_callback_secret(event):
+                result = {
+                    "ok": False,
+                    "error": "Invalid callback secret",
+                    "error_code": "invalid_callback_secret",
+                }
+                return api_response(401, result)
+
+            if is_public_comment_callback(effective_event):
+                result = handle_live_agent_public_comment_added(effective_event)
+            elif is_status_changed_callback(effective_event):
+                result = handle_live_agent_status_changed(effective_event)
+            else:
+                result = handle_jsm_callback(effective_event)
             status_code = 200 if result.get("ok") else 400
 
             log_json({
@@ -613,11 +1357,21 @@ def lambda_handler(event, context):
                 "message": "live_agent_callback_completed",
                 "session_id": result.get("session_id") or effective_event.get("session_id"),
                 "ok": result.get("ok"),
+                "event_type": effective_event.get("event_type"),
                 "ticket_key": result.get("ticket_key"),
                 "error_code": result.get("error_code"),
             })
 
             return api_response(status_code, result) if api_gateway_event else result
+
+        if is_unsupported_jsm_callback(effective_event):
+            result = {
+                "ok": True,
+                "ignored": True,
+                "message": "Unsupported JSM callback event_type ignored",
+                "event_type": effective_event.get("event_type"),
+            }
+            return api_response(202, result) if api_gateway_event else result
 
         payload = build_handoff_payload(effective_event)
         result = call_webhook(payload)

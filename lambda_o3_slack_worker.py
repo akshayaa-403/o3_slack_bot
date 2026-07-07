@@ -8,6 +8,7 @@ import boto3
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone, timedelta
+from boto3.dynamodb.conditions import Attr
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.exceptions import ClientError
@@ -161,6 +162,10 @@ LIVE_AGENT_FAILED_REPLY = os.environ.get(
     "LIVE_AGENT_FAILED_REPLY",
     "I could not send this to live agent support. Please try again later or create a Jira ticket."
 )
+ATLASSIAN_DOMAIN = os.environ.get("ATLASSIAN_DOMAIN", "").rstrip("/")
+ATLASSIAN_EMAIL = os.environ.get("ATLASSIAN_EMAIL", "")
+ATLASSIAN_API_TOKEN = os.environ.get("ATLASSIAN_API_TOKEN", "")
+JSM_COMMENT_PUBLIC = os.environ.get("JSM_COMMENT_PUBLIC", "true").lower() == "true"
 
 NEXT_ACTION_CREATE_JIRA_TICKET = "O3_CreateJiraTicket"
 NEXT_ACTION_CLAUDE_ASSISTANCE = "O3_ClaudeFurtherAssistance"
@@ -302,6 +307,48 @@ def send_slack_message(channel, text, blocks=None, thread_ts=None):
         raise Exception(f"Slack API error: {result.get('error')}")
 
     return result
+
+
+def atlassian_auth_header():
+    if not (ATLASSIAN_EMAIL and ATLASSIAN_API_TOKEN):
+        raise ValueError("Missing ATLASSIAN_EMAIL or ATLASSIAN_API_TOKEN")
+
+    token = base64.b64encode(f"{ATLASSIAN_EMAIL}:{ATLASSIAN_API_TOKEN}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+def add_jsm_request_comment(ticket_key, body, public=True):
+    if not ATLASSIAN_DOMAIN:
+        raise ValueError("Missing ATLASSIAN_DOMAIN")
+
+    safe_ticket_key = urllib.parse.quote(str(ticket_key), safe="")
+    url = f"{ATLASSIAN_DOMAIN}/rest/servicedeskapi/request/{safe_ticket_key}/comment"
+    payload = {
+        "body": body,
+        "public": bool(public),
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": atlassian_auth_header(),
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=10) as response:
+        response_text = response.read().decode("utf-8").strip()
+
+    if response_text:
+        try:
+            return json.loads(response_text)
+        except ValueError:
+            return {"message": response_text}
+
+    return {"ok": True}
 
 
 def slack_api(method, params=None, payload=None, http_method=None):
@@ -502,17 +549,55 @@ def resolve_session_identity(body, channel, user):
     }
 
 
+ACTIVE_LIVE_AGENT_STATUSES = {
+    "requested",
+    "ticket_created",
+    "in_progress",
+    "waiting_for_customer",
+    "waiting_for_support",
+    "status_changed",
+    "user_replied",
+}
+
+TERMINAL_LIVE_AGENT_STATUSES = {
+    "resolved",
+    "closed",
+    "failed",
+    "cancelled",
+    "canceled",
+}
+
+
+def is_active_live_agent_session(session_item):
+    if not session_item:
+        return False
+
+    has_live_agent_ticket = bool(
+        session_item.get("live_agent_ticket_key")
+        or session_item.get("last_live_agent_ticket_key")
+    )
+
+    return (
+        has_live_agent_ticket
+        and session_item.get("live_agent_status") in ACTIVE_LIVE_AGENT_STATUSES
+        and session_item.get("conversation_status") not in {"closed", "failed"}
+        and session_item.get("summary_status") not in {"started", "completed"}
+    )
+
+
 def session_is_terminal(session_item):
     if not session_item:
+        return False
+
+    if is_active_live_agent_session(session_item):
         return False
 
     return (
         session_item.get("conversation_status") in {"closed", "failed"}
         or session_item.get("summary_status") in {"started", "completed"}
         or session_item.get("jira_status") == "created"
-        or session_item.get("support_options_status") in {"jira_created", "live_agent_requested"}
-        or session_item.get("live_agent_status") in {"requested", "ticket_created", "waiting_for_customer", "resolved"}
-        or bool(session_item.get("live_agent_ticket_key") or session_item.get("last_live_agent_ticket_key"))
+        or session_item.get("support_options_status") == "jira_created"
+        or session_item.get("live_agent_status") in TERMINAL_LIVE_AGENT_STATUSES
     )
 
 
@@ -3963,6 +4048,239 @@ def get_lex_reply(messages):
     return EMPTY_LEX_REPLY, True
 
 
+def truncate_text(value, limit):
+    text = str(value or "")
+    return text[:limit]
+
+
+def live_agent_slack_comment_marker_id(event_id, ticket_key, user, text, channel, ts):
+    if event_id:
+        marker_key = str(event_id)
+    else:
+        raw = json.dumps(
+            {
+                "ticket_key": ticket_key or "",
+                "user": user or "",
+                "text": text or "",
+                "channel": channel or "",
+                "ts": ts or "",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        marker_key = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    return f"live_agent_slack_comment:{marker_key}"
+
+
+def acquire_live_agent_slack_comment_marker(session_id, ticket_key, event_id, user, text, channel, ts, now_iso):
+    marker_session_id = live_agent_slack_comment_marker_id(event_id, ticket_key, user, text, channel, ts)
+
+    try:
+        sessions_table.update_item(
+            Key={"session_id": marker_session_id},
+            UpdateExpression="""
+                SET
+                    record_type = :record_type,
+                    target_session_id = :target_session_id,
+                    ticket_key = :ticket_key,
+                    event_id = :event_id,
+                    slack_user = :slack_user,
+                    slack_channel = :slack_channel,
+                    slack_ts = :slack_ts,
+                    #status = :posting,
+                    created_at = if_not_exists(created_at, :now),
+                    updated_at = :now,
+                    #ttl = :ttl
+            """,
+            ConditionExpression=(
+                Attr("session_id").not_exists()
+                | Attr("status").eq("failed")
+            ),
+            ExpressionAttributeNames={
+                "#status": "status",
+                "#ttl": "ttl",
+            },
+            ExpressionAttributeValues={
+                ":record_type": "live_agent_slack_comment_marker",
+                ":target_session_id": session_id,
+                ":ticket_key": ticket_key,
+                ":event_id": event_id or "",
+                ":slack_user": user or "",
+                ":slack_channel": channel or "",
+                ":slack_ts": ts or "",
+                ":posting": "posting",
+                ":now": now_iso,
+                ":ttl": ttl_epoch(),
+            },
+        )
+
+        return {
+            "acquired": True,
+            "session_id": marker_session_id,
+        }
+
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return {
+                "acquired": False,
+                "session_id": marker_session_id,
+            }
+
+        raise
+
+
+def update_live_agent_slack_comment_marker(marker_session_id, status, now_iso, error=None):
+    expression_values = {
+        ":status": status,
+        ":now": now_iso,
+        ":ttl": ttl_epoch(),
+    }
+    update_expression = """
+        SET
+            #status = :status,
+            updated_at = :now,
+            #ttl = :ttl
+    """
+    expression_attribute_names = {
+        "#status": "status",
+        "#ttl": "ttl",
+    }
+
+    if error:
+        update_expression += """,
+            error = :error
+        """
+        expression_values[":error"] = str(error)
+
+    sessions_table.update_item(
+        Key={"session_id": marker_session_id},
+        UpdateExpression=update_expression,
+        ExpressionAttributeNames=expression_attribute_names,
+        ExpressionAttributeValues=expression_values,
+    )
+
+
+def build_live_agent_slack_comment(user, text, channel, thread_ts, ts):
+    slack_thread = thread_ts or ts or ""
+    return (
+        f"[From Slack] User {user} replied:\n\n"
+        f"{text}\n\n"
+        f"Slack channel: {channel}\n"
+        f"Slack thread: {slack_thread}"
+    )
+
+
+def update_live_agent_user_reply_session(session_id, session_item, event_id, text, now_iso):
+    previous_status = session_item.get("live_agent_status")
+    next_status = "user_replied" if previous_status == "waiting_for_customer" else previous_status
+
+    sessions_table.update_item(
+        Key={"session_id": session_id},
+        UpdateExpression="""
+            SET
+                live_agent_status = :live_agent_status,
+                last_live_agent_user_reply = :reply,
+                last_live_agent_user_reply_at = :now,
+                last_live_agent_user_reply_event_id = :event_id,
+                live_agent_updated_at = :now,
+                updated_at = :now,
+                #ttl = :ttl
+        """,
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues={
+            ":live_agent_status": next_status,
+            ":reply": truncate_text(text, 2000),
+            ":now": now_iso,
+            ":event_id": event_id or "",
+            ":ttl": ttl_epoch(),
+        },
+    )
+
+
+def update_live_agent_user_reply_pointer(ticket_key, text, now_iso):
+    if not ticket_key:
+        return
+
+    sessions_table.update_item(
+        Key={"session_id": f"live_agent_ticket:{ticket_key}"},
+        UpdateExpression="""
+            SET
+                last_slack_user_reply = :reply,
+                last_slack_user_reply_at = :now,
+                updated_at = :now,
+                #ttl = :ttl
+        """,
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues={
+            ":reply": truncate_text(text, 2000),
+            ":now": now_iso,
+            ":ttl": ttl_epoch(),
+        },
+    )
+
+
+def handle_live_agent_user_reply(session_id, session_item, body, channel, user, text, thread_ts, ts):
+    ticket_key = session_item.get("live_agent_ticket_key") or session_item.get("last_live_agent_ticket_key")
+    event_id = body.get("event_id")
+    now_iso = to_iso(datetime.now(timezone.utc))
+    marker = acquire_live_agent_slack_comment_marker(
+        session_id,
+        ticket_key,
+        event_id,
+        user,
+        text,
+        channel,
+        ts,
+        now_iso,
+    )
+
+    if not marker.get("acquired"):
+        log_json({
+            "level": "INFO",
+            "message": "live_agent_user_reply_duplicate",
+            "session_id": session_id,
+            "ticket_key": ticket_key,
+            "event_id": event_id,
+            "marker_session_id": marker.get("session_id"),
+        })
+        return {
+            "ok": True,
+            "duplicate": True,
+            "ticket_key": ticket_key,
+            "marker_session_id": marker.get("session_id"),
+        }
+
+    comment_body = build_live_agent_slack_comment(user, text, channel, thread_ts, ts)
+
+    try:
+        add_jsm_request_comment(ticket_key, comment_body, public=JSM_COMMENT_PUBLIC)
+        update_live_agent_user_reply_session(session_id, session_item, event_id, text, now_iso)
+        update_live_agent_user_reply_pointer(ticket_key, text, now_iso)
+        update_live_agent_slack_comment_marker(marker["session_id"], "posted", now_iso)
+    except Exception as e:
+        update_live_agent_slack_comment_marker(marker["session_id"], "failed", now_iso, error=e)
+        raise
+
+    ack = f"Sent your reply to support on {ticket_key}."
+    send_slack_message(channel, ack, thread_ts=thread_ts)
+
+    log_json({
+        "level": "INFO",
+        "message": "live_agent_user_reply_forwarded",
+        "session_id": session_id,
+        "ticket_key": ticket_key,
+        "event_id": event_id,
+        "marker_session_id": marker.get("session_id"),
+    })
+
+    return {
+        "ok": True,
+        "ticket_key": ticket_key,
+        "marker_session_id": marker.get("session_id"),
+    }
+
+
 def process_record(record):
     body = json.loads(record["body"])
 
@@ -4105,6 +4423,36 @@ def process_record(record):
             "jira_status": existing_session.get("jira_status"),
             "live_agent_status": existing_session.get("live_agent_status")
         })
+        return
+
+    is_bot_message = bool(
+        body.get("bot_id")
+        or body.get("bot_user_id")
+        or body.get("subtype") in {"bot_message", "message_changed", "message_deleted"}
+    )
+    if existing_session and not is_interactive_action and is_active_live_agent_session(existing_session):
+        if is_bot_message or not text:
+            log_json({
+                "level": "INFO",
+                "message": "active_live_agent_non_user_message_ignored",
+                "event_id": event_id,
+                "session_id": session_id,
+                "ticket_key": existing_session.get("live_agent_ticket_key") or existing_session.get("last_live_agent_ticket_key"),
+                "is_bot_message": is_bot_message,
+                "has_text": bool(text),
+            })
+            return
+
+        handle_live_agent_user_reply(
+            session_id,
+            existing_session,
+            body,
+            channel,
+            user,
+            text,
+            thread_ts or session_thread_ts,
+            ts,
+        )
         return
 
     response_source = "lex"
