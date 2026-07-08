@@ -32,6 +32,7 @@ INTENT_TITLES = {
     "AccessToIkbInnovyQCom": "ikb.InnovyQ.com access",
     "AccessToUemGpcloudserviceCom": "uem.gpcloudservice.com access",
     "CreateJiraTicket": "Support request",
+    "SessionSummary": "Closed session summary",
 }
 
 

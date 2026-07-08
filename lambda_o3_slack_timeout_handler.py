@@ -16,7 +16,7 @@ lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "o3_slack_sessions")
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "86400"))
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-TIMEOUT_CLOSE_GRACE_SECONDS = int(os.environ.get("TIMEOUT_CLOSE_GRACE_SECONDS", "300"))
+TIMEOUT_CLOSE_GRACE_SECONDS = int(os.environ.get("TIMEOUT_CLOSE_GRACE_SECONDS", "30"))
 TIMEOUT_PROMPT_TEXT = os.environ.get(
     "TIMEOUT_PROMPT_TEXT",
     "Are you still there? I will close this conversation if I do not hear back soon."
@@ -232,7 +232,6 @@ def claim_prompt(session_id, timeout_token_value, now):
                 AND (
                     attribute_not_exists(timeout_status)
                     OR timeout_status = :scheduled
-                    OR timeout_status = :prompting
                 )
             """,
             ExpressionAttributeNames={
@@ -283,6 +282,43 @@ def mark_prompted(session_id, timeout_token_value, prompted_at, close_due_at):
             ":ttl": ttl_epoch()
         }
     )
+
+
+def claim_close(session_id, timeout_token_value, now):
+    try:
+        sessions_table.update_item(
+            Key={"session_id": session_id},
+            UpdateExpression="""
+                SET
+                    timeout_status = :closing,
+                    timeout_closing_started_at = :now,
+                    updated_at = :now,
+                    #ttl = :ttl
+            """,
+            ConditionExpression="""
+                timeout_token = :timeout_token
+                AND conversation_status = :active
+                AND timeout_status = :prompted
+            """,
+            ExpressionAttributeNames={
+                "#ttl": "ttl"
+            },
+            ExpressionAttributeValues={
+                ":timeout_token": timeout_token_value,
+                ":active": "active",
+                ":prompted": "prompted",
+                ":closing": "closing",
+                ":now": to_iso(now),
+                ":ttl": ttl_epoch()
+            }
+        )
+        return True
+
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return False
+
+        raise
 
 
 def invoke_summarizer(session_id, timeout_token_value, closed_at):
@@ -420,6 +456,9 @@ def handle_close(event):
                 "timeout_close_due_at": to_iso(close_due_at)
             }
         )
+
+    if not claim_close(session_id, timeout_token_value, now):
+        return ignored("close_claim_failed", session_id)
 
     summarizer_invoked = invoke_summarizer(session_id, timeout_token_value, now)
 

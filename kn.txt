@@ -404,3 +404,411 @@ PII masking tests — should mask, not fully block
 My email is test.user@example.com and VPN is not working.
 Call me at 9876543210 for the laptop issue.
 My server IP is 10.20.30.40 and SSH is failing.
+=================================================
+https://beipbsznd5.execute-api.ap-southeast-2.amazonaws.com/default/o3_live_agent
+
+{
+  "source": "jsm_automation",
+  "event_type": "live_agent_ticket_created",
+  "session_id": "{{webhookData.session_id}}",
+  "session_root_ts": "{{webhookData.session_root_ts}}",
+  "slack_channel": "{{webhookData.slack.channelId}}",
+  "slack_thread_ts": "{{webhookData.slack.threadTs}}",
+  "slack_user": "{{webhookData.slack.userId}}",
+  "ticket_key": "{{createdIssue.key}}",
+  "ticket_url": "{{baseUrl}}/browse/{{createdIssue.key}}",
+  "ticket_status": "{{createdIssue.status.name}}",
+  "jira_project": "{{createdIssue.project.key}}",
+  "issue_type": "{{createdIssue.issueType.name}}",
+  "portal_request_type": "{{createdIssue.Request Type.requestType.name}}"
+}
+
+Key	Value	Hidden	
+Content-Type
+application/json
+
+
+
+X-IVY-Callback-Secret
+b30b9b1e347587fa67edd9b619caa4de5306039c
+==========
+audit log
+
+session_id={{webhookData.session_id}} session_root_ts={{webhookData.session_root_ts}} slack_channel={{webhookData.slack.channelId}} slack_thread_ts={{webhookData.slack.threadTs}} slack_user={{webhookData.slack.userId}}  createdIssue.key={{createdIssue.key}} createdIssue.status={{createdIssue.status.name}} createdIssues={{#createdIssues}}{{key}}{{/}} baseUrl={{baseUrl}}
+===========
+summary
+[IVY Live Agent] {{webhookData.title}}
+description
+Slack User:
+{{webhookData.slack.userId}}
+
+Slack Channel:
+{{webhookData.slack.channelId}}
+
+Thread:
+{{webhookData.slack.threadTs}}
+
+Session:
+{{webhookData.session_id}}
+
+User Request / Description:
+{{webhookData.description}}
+
+Request Type:
+{{webhookData.requestType}}
+
+Summary:
+{{webhookData.conversation_summary}}
+
+Conversation:
+{{webhookData.conversation_text}}
+
+Source:
+{{webhookData.source}}
+
+Sir,
+I wanted to share a quick update on the features implemented so far in the O3 Bot, along with the remaining items planned for the next phase.
+The following capabilities have been implemented till now:
+Slack Integration
+
+
+
+
+
+
+
+O3 Bot can receive and respond to user messages from Slack.
+
+
+Supports Slack DM and thread-based conversations.
+
+
+Slack events are routed through API Gateway, Lambda, SQS, and worker Lambda.
+
+Event Processing Pipeline
+
+
+
+
+
+
+
+Slack events are processed asynchronously using SQS.
+
+
+Dead-letter queue support is configured for failed messages.
+
+
+Duplicate Slack event handling has been implemented using DynamoDB.
+
+Session Management
+
+
+
+
+
+
+
+User sessions are stored and tracked in DynamoDB.
+
+
+Session state includes Slack channel, user, thread, last user message, bot response, Lex state, Jira ticket state, and live-agent status.
+
+
+DM-based and thread-based conversation handling is supported.
+
+Amazon Lex Integration
+
+
+
+
+
+
+O3 Bot is integrated with Amazon Lex for intent detection.
+
+
+Lex handles structured conversational flows before escalation.
+
+Claude / Bedrock AI Fallback
+
+
+
+
+
+
+Claude fallback support has been added for unresolved cases.
+
+
+The bot can provide AI-generated assistance before offering escalation options.
+
+Support Options Flow
+
+
+
+
+
+Users can choose next actions such as:
+
+
+
+
+
+
+
+
+Continue with AI assistance
+
+
+Create Jira ticket
+
+
+Request live-agent support
+
+
+Close and summarize conversation
+
+Jira Ticket Creation
+
+
+
+
+
+
+
+
+Jira ticket creation flow is implemented.
+
+
+Duplicate ticket creation prevention and lock handling are in place.
+
+
+Slack confirmation is sent after ticket creation.
+
+
+Jira ticket metadata is stored in DynamoDB.
+
+Live Agent Handoff
+
+
+
+
+
+
+
+Users can request live-agent support from Slack.
+
+
+Live-agent requests are created in the IVY Live Agent Support JSM project.
+
+
+Slack user details, channel, thread, session ID, and conversation summary are passed to JSM.
+
+JSM Ticket Created Callback
+
+
+
+
+
+
+
+JSM automation sends ticket creation details back to AWS.
+
+
+O3 Bot stores live-agent ticket mapping in DynamoDB using records such as live_agent_ticket:IVY-xx.
+
+
+Slack receives confirmation with the created JSM ticket key.
+
+JSM Status Updates to Slack
+
+
+Status changes in JSM are synced back to Slack.
+
+
+Supported updates include:
+
+
+
+
+
+
+
+
+In Progress
+
+
+Waiting for Customer
+
+
+Waiting for Support
+
+
+Resolved
+
+
+When a ticket is resolved, the related Slack session is closed in DynamoDB.
+
+JSM Agent Reply to Slack
+
+
+When an agent uses “Reply to customer” in JSM, the message is sent back to the original Slack conversation.
+
+
+Echo-loop prevention has been added to avoid duplicate Slack/JSM message loops.
+
+Slack User Reply to JSM
+
+
+Worker logic has been implemented to route Slack user replies back to the same JSM ticket as comments.
+
+
+Current work is focused on ensuring JSM tickets are created with the correct Request Type so comments are customer-visible.
+
+Reliability and Idempotency
+
+
+Duplicate callbacks are prevented using DynamoDB marker records.
+
+
+Duplicate Slack retries are handled.
+
+
+Ticket creation, status update, and comment callbacks have idempotency safeguards.
+
+CloudWatch Logging
+
+
+JSON-based logging has been added for easier debugging.
+
+
+Logs include session ID, ticket key, callback type, status, and error codes.
+
+      15. Timeout scheduler
+        Send warning message to user if user remains inactive          for 15 mins, close and summarize conversation                       after 5mins of inactivity.
+      
+
+The following features are still pending and planned for the next phase:
+JSM Ops On-call Logic
+
+
+
+
+
+
+Implement agent assignment logic based on the on-call shift scheduler.
+
+
+Route live-agent requests to the correct support agent depending on shift availability.
+
+Image Handling Logic Update
+
+
+
+
+
+
+Update image handling logic inplace of OpenSearch.
+
+
+Improve screenshot/image issue matching and routing.
+
+User Experience Improvements
+
+
+
+
+
+
+Improve Slack response wording, confirmations, and error messages.
+
+
+Make the overall bot flow smoother and easier for end users.
+
+Slack Group DM Testing
+
+
+
+
+Test the O3 Bot in Slack group DMs with two additional accounts.
+
+
+Validate multi-user behavior, thread handling, and live-agent flow in group DM scenarios
+
+       5.Close and Summarize Flow
+
+
+
+
+
+
+
+Fully test O3_slack_summarizer.
+
+
+Ensure closed conversations are summarized correctly.
+
+
+Confirm summary is stored/sent to Jira/JSM where required.
+
+       6. Rovo / Jira Enrichment
+
+
+
+
+
+
+Confirm what role Jira + Rovo plays in the final flow.
+
+
+Decide whether Rovo should enrich Jira/JSM tickets, suggest solutions, or assist agents.
+       7. Live-Agent Logs and Observability
+
+
+
+
+
+
+
+Use o3-liveagentlogs or equivalent logging for live-agent events.
+
+
+Track ticket creation, status changes, comments, failures, and duplicate events.
+
+
+Add CloudWatch alarms for failed callbacks, DLQ messages, and Jira/JSM API failures.
+
+=================
+{
+  "source": "jsm_automation",
+  "event_type": "live_agent_ticket_created",
+  "session_id": "{{webhookData.session_id}}",
+  "session_root_ts": "{{webhookData.session_root_ts}}",
+  "slack_channel": "{{webhookData.slack.channelId}}",
+  "slack_thread_ts": "{{webhookData.slack.threadTs}}",
+  "slack_user": "{{webhookData.slack.userId}}",
+  "ticket_key": "{{createdIssue.key}}",
+  "ticket_url": "{{baseUrl}}/browse/{{createdIssue.key}}",
+  "ticket_status": "{{createdIssue.status.name}}",
+  "jira_project": "{{createdIssue.project.key}}",
+  "issue_type": "{{createdIssue.issueType.name}}",
+  "portal_request_type": "{{createdIssue.Request Type.requestType.name}}"
+}
+===========
+new:
+{
+  "source": "jsm_automation",
+  "event_type": "live_agent_ticket_created",
+  "ticket_key": "{{issue.key}}",
+  "ticket_url": "{{baseUrl}}/browse/{{issue.key}}",
+  "ticket_status": "{{issue.status.name}}",
+  "assignee_account_id": "{{issue.assignee.accountId}}",
+  "assignee_display_name": "{{issue.assignee.displayName}}",
+  "assignee_email": "{{issue.assignee.emailAddress}}",
+  "slack_channel": "{{webhook.body.channel}}",
+  "slack_thread_ts": "{{webhook.body.thread}}",
+  "slack_user": "{{webhook.body.slack_user}}",
+  "session_id": "{{webhook.body.session_id}}",
+  "user_request": "{{webhook.body.user_request}}",
+  "created_at": "{{issue.created}}",
+  "updated_at": "{{issue.updated}}"
+}

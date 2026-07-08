@@ -17,6 +17,7 @@ dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 s3_client = boto3.client("s3", region_name=AWS_REGION)
 bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 scheduler = boto3.client("scheduler", region_name=AWS_REGION)
+lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 
 # Runtime configuration. Most values can be changed from Lambda environment
 # variables without redeploying code.
@@ -30,6 +31,8 @@ SUMMARY_WEBHOOK_URL = os.environ.get("SUMMARY_WEBHOOK_URL") or os.environ.get("P
 SUMMARY_WEBHOOK_TIMEOUT_SECONDS = int(os.environ.get("SUMMARY_WEBHOOK_TIMEOUT_SECONDS", "15"))
 AUDIT_S3_BUCKET = os.environ.get("AUDIT_S3_BUCKET")
 AUDIT_S3_PREFIX = os.environ.get("AUDIT_S3_PREFIX", "slack-audit")
+CREATE_JIRA_TICKET_FUNCTION = os.environ.get("CREATE_JIRA_TICKET_FUNCTION")
+CREATE_SUMMARY_JIRA_TICKET = os.environ.get("CREATE_SUMMARY_JIRA_TICKET", "true").lower() == "true"
 TIMEOUT_SCHEDULING_ENABLED = os.environ.get("TIMEOUT_SCHEDULING_ENABLED", "true").lower() == "true"
 SCHEDULER_GROUP_NAME = os.environ.get("SCHEDULER_GROUP_NAME", "default")
 SCHEDULER_NAME_PREFIX = os.environ.get("SCHEDULER_NAME_PREFIX", "o3-slack-timeout")
@@ -208,12 +211,15 @@ def mark_summary_started(session_id, timeout_token, started_at):
             attribute_not_exists(conversation_status)
             OR conversation_status = :active
             OR conversation_status = :summarizing
+            OR conversation_status = :closed
         )
     """
 
     if timeout_token:
         condition += " AND timeout_token = :timeout_token"
         expression_values[":timeout_token"] = timeout_token
+
+    expression_values[":closed"] = "closed"
 
     sessions_table.update_item(
         Key={"session_id": session_id},
@@ -242,6 +248,7 @@ def mark_summary_completed(
     webhook_sent=False,
     webhook_error=None,
     audit_error=None,
+    summary_jira_result=None,
 ):
     # Store the final summary and delivery/audit status back on the session row.
     update_expression = """
@@ -277,6 +284,34 @@ def mark_summary_completed(
     if audit_error:
         update_expression += ", summary_audit_error = :audit_error"
         expression_values[":audit_error"] = text_or_empty(audit_error)[:1000]
+
+    if summary_jira_result:
+        update_expression += """
+            ,
+            summary_jira_status = :summary_jira_status,
+            summary_jira_created_at = :summary_jira_created_at
+        """
+        expression_values[":summary_jira_status"] = (
+            "created" if summary_jira_result.get("ok") else "create_failed"
+        )
+        expression_values[":summary_jira_created_at"] = to_iso(completed_at)
+
+        if summary_jira_result.get("ticket_key"):
+            update_expression += """
+                ,
+                summary_jira_ticket_key = :summary_jira_ticket_key,
+                summary_jira_ticket_url = :summary_jira_ticket_url
+            """
+            expression_values[":summary_jira_ticket_key"] = summary_jira_result.get("ticket_key")
+            expression_values[":summary_jira_ticket_url"] = summary_jira_result.get("ticket_url") or ""
+
+        if summary_jira_result.get("error"):
+            update_expression += ", summary_jira_error = :summary_jira_error"
+            expression_values[":summary_jira_error"] = text_or_empty(summary_jira_result.get("error"))[:1000]
+
+        if summary_jira_result.get("error_code"):
+            update_expression += ", summary_jira_error_code = :summary_jira_error_code"
+            expression_values[":summary_jira_error_code"] = text_or_empty(summary_jira_result.get("error_code"))[:200]
 
     sessions_table.update_item(
         Key={"session_id": session_id},
@@ -726,6 +761,117 @@ def post_summary_webhook(payload):
         return True, {"summaryText": response_text}
 
 
+def summary_ticket_request_id(session_id, closed_at):
+    source = f"{session_id}:{to_iso(closed_at)}"
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:32]
+    return f"summary-{digest}"
+
+
+def summary_text_for_jira(summary):
+    return (
+        text_or_empty(summary.get("ai_summary"))
+        or text_or_empty(summary.get("last_user_message"))
+        or text_or_empty(summary.get("original_request"))
+        or "Closed IVY Slack support session summary."
+    )
+
+
+def build_summary_jira_payload(session_item, session_id, payload, summary, closed_at):
+    conversation_text = "\n".join(payload.get("conversation") or [])
+    summary_text = summary_text_for_jira(summary)
+    original_request = text_or_empty(summary.get("original_request")) or summary_text
+
+    return {
+        "jira_request_id": summary_ticket_request_id(session_id, closed_at),
+        "jira_requested_at": to_iso(closed_at),
+        "jira_confirmed_at": to_iso(closed_at),
+        "event_id": f"summary:{session_id}:{to_iso(closed_at)}",
+        "session_id": session_id,
+        "session_root_ts": session_item.get("session_root_ts") or session_item.get("thread_ts"),
+        "channel": session_item.get("channel"),
+        "user": session_item.get("user"),
+        "text": original_request,
+        "raw_text": original_request,
+        "conversation_summary": summary_text,
+        "conversation_text": conversation_text,
+        "confirmation_text": "summary_close",
+        "lex": {
+            "intent": "SessionSummary",
+            "state": "Closed",
+            "slots": {},
+        },
+        "slack": {
+            "channel": session_item.get("channel"),
+            "user": session_item.get("user"),
+            "event_ts": session_item.get("last_ts"),
+            "thread_ts": session_item.get("thread_ts"),
+        },
+        "summary": summary,
+        "summary_payload_type": payload.get("type"),
+        "summary_close_reason": payload.get("reason"),
+        "live_agent": {
+            "status": session_item.get("live_agent_status"),
+            "ticket_key": session_item.get("live_agent_ticket_key") or session_item.get("last_live_agent_ticket_key"),
+            "ticket_url": session_item.get("live_agent_ticket_url") or session_item.get("last_live_agent_ticket_url"),
+        },
+    }
+
+
+def invoke_create_jira_ticket(payload):
+    if not CREATE_SUMMARY_JIRA_TICKET:
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "disabled",
+        }
+
+    if not CREATE_JIRA_TICKET_FUNCTION:
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "missing_create_jira_ticket_function",
+            "error": "missing_create_jira_ticket_function",
+            "error_code": "missing_create_jira_ticket_function",
+        }
+
+    response = lambda_client.invoke(
+        FunctionName=CREATE_JIRA_TICKET_FUNCTION,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(payload).encode("utf-8"),
+    )
+    raw_payload = response.get("Payload").read().decode("utf-8") if response.get("Payload") else ""
+
+    if response.get("FunctionError"):
+        return {
+            "ok": False,
+            "error": raw_payload or response.get("FunctionError"),
+            "error_code": "jira_lambda_function_error",
+        }
+
+    if not raw_payload:
+        return {
+            "ok": False,
+            "error": "empty_create_jira_response",
+            "error_code": "invalid_create_jira_response",
+        }
+
+    try:
+        parsed = json.loads(raw_payload)
+    except ValueError:
+        return {
+            "ok": False,
+            "error": "invalid_create_jira_response",
+            "error_code": "invalid_create_jira_response",
+            "raw_response": raw_payload,
+        }
+
+    return parsed if isinstance(parsed, dict) else {
+        "ok": False,
+        "error": "invalid_create_jira_response",
+        "error_code": "invalid_create_jira_response",
+    }
+
+
 def put_audit_log(payload, closed_at):
     # Persist the full audit payload to S3 when an audit bucket is configured.
     if not AUDIT_S3_BUCKET:
@@ -992,6 +1138,41 @@ def lambda_handler(event, context):
                 "error": audit_error,
             })
 
+        summary_jira_result = None
+        if CREATE_SUMMARY_JIRA_TICKET and not session_item.get("summary_jira_ticket_key"):
+            try:
+                summary_jira_payload = build_summary_jira_payload(
+                    session_item,
+                    session_id,
+                    payload,
+                    summary,
+                    closed_at,
+                )
+                summary_jira_result = invoke_create_jira_ticket(summary_jira_payload)
+                payload["summaryJiraResult"] = summary_jira_result
+                log_json({
+                    "level": "INFO" if summary_jira_result.get("ok") else "ERROR",
+                    "message": "summary_jira_create_completed",
+                    "session_id": session_id,
+                    "ok": summary_jira_result.get("ok"),
+                    "ticket_key": summary_jira_result.get("ticket_key"),
+                    "error_code": summary_jira_result.get("error_code"),
+                    "skipped": summary_jira_result.get("skipped", False),
+                })
+            except Exception as error:
+                summary_jira_result = {
+                    "ok": False,
+                    "error": str(error),
+                    "error_code": "summary_jira_create_failed",
+                }
+                payload["summaryJiraResult"] = summary_jira_result
+                log_json({
+                    "level": "ERROR",
+                    "message": "summary_jira_create_failed",
+                    "session_id": session_id,
+                    "error": str(error),
+                })
+
         if webhook_error or audit_error:
             failure_error = webhook_error or audit_error
             mark_summary_failed(
@@ -1031,6 +1212,7 @@ def lambda_handler(event, context):
             webhook_sent=webhook_sent,
             webhook_error=webhook_error,
             audit_error=audit_error,
+            summary_jira_result=summary_jira_result,
         )
         delete_timeout_schedule(session_id, "prompt")
         delete_timeout_schedule(session_id, "close")
@@ -1053,6 +1235,8 @@ def lambda_handler(event, context):
             "audit_s3_key": audit_s3_key,
             "webhook_sent": webhook_sent,
             "ai_summary_generated": bool(summary.get("ai_summary")),
+            "summary_jira_ticket_key": (summary_jira_result or {}).get("ticket_key"),
+            "summary_jira_ok": (summary_jira_result or {}).get("ok"),
         }
 
         log_json({

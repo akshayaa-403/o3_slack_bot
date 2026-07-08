@@ -30,7 +30,7 @@ LOCALE_ID = os.environ.get("LOCALE_ID", "en_US")
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "o3_slack_sessions")
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "86400"))
-INACTIVITY_TIMEOUT_SECONDS = int(os.environ.get("INACTIVITY_TIMEOUT_SECONDS", "900"))
+INACTIVITY_TIMEOUT_SECONDS = int(os.environ.get("INACTIVITY_TIMEOUT_SECONDS", "30"))
 TIMEOUT_SCHEDULING_ENABLED = os.environ.get("TIMEOUT_SCHEDULING_ENABLED", "true").lower() == "true"
 TIMEOUT_HANDLER_ARN = os.environ.get("TIMEOUT_HANDLER_ARN")
 SCHEDULER_ROLE_ARN = os.environ.get("SCHEDULER_ROLE_ARN")
@@ -566,6 +566,21 @@ TERMINAL_LIVE_AGENT_STATUSES = {
     "cancelled",
     "canceled",
 }
+
+
+def is_live_agent_dm_session_pending_or_active(session_item):
+    if not session_item:
+        return False
+
+    return (
+        session_item.get("conversation_status") not in {"closed", "failed"}
+        and session_item.get("summary_status") not in {"started", "completed"}
+        and session_item.get("live_agent_status") not in TERMINAL_LIVE_AGENT_STATUSES
+        and (
+            session_item.get("support_options_status") in {"live_agent_requested", "live_agent_creating"}
+            or session_item.get("live_agent_status") in ACTIVE_LIVE_AGENT_STATUSES
+        )
+    )
 
 
 def is_active_live_agent_session(session_item):
@@ -2080,6 +2095,118 @@ def delete_active_dm_session(channel, user):
     )
 
 
+def supersede_other_dm_sessions(channel, user, current_session_id, now_iso):
+    if not channel or not user or not current_session_id:
+        return
+
+    try:
+        response = sessions_table.scan(
+            FilterExpression=(
+                Attr("channel").eq(channel)
+                & Attr("user").eq(user)
+                & Attr("conversation_status").eq("active")
+            ),
+            ProjectionExpression="""
+                session_id,
+                session_root_ts,
+                timeout_token,
+                conversation_status,
+                summary_status,
+                next_action,
+                assistance_status,
+                support_options_status,
+                jira_status,
+                live_agent_status,
+                live_agent_ticket_key,
+                last_live_agent_ticket_key
+            """,
+        )
+    except Exception as error:
+        log_json({
+            "level": "ERROR",
+            "message": "dm_supersede_scan_failed",
+            "channel": channel,
+            "user": user,
+            "current_session_id": current_session_id,
+            "error": str(error),
+        })
+        return
+
+    for item in response.get("Items") or []:
+        old_session_id = item.get("session_id")
+        if not old_session_id or old_session_id == current_session_id:
+            continue
+
+        if not str(old_session_id).startswith("issue:"):
+            continue
+
+        if session_waits_for_dm_text(item):
+            continue
+
+        try:
+            sessions_table.update_item(
+                Key={"session_id": old_session_id},
+                UpdateExpression="""
+                    SET
+                        conversation_status = :closed,
+                        session_state = :closed_state,
+                        timeout_status = :superseded,
+                        superseded_by_session_id = :current_session_id,
+                        superseded_at = :now,
+                        updated_at = :now,
+                        #ttl = :ttl
+                    REMOVE
+                        timeout_due_at,
+                        timeout_token,
+                        timeout_schedule_name,
+                        timeout_prompt_started_at,
+                        timeout_prompted_at,
+                        timeout_close_due_at,
+                        timeout_closing_started_at,
+                        timeout_closed_at
+                """,
+                ConditionExpression="conversation_status = :active",
+                ExpressionAttributeNames={
+                    "#ttl": "ttl",
+                },
+                ExpressionAttributeValues={
+                    ":active": "active",
+                    ":closed": "closed",
+                    ":closed_state": SESSION_STATE_CLOSED,
+                    ":superseded": "superseded",
+                    ":current_session_id": current_session_id,
+                    ":now": now_iso,
+                    ":ttl": ttl_epoch(),
+                },
+            )
+            delete_timeout_schedule(old_session_id, "prompt")
+            delete_timeout_schedule(old_session_id, "close")
+            log_json({
+                "level": "INFO",
+                "message": "dm_session_superseded",
+                "session_id": old_session_id,
+                "superseded_by_session_id": current_session_id,
+            })
+        except ClientError as error:
+            if error.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                continue
+            log_json({
+                "level": "ERROR",
+                "message": "dm_session_supersede_failed",
+                "session_id": old_session_id,
+                "superseded_by_session_id": current_session_id,
+                "error": str(error),
+            })
+        except Exception as error:
+            log_json({
+                "level": "ERROR",
+                "message": "dm_session_supersede_failed",
+                "session_id": old_session_id,
+                "superseded_by_session_id": current_session_id,
+                "error": str(error),
+            })
+
+
 def has_pending_jira_confirmation(session_item):
     return (
         session_item.get("next_action") == NEXT_ACTION_CREATE_JIRA_TICKET
@@ -2111,6 +2238,9 @@ def has_pending_final_support_options(session_item):
 def session_waits_for_dm_text(session_item, text=None):
     if not session_item or session_is_terminal(session_item):
         return False
+
+    if is_live_agent_dm_session_pending_or_active(session_item):
+        return True
 
     if has_pending_jira_confirmation(session_item):
         return True
@@ -4149,8 +4279,9 @@ def update_live_agent_slack_comment_marker(marker_session_id, status, now_iso, e
 
     if error:
         update_expression += """,
-            error = :error
+            #error = :error
         """
+        expression_attribute_names["#error"] = "error"
         expression_values[":error"] = str(error)
 
     sessions_table.update_item(
@@ -4430,7 +4561,7 @@ def process_record(record):
         or body.get("bot_user_id")
         or body.get("subtype") in {"bot_message", "message_changed", "message_deleted"}
     )
-    if existing_session and not is_interactive_action and is_active_live_agent_session(existing_session):
+    if existing_session and not is_interactive_action and is_live_agent_dm_session_pending_or_active(existing_session):
         if is_bot_message or not text:
             log_json({
                 "level": "INFO",
@@ -4440,6 +4571,19 @@ def process_record(record):
                 "ticket_key": existing_session.get("live_agent_ticket_key") or existing_session.get("last_live_agent_ticket_key"),
                 "is_bot_message": is_bot_message,
                 "has_text": bool(text),
+            })
+            return
+
+        if not is_active_live_agent_session(existing_session):
+            reply = "Your live-agent ticket is still being linked. Please try again in a moment."
+            send_slack_message(channel, reply, thread_ts=thread_ts or session_thread_ts)
+            log_json({
+                "level": "INFO",
+                "message": "live_agent_pending_ticket_reply_deferred",
+                "event_id": event_id,
+                "session_id": session_id,
+                "live_agent_status": existing_session.get("live_agent_status"),
+                "support_options_status": existing_session.get("support_options_status"),
             })
             return
 
@@ -5138,9 +5282,9 @@ def process_record(record):
         conversation_status = "active"
     if assistance_status in {"pending_confirmation", "awaiting_details"}:
         conversation_status = "active"
-    if support_options_status in {"pending", "creating_jira", "live_agent_creating"}:
+    if support_options_status in {"pending", "creating_jira", "live_agent_creating", "live_agent_requested"}:
         conversation_status = "active"
-    if live_agent_status in {"creating", "in_progress"}:
+    if live_agent_status in ACTIVE_LIVE_AGENT_STATUSES:
         conversation_status = "active"
 
     offer_close_summary = (
@@ -5318,6 +5462,7 @@ def process_record(record):
             "timeout_prompt_started_at",
             "timeout_prompted_at",
             "timeout_close_due_at",
+            "timeout_closing_started_at",
             "timeout_closed_at"
         ])
     else:
@@ -5328,6 +5473,7 @@ def process_record(record):
             "timeout_prompt_started_at",
             "timeout_prompted_at",
             "timeout_close_due_at",
+            "timeout_closing_started_at",
             "timeout_closed_at"
         ])
 
@@ -5833,6 +5979,9 @@ def process_record(record):
         )
 
     if one_to_one_dm and not session_identity.get("legacy"):
+        if not is_interactive_action and conversation_status == "active":
+            supersede_other_dm_sessions(channel, user, session_id, updated_at)
+
         updated_session_state = {
             **existing_session,
             "conversation_status": conversation_status,
