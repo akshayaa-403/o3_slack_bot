@@ -5,6 +5,7 @@ import hashlib
 from datetime import datetime, timezone
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import boto3
@@ -12,6 +13,7 @@ from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import ClientError
 
 import chat_locks
+import lambda_o3_jsm_oncall_user as oncall_user_helper
 from lambda_o3_jsm_oncall_user import get_current_oncall_user
 
 AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
@@ -37,6 +39,7 @@ ONCALL_USER_FUNCTION = os.environ.get("ONCALL_USER_FUNCTION") or os.environ.get(
 AGENT_CHAT_LOCK_TABLE = os.environ.get("AGENT_CHAT_LOCK_TABLE", "O3_Lambda_Agent_Chat_Locks")
 ENABLE_LIVE_AGENT_CAPACITY = os.environ.get("ENABLE_LIVE_AGENT_CAPACITY", "false").lower() == "true"
 LIVE_AGENT_MAX_ACTIVE_CHATS = int(os.environ.get("LIVE_AGENT_MAX_ACTIVE_CHATS", "5"))
+MAX_QUEUE_DRAIN_PER_INVOCATION = max(1, int(os.environ.get("MAX_QUEUE_DRAIN_PER_INVOCATION", "1")))
 LIVE_AGENT_BUSY_REPLY = os.environ.get(
     "LIVE_AGENT_BUSY_REPLY",
     "All live agents are busy right now. You are in the queue and support will pick this up as soon as someone is available."
@@ -473,6 +476,14 @@ def live_agent_promoted_reply(ticket_key, ticket_url):
         return f"A live agent is now available for {ticket_key}."
 
     return "A live agent is now available for your request."
+
+
+def live_agent_queue_assigned_reply(ticket_key, agent_name):
+    agent_text = text_or_empty(agent_name) or "The on-call agent"
+    if ticket_key:
+        return f"✅ A live agent is now available. {agent_text} has been assigned to {ticket_key}."
+
+    return f"✅ A live agent is now available. {agent_text} has been assigned to your request."
 
 
 def agent_key_from_user(user):
@@ -1845,49 +1856,103 @@ def is_terminal_ticket_status(status):
     return normalized_ticket_status_text(status) in TERMINAL_TICKET_STATUSES
 
 
+def assign_jira_ticket(ticket_key, agent_account_id):
+    result = oncall_user_helper.assign_jira_issue(ticket_key, agent_account_id)
+    if "status" not in result:
+        result["status"] = result.get("status_code")
+    return result
+
+
 def drain_live_agent_queue():
-    queue_item = chat_locks.pop_oldest_waiting_request()
-    if not queue_item:
-        return {
-            "drained": False,
-            "reason": "queue_empty",
-        }
+    assignments = []
+    for _ in range(MAX_QUEUE_DRAIN_PER_INVOCATION):
+        queue_item = chat_locks.pop_oldest_waiting_request()
+        if not queue_item:
+            return {
+                "drained": bool(assignments),
+                "reason": "queue_empty",
+                "assignments": assignments,
+                "assignment_count": len(assignments),
+            }
 
-    ticket_key = queue_item.get("ticket_key") or ""
-    oncall_user = get_current_oncall_user(ticket_key=ticket_key, webhook_payload={})
-    if not oncall_user.get("ok"):
-        chat_locks.mark_queue_item_waiting_again(queue_item, "no_oncall_user")
-        return {
-            "drained": False,
-            "reason": "no_oncall_user",
+        ticket_key = text_or_empty(queue_item.get("ticket_key"))
+        oncall_user = get_current_oncall_user(ticket_key=ticket_key)
+        if not oncall_user.get("ok"):
+            chat_locks.mark_queue_item_waiting_again(queue_item, "no_oncall_user")
+            return {
+                "drained": bool(assignments),
+                "reason": "no_oncall_user",
+                "ticket_key": ticket_key,
+                "assignments": assignments,
+                "assignment_count": len(assignments),
+            }
+
+        agent = live_agent_agent_from_oncall(oncall_user)
+        ticket = {
             "ticket_key": ticket_key,
+            "ticket_url": queue_item.get("ticket_url") or "",
+            "status": queue_item.get("ticket_status") or "",
         }
+        slack_context = {
+            "session_id": queue_item.get("session_id") or "",
+            "slack_channel": queue_item.get("slack_channel") or "",
+            "slack_thread_ts": queue_item.get("slack_thread_ts") or "",
+            "slack_user": queue_item.get("slack_user") or "",
+        }
+        lock_result = chat_locks.acquire_chat_lock(agent, ticket, slack_context)
 
-    ticket = {
-        "ticket_key": ticket_key,
-        "ticket_url": queue_item.get("ticket_url") or "",
-        "status": queue_item.get("ticket_status") or "",
-    }
-    slack_context = {
-        "session_id": queue_item.get("session_id") or "",
-        "slack_channel": queue_item.get("slack_channel") or "",
-        "slack_thread_ts": queue_item.get("slack_thread_ts") or "",
-        "slack_user": queue_item.get("slack_user") or "",
-    }
-    lock_result = chat_locks.acquire_chat_lock(
-        live_agent_agent_from_oncall(oncall_user),
-        ticket,
-        slack_context,
-    )
+        if not lock_result.get("ok"):
+            reason = lock_result.get("reason") or "lock_failed"
+            if reason == "agent_at_capacity":
+                chat_locks.mark_queue_item_waiting_again(queue_item, reason)
+            else:
+                chat_locks.mark_queue_item_failed(queue_item, reason)
+            return {
+                "drained": bool(assignments),
+                "reason": reason,
+                "ticket_key": ticket_key,
+                "lock": lock_result,
+                "assignments": assignments,
+                "assignment_count": len(assignments),
+            }
 
-    if lock_result.get("ok"):
-        chat_locks.mark_queue_item_assigned(queue_item, live_agent_agent_from_oncall(oncall_user), ticket_key)
+        jira_assignment = assign_jira_ticket(ticket_key, agent.get("account_id"))
+        if not jira_assignment.get("ok"):
+            release_result = chat_locks.release_chat_lock(
+                ticket_key,
+                close_reason="jira_assignment_failed",
+            )
+            queue_reason = jira_assignment.get("reason") or "jira_assignment_failed"
+            if jira_assignment.get("retryable"):
+                chat_locks.mark_queue_item_waiting_again(queue_item, queue_reason)
+            else:
+                chat_locks.mark_queue_item_failed(queue_item, queue_reason)
+            log_json({
+                "level": "ERROR",
+                "message": "live_agent_queue_assignment_rolled_back",
+                "ticket_key": ticket_key,
+                "agent_account_id": agent.get("account_id"),
+                "queue_retryable": jira_assignment.get("retryable"),
+                "lock_released": release_result.get("released"),
+            })
+            return {
+                "drained": bool(assignments),
+                "reason": queue_reason,
+                "ticket_key": ticket_key,
+                "lock": lock_result,
+                "lock_release": release_result,
+                "jira_assignment": jira_assignment,
+                "assignments": assignments,
+                "assignment_count": len(assignments),
+            }
+
+        chat_locks.mark_queue_item_assigned(queue_item, agent, ticket_key)
         slack_result = {"attempted": False}
         if queue_item.get("slack_channel"):
             try:
                 slack_result = post_slack_message(
                     queue_item["slack_channel"],
-                    live_agent_assigned_reply(ticket_key, queue_item.get("ticket_url"), oncall_user.get("display_name")),
+                    live_agent_queue_assigned_reply(ticket_key, oncall_user.get("display_name")),
                     text_or_empty(queue_item.get("slack_thread_ts")),
                 )
             except Exception as error:
@@ -1903,30 +1968,31 @@ def drain_live_agent_queue():
                     "error": str(error),
                 }
 
-        return {
-            "drained": True,
+        assignment = {
             "ticket_key": ticket_key,
-            "agent_account_id": oncall_user.get("account_id"),
+            "agent_account_id": agent.get("account_id"),
             "lock": lock_result,
+            "jira_assignment": jira_assignment,
             "slack": slack_result,
         }
-
-    if lock_result.get("reason") == "agent_at_capacity":
-        chat_locks.mark_queue_item_waiting_again(queue_item, "agent_at_capacity")
-        return {
-            "drained": False,
-            "reason": "agent_at_capacity",
+        assignments.append(assignment)
+        log_json({
+            "level": "INFO",
+            "message": "live_agent_queue_item_assigned",
             "ticket_key": ticket_key,
-            "lock": lock_result,
-        }
+            "agent_account_id": agent.get("account_id"),
+            "assignment_count": len(assignments),
+        })
 
-    chat_locks.mark_queue_item_failed(queue_item, lock_result.get("reason") or "lock_failed")
-    return {
-        "drained": False,
-        "reason": lock_result.get("reason") or "lock_failed",
-        "ticket_key": ticket_key,
-        "lock": lock_result,
+    result = {
+        "drained": bool(assignments),
+        "reason": "max_assignments_reached",
+        "assignments": assignments,
+        "assignment_count": len(assignments),
     }
+    if assignments:
+        result.update(assignments[-1])
+    return result
 
 
 def recover_latest_requested_live_agent_session():

@@ -23,6 +23,9 @@ JIRA_EMAIL = os.environ.get("JIRA_EMAIL")
 JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN")
 JIRA_SECRET_ID = os.environ.get("JIRA_SECRET_ID")
 JIRA_TIMEOUT_SECONDS = int(os.environ.get("JIRA_TIMEOUT_SECONDS", "15"))
+JIRA_MAX_ATTEMPTS = max(1, int(os.environ.get("JIRA_MAX_ATTEMPTS", "3")))
+JIRA_RETRY_DELAY_SECONDS = float(os.environ.get("JIRA_RETRY_DELAY_SECONDS", "1"))
+UNASSIGN_WHEN_AGENT_FULL = os.environ.get("UNASSIGN_WHEN_AGENT_FULL", "false").lower() == "true"
 OPSGENIE_API_KEY = os.environ.get("OPSGENIE_API_KEY")
 OPSGENIE_SCHEDULE_ID = os.environ.get("OPSGENIE_SCHEDULE_ID")
 OPSGENIE_API_BASE_URL = os.environ.get("OPSGENIE_API_BASE_URL", "https://api.opsgenie.com").rstrip("/")
@@ -156,6 +159,122 @@ def jira_get_json(path, query=None):
     )
 
 
+JIRA_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def jira_request(method, path, body=None, query=None):
+    secret = get_jira_secret()
+    url = f"{secret['site_url'].rstrip('/')}{path}"
+    if query:
+        url = f"{url}?{urllib.parse.urlencode(query)}"
+
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    headers = {
+        "Accept": "application/json",
+        "Authorization": jira_auth_header(secret),
+    }
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+
+    for attempt in range(1, JIRA_MAX_ATTEMPTS + 1):
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=JIRA_TIMEOUT_SECONDS) as response:
+                response_body = response.read().decode("utf-8").strip()
+                return {
+                    "ok": 200 <= response.status < 300,
+                    "status_code": response.status,
+                    "body": json.loads(response_body) if response_body else None,
+                    "attempts": attempt,
+                }
+        except urllib.error.HTTPError as error:
+            retryable = error.code in JIRA_RETRYABLE_STATUS_CODES
+            if not retryable or attempt >= JIRA_MAX_ATTEMPTS:
+                return {
+                    "ok": False,
+                    "status_code": error.code,
+                    "reason": "jira_http_error",
+                    "retryable": retryable,
+                    "attempts": attempt,
+                }
+            retry_after = error.headers.get("Retry-After") if error.headers else None
+            try:
+                delay = float(retry_after) if retry_after is not None else JIRA_RETRY_DELAY_SECONDS
+            except ValueError:
+                delay = JIRA_RETRY_DELAY_SECONDS
+            time.sleep(max(0, delay))
+        except (urllib.error.URLError, TimeoutError) as error:
+            return {
+                "ok": False,
+                "status_code": None,
+                "reason": "jira_network_error",
+                "retryable": False,
+                "attempts": attempt,
+                "error": str(error),
+            }
+
+
+def assign_jira_issue(ticket_key, account_id):
+    ticket_key = text_or_empty(ticket_key)
+    account_id = text_or_empty(account_id)
+    if not ticket_key or not account_id:
+        return {
+            "ok": False,
+            "status_code": None,
+            "reason": "missing_ticket_or_account_id",
+        }
+
+    result = jira_request(
+        "PUT",
+        f"/rest/api/3/issue/{urllib.parse.quote(ticket_key, safe='')}/assignee",
+        body={"accountId": account_id},
+    )
+    log_json({
+        "level": "INFO" if result.get("ok") else "ERROR",
+        "message": "jira_issue_assignment_completed",
+        "ticket_key": ticket_key,
+        "status_code": result.get("status_code"),
+        "result": "success" if result.get("ok") else result.get("reason"),
+    })
+    return result
+
+
+def unassign_jira_issue(ticket_key):
+    ticket_key = text_or_empty(ticket_key)
+    if not UNASSIGN_WHEN_AGENT_FULL:
+        return {
+            "ok": False,
+            "status_code": None,
+            "reason": "unassign_when_agent_full_disabled",
+            "skipped": True,
+        }
+    if not ticket_key:
+        return {
+            "ok": False,
+            "status_code": None,
+            "reason": "missing_ticket_key",
+        }
+
+    result = jira_request(
+        "PUT",
+        f"/rest/api/3/issue/{urllib.parse.quote(ticket_key, safe='')}/assignee",
+        body={"accountId": None},
+    )
+    log_json({
+        "level": "INFO" if result.get("ok") else "ERROR",
+        "message": "jira_issue_unassignment_completed",
+        "ticket_key": ticket_key,
+        "status_code": result.get("status_code"),
+        "result": "success" if result.get("ok") else result.get("reason"),
+    })
+    return result
+
+
 def normalize_user(user, source, ticket_key=""):
     user = user if isinstance(user, dict) else {}
     account_id = first_text(
@@ -229,13 +348,45 @@ def user_from_webhook_payload(webhook_payload, ticket_key=""):
 
 
 def get_jira_issue_assignee(ticket_key):
-    safe_ticket_key = urllib.parse.quote(str(ticket_key), safe="")
-    issue = jira_get_json(f"/rest/api/3/issue/{safe_ticket_key}", {"fields": "assignee"})
-    assignee = nested_get(issue, "fields", "assignee")
-    if not isinstance(assignee, dict):
+    ticket_key = text_or_empty(ticket_key)
+    if not ticket_key:
         return {}
 
-    return normalize_user(assignee, "jira_issue_assignee", ticket_key)
+    result = jira_request(
+        "GET",
+        f"/rest/api/3/issue/{urllib.parse.quote(ticket_key, safe='')}",
+        query={"fields": "assignee"},
+    )
+    if not result.get("ok"):
+        log_json({
+            "level": "ERROR",
+            "message": "jira_issue_assignee_lookup_completed",
+            "ticket_key": ticket_key,
+            "status_code": result.get("status_code"),
+            "result": result.get("reason"),
+        })
+        return {}
+
+    assignee = nested_get(result.get("body"), "fields", "assignee")
+    if not isinstance(assignee, dict):
+        log_json({
+            "level": "INFO",
+            "message": "jira_issue_assignee_lookup_completed",
+            "ticket_key": ticket_key,
+            "status_code": result.get("status_code"),
+            "result": "unassigned",
+        })
+        return {}
+
+    user = normalize_user(assignee, "jira_issue_assignee", ticket_key)
+    log_json({
+        "level": "INFO",
+        "message": "jira_issue_assignee_lookup_completed",
+        "ticket_key": ticket_key,
+        "status_code": result.get("status_code"),
+        "result": "success",
+    })
+    return user
 
 
 def jira_user_for_opsgenie_user(opsgenie_user):
