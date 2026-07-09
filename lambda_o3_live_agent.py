@@ -11,13 +11,19 @@ import boto3
 from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import ClientError
 
+import chat_locks
+from lambda_o3_jsm_oncall_user import get_current_oncall_user
+
 AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
 
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 
 CONFIG_TABLE = os.environ.get("CONFIG_TABLE") or os.environ.get("LIVE_AGENT_CONFIG_TABLE")
 SESSION_TABLE = os.environ.get("DYNAMODB_TABLE") or os.environ.get("SESSION_TABLE") or "o3_slack_sessions"
 LIVE_AGENT_CONFIG_INTENT = os.environ.get("LIVE_AGENT_CONFIG_INTENT", "LiveAgent")
+LIVE_AGENT_DEFAULT_REQUEST_TYPE = os.environ.get("LIVE_AGENT_DEFAULT_REQUEST_TYPE", "live_agent")
+LIVE_AGENT_DEFAULT_BRANCHING = os.environ.get("LIVE_AGENT_DEFAULT_BRANCHING", "live_agent")
 LIVE_AGENT_WEBHOOK_URL = os.environ.get("LIVE_AGENT_WEBHOOK_URL") or os.environ.get("AUTOMATION_WEBHOOK_URL")
 LIVE_AGENT_WEBHOOK_SECRET = os.environ.get("LIVE_AGENT_WEBHOOK_SECRET", "").strip()
 LIVE_AGENT_CALLBACK_SECRET = os.environ.get("LIVE_AGENT_CALLBACK_SECRET", "").strip()
@@ -25,6 +31,16 @@ LIVE_AGENT_WEBHOOK_TIMEOUT_SECONDS = int(os.environ.get("LIVE_AGENT_WEBHOOK_TIME
 LIVE_AGENT_TICKET_BASE_URL = os.environ.get("LIVE_AGENT_TICKET_BASE_URL", "https://innovyq.atlassian.net").rstrip("/")
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "86400"))
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+ONCALL_USER_TABLE = os.environ.get("ONCALL_USER_TABLE", "O3_JSMOps_Oncall")
+ONCALL_CACHE_KEY = os.environ.get("ONCALL_CACHE_KEY", "current")
+ONCALL_USER_FUNCTION = os.environ.get("ONCALL_USER_FUNCTION") or os.environ.get("JSM_ONCALL_USER_FUNCTION")
+AGENT_CHAT_LOCK_TABLE = os.environ.get("AGENT_CHAT_LOCK_TABLE", "O3_Lambda_Agent_Chat_Locks")
+ENABLE_LIVE_AGENT_CAPACITY = os.environ.get("ENABLE_LIVE_AGENT_CAPACITY", "false").lower() == "true"
+LIVE_AGENT_MAX_ACTIVE_CHATS = int(os.environ.get("LIVE_AGENT_MAX_ACTIVE_CHATS", "5"))
+LIVE_AGENT_BUSY_REPLY = os.environ.get(
+    "LIVE_AGENT_BUSY_REPLY",
+    "All live agents are busy right now. You are in the queue and support will pick this up as soon as someone is available."
+)
 
 SUCCESS_REPLY = os.environ.get(
     "LIVE_AGENT_SUCCESS_REPLY",
@@ -37,6 +53,8 @@ FAILURE_REPLY = os.environ.get(
 
 config_table = dynamodb.Table(CONFIG_TABLE) if CONFIG_TABLE else None
 session_table = dynamodb.Table(SESSION_TABLE) if SESSION_TABLE else None
+oncall_user_table = dynamodb.Table(ONCALL_USER_TABLE) if ONCALL_USER_TABLE else None
+agent_chat_lock_table = dynamodb.Table(AGENT_CHAT_LOCK_TABLE) if AGENT_CHAT_LOCK_TABLE else None
 
 
 def log_json(data):
@@ -145,6 +163,30 @@ def first_text(*values):
     return ""
 
 
+def present_text(data, key):
+    if isinstance(data, dict) and key in data and data.get(key) is not None:
+        return text_or_empty(data.get(key))
+    return None
+
+
+def canonical_slack_context(session_id="", session_root_ts="", slack_channel="", slack_thread_ts="", slack_user=""):
+    channel = text_or_empty(slack_channel)
+    thread_ts = text_or_empty(slack_thread_ts)
+    user = text_or_empty(slack_user)
+    return {
+        "session_id": text_or_empty(session_id),
+        "session_root_ts": text_or_empty(session_root_ts),
+        "slack_channel": channel,
+        "slack_thread_ts": thread_ts,
+        "slack_user": user,
+        "slack": {
+            "channelId": channel,
+            "threadTs": thread_ts,
+            "userId": user,
+        },
+    }
+
+
 def normalize_ticket_key(callback):
     return first_text(
         callback.get("ticket_key"),
@@ -218,10 +260,54 @@ def normalize_callback(event):
     ticket_url = normalize_ticket_url(callback, ticket_key)
     slack = callback.get("slack") if isinstance(callback.get("slack"), dict) else {}
     issue = callback.get("issue") if isinstance(callback.get("issue"), dict) else {}
+    assignee = callback.get("assignee") if isinstance(callback.get("assignee"), dict) else {}
+    fields = nested_get(issue, "fields") or {}
+    issue_assignee = fields.get("assignee") if isinstance(fields.get("assignee"), dict) else {}
+    attrs = lex_session_attributes(callback)
+    session_id = first_text(callback.get("session_id"), attrs.get("session_id"), callback.get("sessionId"))
+    session_root_ts = first_text(
+        callback.get("session_root_ts"),
+        attrs.get("session_root_ts"),
+        callback.get("sessionRootTs"),
+        attrs.get("sessionRootTs"),
+        attrs.get("slackThreadTs"),
+    )
+    slack_channel = first_text(
+        callback.get("slack_channel"),
+        attrs.get("slack_channel"),
+        callback.get("slackChannel"),
+        attrs.get("slackChannel"),
+        callback.get("channel"),
+        slack.get("channelId"),
+        slack.get("channel"),
+        attrs.get("slackChannelId"),
+    )
+    slack_thread_ts = present_text(callback, "slack_thread_ts")
+    if slack_thread_ts is None:
+        slack_thread_ts = present_text(attrs, "slack_thread_ts")
+    if slack_thread_ts is None:
+        slack_thread_ts = first_text(
+            callback.get("slackThreadTs"),
+            attrs.get("slackThreadTs"),
+            callback.get("thread_ts"),
+            callback.get("threadTs"),
+            slack.get("threadTs"),
+            slack.get("thread_ts"),
+        )
+    slack_user = first_text(
+        callback.get("slack_user"),
+        attrs.get("slack_user"),
+        callback.get("slackUser"),
+        attrs.get("slackUser"),
+        callback.get("user"),
+        slack.get("userId"),
+        slack.get("user"),
+        attrs.get("slackUserId"),
+    )
 
     return {
-        "session_id": first_text(callback.get("session_id"), callback.get("sessionId")),
-        "session_root_ts": first_text(callback.get("session_root_ts"), callback.get("sessionRootTs")),
+        "event_type": callback_event_type(callback),
+        **canonical_slack_context(session_id, session_root_ts, slack_channel, slack_thread_ts, slack_user),
         "ticket_key": ticket_key,
         "ticket_url": ticket_url,
         "ticket_status": first_text(
@@ -250,9 +336,35 @@ def normalize_callback(event):
             callback.get("request_type"),
             callback.get("requestType"),
         ),
-        "slack_channel": first_text(callback.get("slack_channel"), callback.get("slackChannel"), slack.get("channelId"), slack.get("channel")),
-        "slack_thread_ts": first_text(callback.get("slack_thread_ts"), callback.get("slackThreadTs"), slack.get("threadTs"), slack.get("thread_ts")),
-        "slack_user": first_text(callback.get("slack_user"), callback.get("slackUser"), slack.get("userId"), slack.get("user")),
+        "assignee_account_id": first_text(
+            callback.get("assignee_account_id"),
+            callback.get("assigneeAccountId"),
+            callback.get("agent_account_id"),
+            callback.get("agentAccountId"),
+            assignee.get("accountId"),
+            issue_assignee.get("accountId"),
+        ),
+        "assignee_email": first_text(
+            callback.get("assignee_email"),
+            callback.get("assigneeEmail"),
+            assignee.get("emailAddress"),
+            issue_assignee.get("emailAddress"),
+        ),
+        "assignee_display_name": first_text(
+            callback.get("assignee_display_name"),
+            callback.get("assigneeDisplayName"),
+            callback.get("assignee_name"),
+            callback.get("assigneeName"),
+            assignee.get("displayName"),
+            issue_assignee.get("displayName"),
+        ),
+        "user_request": first_text(
+            callback.get("user_request"),
+            callback.get("userRequest"),
+            callback.get("description"),
+            callback.get("request_text"),
+            callback.get("requestText"),
+        ),
         "raw_callback": callback,
     }
 
@@ -301,6 +413,736 @@ def live_agent_ticket_reply(ticket_key, ticket_url):
         return f"Live agent support ticket created: {ticket_key}"
 
     return SUCCESS_REPLY
+
+
+def live_agent_assigned_reply(ticket_key, ticket_url, agent_name):
+    agent_text = text_or_empty(agent_name) or "the on-call agent"
+    if ticket_key and ticket_url:
+        return f"✅ Live agent ticket {ticket_key} has been created and assigned to {agent_text}: {ticket_url}"
+
+    if ticket_key:
+        return f"✅ Live agent ticket {ticket_key} has been created and assigned to {agent_text}."
+
+    return f"✅ Your live agent ticket has been created and assigned to {agent_text}."
+
+
+def live_agent_busy_queue_reply(ticket_key):
+    if ticket_key:
+        return f"⏳ All live agents are currently busy. Your request {ticket_key} is in the queue. We'll notify you as soon as an agent is available."
+
+    return "⏳ All live agents are currently busy. Your request is in the queue. We'll notify you as soon as an agent is available."
+
+
+def live_agent_no_oncall_queue_reply(ticket_key):
+    if ticket_key:
+        return f"⏳ Your live-agent request {ticket_key} was created, but no on-call agent is currently available. You are in the queue."
+
+    return "⏳ Your live-agent request was created, but no on-call agent is currently available. You are in the queue."
+
+
+def callback_ticket(callback):
+    return {
+        "ticket_key": callback.get("ticket_key") or "",
+        "ticket_url": callback.get("ticket_url") or "",
+        "status": callback.get("ticket_status") or "",
+    }
+
+
+def callback_slack_context(callback):
+    return {
+        "session_id": callback.get("session_id") or "",
+        "slack_channel": callback.get("slack_channel") or "",
+        "slack_thread_ts": callback.get("slack_thread_ts") or "",
+        "slack_user": callback.get("slack_user") or "",
+    }
+
+
+def live_agent_agent_from_oncall(oncall_user):
+    return {
+        "account_id": oncall_user.get("account_id") or "",
+        "display_name": oncall_user.get("display_name") or "",
+        "email": oncall_user.get("email") or "",
+    }
+
+
+def live_agent_promoted_reply(ticket_key, ticket_url):
+    if ticket_key and ticket_url:
+        return f"A live agent is now available for {ticket_key}: {ticket_url}"
+
+    if ticket_key:
+        return f"A live agent is now available for {ticket_key}."
+
+    return "A live agent is now available for your request."
+
+
+def agent_key_from_user(user):
+    if not isinstance(user, dict):
+        return ""
+
+    for field in ("account_id", "accountId", "email", "emailAddress", "display_name", "displayName"):
+        value = text_or_empty(user.get(field))
+        if value:
+            return value.lower()
+
+    return ""
+
+
+def normalize_callback_agent(callback):
+    agent = {
+        "account_id": callback.get("assignee_account_id") or "",
+        "email": callback.get("assignee_email") or "",
+        "display_name": callback.get("assignee_display_name") or "",
+        "source": "callback",
+    }
+    agent["agent_key"] = agent_key_from_user(agent)
+    return agent if agent["agent_key"] else {}
+
+
+def current_oncall_user():
+    if not oncall_user_table:
+        return {}
+
+    try:
+        response = oncall_user_table.get_item(Key={"oncall_key": ONCALL_CACHE_KEY})
+        item = response.get("Item") or {}
+        if item:
+            return item
+    except ClientError as error:
+        log_json({
+            "level": "WARN",
+            "message": "oncall_user_lookup_get_failed",
+            "error": str(error),
+        })
+
+    try:
+        response = oncall_user_table.scan(Limit=25)
+        items = response.get("Items") or []
+    except ClientError as error:
+        log_json({
+            "level": "WARN",
+            "message": "oncall_user_lookup_scan_failed",
+            "error": str(error),
+        })
+        return {}
+
+    for item in items:
+        if text_or_empty(item.get("oncall_key")).lower() == ONCALL_CACHE_KEY.lower():
+            return item
+
+    for item in items:
+        if item.get("is_current") is True or text_or_empty(item.get("status")).lower() in {"current", "active"}:
+            return item
+
+    return items[0] if items else {}
+
+
+def resolve_live_agent_agent(callback):
+    agent = normalize_callback_agent(callback)
+    if agent:
+        return agent
+
+    item = current_oncall_user()
+    if not item:
+        return {}
+
+    agent = {
+        "account_id": first_text(item.get("account_id"), item.get("accountId")),
+        "email": first_text(item.get("email"), item.get("emailAddress")),
+        "display_name": first_text(item.get("display_name"), item.get("displayName")),
+        "source": "oncall_cache",
+    }
+    agent["agent_key"] = agent_key_from_user(agent)
+    return agent if agent["agent_key"] else {}
+
+
+def normalize_oncall_helper_user(result):
+    if not isinstance(result, dict):
+        return {}
+
+    if result.get("account_id") or result.get("display_name") or result.get("email"):
+        user = result
+    else:
+        user = result.get("assignee")
+    if not isinstance(user, dict):
+        user = result.get("current_user")
+    if not isinstance(user, dict):
+        user = result.get("user")
+    if not isinstance(user, dict):
+        return {}
+
+    normalized = {
+        "assignee_account_id": first_text(user.get("account_id"), user.get("accountId")),
+        "assignee_display_name": first_text(user.get("display_name"), user.get("displayName")),
+        "assignee_email": first_text(user.get("email"), user.get("emailAddress")),
+    }
+    return normalized if any(normalized.values()) else {}
+
+
+def invoke_oncall_user_helper(callback):
+    if not ONCALL_USER_FUNCTION:
+        return {}
+
+    payload = {
+        "source": "o3_live_agent",
+        "event_type": "resolve_live_agent_assignee",
+        "ticket_key": callback.get("ticket_key"),
+        "ticket_url": callback.get("ticket_url"),
+        "session_id": callback.get("session_id"),
+        "slack_channel": callback.get("slack_channel"),
+        "slack_thread_ts": callback.get("slack_thread_ts"),
+        "slack_user": callback.get("slack_user"),
+    }
+
+    try:
+        response = lambda_client.invoke(
+            FunctionName=ONCALL_USER_FUNCTION,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload).encode("utf-8"),
+        )
+    except ClientError as error:
+        log_json({
+            "level": "WARN",
+            "message": "oncall_user_helper_invoke_failed",
+            "ticket_key": callback.get("ticket_key"),
+            "session_id": callback.get("session_id"),
+            "error": str(error),
+        })
+        return {}
+
+    raw_payload = response.get("Payload").read().decode("utf-8") if response.get("Payload") else ""
+    try:
+        result = json.loads(raw_payload) if raw_payload else {}
+    except ValueError:
+        result = {"message": raw_payload}
+
+    if response.get("FunctionError") or not result.get("ok"):
+        log_json({
+            "level": "WARN",
+            "message": "oncall_user_helper_no_assignee",
+            "ticket_key": callback.get("ticket_key"),
+            "session_id": callback.get("session_id"),
+            "function_error": response.get("FunctionError"),
+            "error_code": result.get("error_code"),
+            "error": result.get("error"),
+        })
+        return {}
+
+    return normalize_oncall_helper_user(result)
+
+
+def enrich_missing_assignee(callback):
+    if callback.get("assignee_account_id"):
+        return callback
+
+    helper_user = invoke_oncall_user_helper(callback)
+    if not helper_user:
+        return callback
+
+    enriched = {**callback}
+    for field, value in helper_user.items():
+        if value and not enriched.get(field):
+            enriched[field] = value
+
+    return enriched
+
+
+def ticket_lock_id(ticket_key):
+    return f"live_agent_chat_ticket:{ticket_key}"
+
+
+def agent_slot_lock_id(agent_key, slot_number):
+    slot_agent = hashlib.sha256(agent_key.encode("utf-8")).hexdigest()[:24]
+    return f"live_agent_chat_slot:{slot_agent}:{slot_number}"
+
+
+def get_chat_lock(ticket_key):
+    if not (agent_chat_lock_table and ticket_key):
+        return {}
+
+    response = agent_chat_lock_table.get_item(Key={"lock_id": ticket_lock_id(ticket_key)})
+    return response.get("Item") or {}
+
+
+def scan_chat_locks(filter_expression):
+    if not agent_chat_lock_table:
+        return []
+
+    items = []
+    scan_kwargs = {"FilterExpression": filter_expression}
+    while True:
+        response = agent_chat_lock_table.scan(**scan_kwargs)
+        items.extend(response.get("Items") or [])
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        scan_kwargs["ExclusiveStartKey"] = last_key
+
+    return items
+
+
+def active_chat_count(agent_key):
+    return len(scan_chat_locks(
+        Attr("record_type").eq("ticket_lock")
+        & Attr("agent_key").eq(agent_key)
+        & Attr("lock_status").eq("active")
+    ))
+
+
+def acquire_agent_slot(agent, callback, now_iso):
+    if not agent_chat_lock_table:
+        return None
+
+    ttl = ttl_epoch()
+    for slot_number in range(1, LIVE_AGENT_MAX_ACTIVE_CHATS + 1):
+        lock_id = agent_slot_lock_id(agent["agent_key"], slot_number)
+        try:
+            agent_chat_lock_table.put_item(
+                Item={
+                    "lock_id": lock_id,
+                    "record_type": "agent_slot",
+                    "lock_status": "active",
+                    "slot_number": slot_number,
+                    "agent_key": agent["agent_key"],
+                    "agent_account_id": agent.get("account_id") or "",
+                    "agent_email": agent.get("email") or "",
+                    "agent_display_name": agent.get("display_name") or "",
+                    "ticket_key": callback["ticket_key"],
+                    "session_id": callback.get("session_id") or "",
+                    "slack_channel": callback.get("slack_channel") or "",
+                    "slack_thread_ts": callback.get("slack_thread_ts") or "",
+                    "slack_user": callback.get("slack_user") or "",
+                    "created_at": now_iso,
+                    "updated_at": now_iso,
+                    "ttl": ttl,
+                },
+                ConditionExpression=(
+                    Attr("lock_id").not_exists()
+                    | Attr("lock_status").ne("active")
+                ),
+            )
+            return {
+                "lock_id": lock_id,
+                "slot_number": slot_number,
+            }
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                continue
+            raise
+
+    return None
+
+
+def release_agent_slot(slot_lock_id, now_iso):
+    if not (agent_chat_lock_table and slot_lock_id):
+        return
+
+    agent_chat_lock_table.update_item(
+        Key={"lock_id": slot_lock_id},
+        UpdateExpression="""
+            SET
+                lock_status = :released,
+                released_at = :now,
+                updated_at = :now,
+                #ttl = :ttl
+        """,
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues={
+            ":released": "released",
+            ":now": now_iso,
+            ":ttl": ttl_epoch(),
+        },
+    )
+
+
+def create_ticket_chat_lock(callback, agent, lock_status, now_iso, slot=None):
+    if not agent_chat_lock_table:
+        return {}
+
+    item = {
+        "lock_id": ticket_lock_id(callback["ticket_key"]),
+        "record_type": "ticket_lock",
+        "lock_status": lock_status,
+        "agent_key": agent["agent_key"],
+        "agent_account_id": agent.get("account_id") or "",
+        "agent_email": agent.get("email") or "",
+        "agent_display_name": agent.get("display_name") or "",
+        "agent_source": agent.get("source") or "",
+        "ticket_key": callback["ticket_key"],
+        "ticket_url": callback.get("ticket_url") or "",
+        "session_id": callback.get("session_id") or "",
+        "slack_channel": callback.get("slack_channel") or "",
+        "slack_thread_ts": callback.get("slack_thread_ts") or "",
+        "slack_user": callback.get("slack_user") or "",
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "ttl": ttl_epoch(),
+    }
+
+    if lock_status == "waiting":
+        item["queued_at"] = now_iso
+
+    if slot:
+        item["slot_lock_id"] = slot["lock_id"]
+        item["slot_number"] = slot["slot_number"]
+        item["activated_at"] = now_iso
+
+    try:
+        agent_chat_lock_table.put_item(
+            Item=item,
+            ConditionExpression=Attr("lock_id").not_exists(),
+        )
+        return {
+            **item,
+            "created": True,
+        }
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return {
+                **get_chat_lock(callback["ticket_key"]),
+                "created": False,
+            }
+        raise
+
+
+def update_live_agent_capacity_state(callback, pointer_session_id, capacity_status, agent, lock_item=None):
+    if not session_table:
+        return
+
+    now_iso = utc_now_iso()
+    lock_item = lock_item or {}
+    values = {
+        ":capacity_status": capacity_status,
+        ":agent_key": agent.get("agent_key") or "",
+        ":agent_account_id": agent.get("account_id") or "",
+        ":agent_email": agent.get("email") or "",
+        ":agent_display_name": agent.get("display_name") or "",
+        ":lock_id": lock_item.get("lock_id") or ticket_lock_id(callback["ticket_key"]),
+        ":slot_lock_id": lock_item.get("slot_lock_id") or "",
+        ":now": now_iso,
+        ":ttl": ttl_epoch(),
+    }
+    expression = """
+        SET
+            live_agent_capacity_status = :capacity_status,
+            live_agent_agent_key = :agent_key,
+            live_agent_agent_account_id = :agent_account_id,
+            live_agent_agent_email = :agent_email,
+            live_agent_agent_display_name = :agent_display_name,
+            live_agent_chat_lock_id = :lock_id,
+            live_agent_slot_lock_id = :slot_lock_id,
+            live_agent_capacity_updated_at = :now,
+            updated_at = :now,
+            #ttl = :ttl
+    """
+
+    if capacity_status == "waiting":
+        expression += """,
+            live_agent_status = :queued_status,
+            live_agent_queue_enqueued_at = if_not_exists(live_agent_queue_enqueued_at, :now)
+        """
+        values[":queued_status"] = "queued"
+
+    if capacity_status == "active" and lock_item.get("queued_at"):
+        expression += """,
+            live_agent_queue_promoted_at = :now
+        """
+
+    target_keys = []
+    if callback.get("session_id"):
+        target_keys.append(callback["session_id"])
+    if pointer_session_id:
+        target_keys.append(pointer_session_id)
+
+    for session_id in dict.fromkeys(target_keys):
+        session_table.update_item(
+            Key={"session_id": session_id},
+            UpdateExpression=expression,
+            ExpressionAttributeNames={"#ttl": "ttl"},
+            ExpressionAttributeValues=values,
+        )
+
+
+def apply_chat_capacity(callback, pointer_session_id):
+    if not agent_chat_lock_table or LIVE_AGENT_MAX_ACTIVE_CHATS < 1:
+        return {
+            "status": "disabled",
+            "reason": "chat_lock_table_not_configured",
+        }
+
+    existing_lock = get_chat_lock(callback["ticket_key"])
+    if existing_lock.get("lock_status") == "active":
+        return {
+            "status": "active",
+            "duplicate": True,
+            "agent_key": existing_lock.get("agent_key"),
+            "active_chat_count": active_chat_count(existing_lock.get("agent_key")),
+            "lock": existing_lock,
+        }
+
+    if existing_lock.get("lock_status") == "waiting":
+        return {
+            "status": "waiting",
+            "duplicate": True,
+            "agent_key": existing_lock.get("agent_key"),
+            "active_chat_count": active_chat_count(existing_lock.get("agent_key")),
+            "lock": existing_lock,
+        }
+
+    agent = resolve_live_agent_agent(callback)
+    if not agent:
+        return {
+            "status": "disabled",
+            "reason": "missing_agent",
+        }
+
+    now_iso = utc_now_iso()
+    slot = acquire_agent_slot(agent, callback, now_iso)
+    if slot:
+        lock_item = create_ticket_chat_lock(callback, agent, "active", now_iso, slot=slot)
+        if not lock_item.get("created"):
+            release_agent_slot(slot["lock_id"], now_iso)
+            return {
+                "status": "active" if lock_item.get("lock_status") == "active" else lock_item.get("lock_status") or "duplicate",
+                "duplicate": True,
+                "agent_key": lock_item.get("agent_key"),
+                "active_chat_count": active_chat_count(agent["agent_key"]),
+                "lock": lock_item,
+            }
+
+        update_live_agent_capacity_state(callback, pointer_session_id, "active", agent, lock_item)
+        return {
+            "status": "active",
+            "agent_key": agent["agent_key"],
+            "active_chat_count": active_chat_count(agent["agent_key"]),
+            "lock": lock_item,
+        }
+
+    lock_item = create_ticket_chat_lock(callback, agent, "waiting", now_iso)
+    update_live_agent_capacity_state(callback, pointer_session_id, "waiting", agent, lock_item)
+    return {
+        "status": "waiting",
+        "agent_key": agent["agent_key"],
+        "active_chat_count": active_chat_count(agent["agent_key"]),
+        "lock": lock_item,
+    }
+
+
+def release_chat_lock_for_ticket(ticket_key):
+    if not agent_chat_lock_table:
+        return {}
+
+    lock_item = get_chat_lock(ticket_key)
+    if lock_item.get("lock_status") != "active":
+        return {
+            "released": False,
+            "reason": "not_active",
+            "lock": lock_item,
+        }
+
+    now_iso = utc_now_iso()
+    agent_chat_lock_table.update_item(
+        Key={"lock_id": lock_item["lock_id"]},
+        UpdateExpression="""
+            SET
+                lock_status = :released,
+                released_at = :now,
+                updated_at = :now,
+                #ttl = :ttl
+        """,
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues={
+            ":released": "released",
+            ":now": now_iso,
+            ":ttl": ttl_epoch(),
+        },
+    )
+    release_agent_slot(lock_item.get("slot_lock_id"), now_iso)
+    return {
+        "released": True,
+        "agent_key": lock_item.get("agent_key"),
+        "lock": lock_item,
+    }
+
+
+def waiting_chat_locks(agent_key):
+    items = scan_chat_locks(
+        Attr("record_type").eq("ticket_lock")
+        & Attr("agent_key").eq(agent_key)
+        & Attr("lock_status").eq("waiting")
+    )
+    return sorted(items, key=lambda item: text_or_empty(item.get("queued_at")) or text_or_empty(item.get("created_at")))
+
+
+def acquire_queue_promotion_notice(pointer_session_id):
+    if not (session_table and pointer_session_id):
+        return False
+
+    now_iso = utc_now_iso()
+    try:
+        session_table.update_item(
+            Key={"session_id": pointer_session_id},
+            UpdateExpression="""
+                SET
+                    live_agent_queue_promotion_slack_status = :posting,
+                    live_agent_queue_promotion_started_at = :now,
+                    updated_at = :now,
+                    #ttl = :ttl
+            """,
+            ConditionExpression=Attr("live_agent_queue_promotion_slack_status").not_exists(),
+            ExpressionAttributeNames={"#ttl": "ttl"},
+            ExpressionAttributeValues={
+                ":posting": "posting",
+                ":now": now_iso,
+                ":ttl": ttl_epoch(),
+            },
+        )
+        return True
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def mark_queue_promotion_notice(pointer_session_id, status, result=None, error=None):
+    if not (session_table and pointer_session_id):
+        return
+
+    now_iso = utc_now_iso()
+    values = {
+        ":status": status,
+        ":now": now_iso,
+        ":ttl": ttl_epoch(),
+    }
+    expression = """
+        SET
+            live_agent_queue_promotion_slack_status = :status,
+            updated_at = :now,
+            #ttl = :ttl
+    """
+    if result and result.get("ts"):
+        expression += """,
+            live_agent_queue_promotion_slack_ts = :slack_ts,
+            live_agent_queue_promotion_sent_at = :now
+        """
+        values[":slack_ts"] = result["ts"]
+    if error:
+        expression += """,
+            live_agent_queue_promotion_slack_error = :error
+        """
+        values[":error"] = str(error)
+
+    session_table.update_item(
+        Key={"session_id": pointer_session_id},
+        UpdateExpression=expression,
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues=values,
+    )
+
+
+def promote_oldest_waiting_chat(agent_key):
+    if not (agent_chat_lock_table and agent_key):
+        return {
+            "promoted": False,
+            "reason": "missing_agent_or_table",
+        }
+
+    for waiting_lock in waiting_chat_locks(agent_key):
+        callback = {
+            "ticket_key": waiting_lock.get("ticket_key"),
+            "ticket_url": waiting_lock.get("ticket_url"),
+            "session_id": waiting_lock.get("session_id"),
+            "slack_channel": waiting_lock.get("slack_channel"),
+            "slack_thread_ts": waiting_lock.get("slack_thread_ts"),
+            "slack_user": waiting_lock.get("slack_user"),
+        }
+        agent = {
+            "agent_key": waiting_lock.get("agent_key") or "",
+            "account_id": waiting_lock.get("agent_account_id") or "",
+            "email": waiting_lock.get("agent_email") or "",
+            "display_name": waiting_lock.get("agent_display_name") or "",
+            "source": waiting_lock.get("agent_source") or "queue",
+        }
+        now_iso = utc_now_iso()
+        slot = acquire_agent_slot(agent, callback, now_iso)
+        if not slot:
+            return {
+                "promoted": False,
+                "reason": "capacity_full",
+            }
+
+        try:
+            agent_chat_lock_table.update_item(
+                Key={"lock_id": waiting_lock["lock_id"]},
+                UpdateExpression="""
+                    SET
+                        lock_status = :active,
+                        slot_lock_id = :slot_lock_id,
+                        slot_number = :slot_number,
+                        activated_at = :now,
+                        updated_at = :now,
+                        #ttl = :ttl
+                """,
+                ConditionExpression=Attr("lock_status").eq("waiting"),
+                ExpressionAttributeNames={"#ttl": "ttl"},
+                ExpressionAttributeValues={
+                    ":active": "active",
+                    ":slot_lock_id": slot["lock_id"],
+                    ":slot_number": slot["slot_number"],
+                    ":now": now_iso,
+                    ":ttl": ttl_epoch(),
+                },
+            )
+        except ClientError as error:
+            release_agent_slot(slot["lock_id"], now_iso)
+            if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                continue
+            raise
+
+        promoted_lock = {
+            **waiting_lock,
+            "lock_status": "active",
+            "slot_lock_id": slot["lock_id"],
+            "slot_number": slot["slot_number"],
+            "activated_at": now_iso,
+        }
+        pointer_session_id = f"live_agent_ticket:{waiting_lock['ticket_key']}"
+        update_live_agent_capacity_state(callback, pointer_session_id, "active", agent, promoted_lock)
+
+        slack_result = {"attempted": False}
+        if waiting_lock.get("slack_channel") and acquire_queue_promotion_notice(pointer_session_id):
+            try:
+                slack_result = post_slack_message(
+                    waiting_lock["slack_channel"],
+                    live_agent_promoted_reply(waiting_lock.get("ticket_key"), waiting_lock.get("ticket_url")),
+                    text_or_empty(waiting_lock.get("slack_thread_ts")),
+                )
+                mark_queue_promotion_notice(pointer_session_id, "sent", result=slack_result)
+            except Exception as error:
+                mark_queue_promotion_notice(pointer_session_id, "failed", error=error)
+                log_json({
+                    "level": "ERROR",
+                    "message": "live_agent_queue_promotion_slack_failed",
+                    "ticket_key": waiting_lock.get("ticket_key"),
+                    "error": str(error),
+                })
+                slack_result = {
+                    "attempted": True,
+                    "ok": False,
+                    "error": str(error),
+                }
+
+        return {
+            "promoted": True,
+            "ticket_key": waiting_lock.get("ticket_key"),
+            "agent_key": agent_key,
+            "slot_lock_id": slot["lock_id"],
+            "slack": slack_result,
+        }
+
+    return {
+        "promoted": False,
+        "reason": "queue_empty",
+    }
 
 
 def update_live_agent_session(callback):
@@ -354,6 +1196,10 @@ def update_live_agent_session(callback):
         "live_agent_jira_project": callback.get("jira_project"),
         "live_agent_issue_type": callback.get("issue_type"),
         "live_agent_portal_request_type": callback.get("portal_request_type"),
+        "live_agent_assignee_account_id": callback.get("assignee_account_id"),
+        "live_agent_assignee_display_name": callback.get("assignee_display_name"),
+        "live_agent_assignee_email": callback.get("assignee_email"),
+        "live_agent_user_request": callback.get("user_request"),
     }
 
     for attribute_name, attribute_value in optional_fields.items():
@@ -396,6 +1242,10 @@ def put_live_agent_ticket_pointer(callback):
         "slack_channel": callback.get("slack_channel") or "",
         "slack_thread_ts": callback.get("slack_thread_ts") or "",
         "slack_user": callback.get("slack_user") or "",
+        "assignee_account_id": callback.get("assignee_account_id") or "",
+        "assignee_display_name": callback.get("assignee_display_name") or "",
+        "assignee_email": callback.get("assignee_email") or "",
+        "user_request": callback.get("user_request") or "",
         "created_at": now_iso,
         "updated_at": now_iso,
         "ttl": ttl_epoch(),
@@ -414,6 +1264,10 @@ def put_live_agent_ticket_pointer(callback):
                 slack_channel = :slack_channel,
                 slack_thread_ts = :slack_thread_ts,
                 slack_user = :slack_user,
+                assignee_account_id = :assignee_account_id,
+                assignee_display_name = :assignee_display_name,
+                assignee_email = :assignee_email,
+                user_request = :user_request,
                 created_at = if_not_exists(created_at, :created_at),
                 updated_at = :updated_at,
                 #ttl = :ttl
@@ -429,6 +1283,10 @@ def put_live_agent_ticket_pointer(callback):
             ":slack_channel": item["slack_channel"],
             ":slack_thread_ts": item["slack_thread_ts"],
             ":slack_user": item["slack_user"],
+            ":assignee_account_id": item["assignee_account_id"],
+            ":assignee_display_name": item["assignee_display_name"],
+            ":assignee_email": item["assignee_email"],
+            ":user_request": item["user_request"],
             ":created_at": item["created_at"],
             ":updated_at": item["updated_at"],
             ":ttl": item["ttl"],
@@ -575,8 +1433,8 @@ def is_public_comment_callback(callback):
 
 
 def normalize_status_callback(event):
-    callback = parse_api_gateway_body(event) if isinstance(event, dict) and "body" in event else event
-    callback = callback if isinstance(callback, dict) else {}
+    base = normalize_callback(event)
+    callback = base["raw_callback"]
     status = first_text(
         callback.get("ticket_status"),
         callback.get("status"),
@@ -590,8 +1448,7 @@ def normalize_status_callback(event):
     normalized_status = normalize_live_agent_status(status)
 
     return {
-        "event_type": callback_event_type(callback),
-        "ticket_key": normalize_ticket_key(callback),
+        **base,
         "ticket_status": status,
         "live_agent_status": normalized_status,
         "transition_to": first_text(
@@ -606,7 +1463,6 @@ def normalize_status_callback(event):
             nested_get(callback, "issue", "fields", "updated"),
             nested_get(callback, "createdIssue", "fields", "updated"),
         ),
-        "raw_callback": callback,
     }
 
 
@@ -618,18 +1474,16 @@ def boolish_true(value):
 
 
 def normalize_public_comment_callback(event):
-    callback = parse_api_gateway_body(event) if isinstance(event, dict) and "body" in event else event
-    callback = callback if isinstance(callback, dict) else {}
+    base = normalize_callback(event)
+    callback = base["raw_callback"]
 
     comment = callback.get("comment") if isinstance(callback.get("comment"), dict) else {}
     author = comment.get("author") if isinstance(comment.get("author"), dict) else {}
 
     return {
-        "event_type": callback_event_type(callback),
+        **base,
         "source": text_or_empty(callback.get("source")),
         "from_slack": boolish_true(callback.get("from_slack")),
-        "ticket_key": normalize_ticket_key(callback),
-        "ticket_url": normalize_ticket_url(callback, normalize_ticket_key(callback)),
         "ticket_status": first_text(
             callback.get("ticket_status"),
             callback.get("status"),
@@ -655,7 +1509,6 @@ def normalize_public_comment_callback(event):
             callback.get("created"),
             comment.get("created"),
         ),
-        "raw_callback": callback,
     }
 
 
@@ -975,6 +1828,164 @@ def handle_live_agent_public_comment_added(event):
     }
 
 
+TERMINAL_TICKET_STATUSES = {
+    "resolved",
+    "done",
+    "closed",
+    "cancelled",
+    "canceled",
+}
+
+
+def normalized_ticket_status_text(status):
+    return text_or_empty(status).lower().replace("_", " ").replace("-", " ").strip()
+
+
+def is_terminal_ticket_status(status):
+    return normalized_ticket_status_text(status) in TERMINAL_TICKET_STATUSES
+
+
+def drain_live_agent_queue():
+    queue_item = chat_locks.pop_oldest_waiting_request()
+    if not queue_item:
+        return {
+            "drained": False,
+            "reason": "queue_empty",
+        }
+
+    ticket_key = queue_item.get("ticket_key") or ""
+    oncall_user = get_current_oncall_user(ticket_key=ticket_key, webhook_payload={})
+    if not oncall_user.get("ok"):
+        chat_locks.mark_queue_item_waiting_again(queue_item, "no_oncall_user")
+        return {
+            "drained": False,
+            "reason": "no_oncall_user",
+            "ticket_key": ticket_key,
+        }
+
+    ticket = {
+        "ticket_key": ticket_key,
+        "ticket_url": queue_item.get("ticket_url") or "",
+        "status": queue_item.get("ticket_status") or "",
+    }
+    slack_context = {
+        "session_id": queue_item.get("session_id") or "",
+        "slack_channel": queue_item.get("slack_channel") or "",
+        "slack_thread_ts": queue_item.get("slack_thread_ts") or "",
+        "slack_user": queue_item.get("slack_user") or "",
+    }
+    lock_result = chat_locks.acquire_chat_lock(
+        live_agent_agent_from_oncall(oncall_user),
+        ticket,
+        slack_context,
+    )
+
+    if lock_result.get("ok"):
+        chat_locks.mark_queue_item_assigned(queue_item, live_agent_agent_from_oncall(oncall_user), ticket_key)
+        slack_result = {"attempted": False}
+        if queue_item.get("slack_channel"):
+            try:
+                slack_result = post_slack_message(
+                    queue_item["slack_channel"],
+                    live_agent_assigned_reply(ticket_key, queue_item.get("ticket_url"), oncall_user.get("display_name")),
+                    text_or_empty(queue_item.get("slack_thread_ts")),
+                )
+            except Exception as error:
+                log_json({
+                    "level": "ERROR",
+                    "message": "live_agent_queue_assignment_slack_failed",
+                    "ticket_key": ticket_key,
+                    "error": str(error),
+                })
+                slack_result = {
+                    "attempted": True,
+                    "ok": False,
+                    "error": str(error),
+                }
+
+        return {
+            "drained": True,
+            "ticket_key": ticket_key,
+            "agent_account_id": oncall_user.get("account_id"),
+            "lock": lock_result,
+            "slack": slack_result,
+        }
+
+    if lock_result.get("reason") == "agent_at_capacity":
+        chat_locks.mark_queue_item_waiting_again(queue_item, "agent_at_capacity")
+        return {
+            "drained": False,
+            "reason": "agent_at_capacity",
+            "ticket_key": ticket_key,
+            "lock": lock_result,
+        }
+
+    chat_locks.mark_queue_item_failed(queue_item, lock_result.get("reason") or "lock_failed")
+    return {
+        "drained": False,
+        "reason": lock_result.get("reason") or "lock_failed",
+        "ticket_key": ticket_key,
+        "lock": lock_result,
+    }
+
+
+def recover_latest_requested_live_agent_session():
+    if not session_table:
+        return {}
+
+    try:
+        response = session_table.scan(
+            FilterExpression=Attr("support_options_status").eq("live_agent_requested"),
+            Limit=25,
+        )
+    except Exception as error:
+        log_json({
+            "level": "WARN",
+            "message": "live_agent_recover_latest_requested_session_failed",
+            "error": str(error),
+        })
+        return {}
+
+    items = response.get("Items") or []
+    if not items:
+        return {}
+
+    return max(
+        items,
+        key=lambda item: text_or_empty(
+            item.get("live_agent_requested_at")
+            or item.get("live_agent_updated_at")
+            or item.get("updated_at")
+            or item.get("created_at")
+        ),
+    )
+
+
+def enrich_missing_slack_context(callback):
+    if callback.get("session_id") and callback.get("slack_channel") and callback.get("slack_user"):
+        return callback
+
+    if any(callback.get(field) for field in ("session_id", "slack_channel", "slack_user")):
+        return callback
+
+    recovered = normalize_callback(recover_latest_requested_live_agent_session())
+    if not any(recovered.get(field) for field in ("session_id", "slack_channel", "slack_thread_ts", "slack_user")):
+        return callback
+
+    enriched = {**callback}
+    for field in ("session_id", "session_root_ts", "slack_channel", "slack_thread_ts", "slack_user"):
+        if not enriched.get(field) and recovered.get(field):
+            enriched[field] = recovered[field]
+    enriched["slack"] = canonical_slack_context(
+        enriched.get("session_id"),
+        enriched.get("session_root_ts"),
+        enriched.get("slack_channel"),
+        enriched.get("slack_thread_ts"),
+        enriched.get("slack_user"),
+    )["slack"]
+    return enriched
+
+
 def handle_live_agent_status_changed(event):
     callback = normalize_status_callback(event)
     if not callback.get("ticket_key"):
@@ -1042,6 +2053,46 @@ def handle_live_agent_status_changed(event):
                 "error": str(error),
             }
 
+    terminal_status = is_terminal_ticket_status(callback.get("ticket_status"))
+    lock_release = {"ok": True, "released": False}
+    queue_drain = {"drained": False, "reason": "not_terminal"}
+    if terminal_status:
+        try:
+            lock_release = chat_locks.release_chat_lock(
+                callback["ticket_key"],
+                close_reason=callback.get("ticket_status"),
+            )
+            if lock_release.get("released"):
+                queue_drain = drain_live_agent_queue()
+            else:
+                queue_drain = {
+                    "drained": False,
+                    "reason": "lock_not_released",
+                }
+        except Exception as error:
+            log_json({
+                "level": "ERROR",
+                "message": "live_agent_chat_lock_release_failed",
+                "ticket_key": callback["ticket_key"],
+                "ticket_status": callback.get("ticket_status"),
+                "error": str(error),
+            })
+            lock_release = {
+                "ok": False,
+                "released": False,
+                "error": str(error),
+            }
+
+    log_json({
+        "level": "INFO",
+        "message": "live_agent_status_lock_release_checked",
+        "ticket_key": callback["ticket_key"],
+        "ticket_status": callback.get("ticket_status"),
+        "terminal_status": terminal_status,
+        "lock_released": bool(lock_release.get("released")),
+        "released_agent_account_id": lock_release.get("agent_account_id"),
+    })
+
     return {
         "ok": True,
         "event_type": callback.get("event_type"),
@@ -1051,34 +2102,135 @@ def handle_live_agent_status_changed(event):
         "pointer_session_id": pointer_session_id,
         "target_session_id": target_session_id,
         "event_marker_session_id": marker.get("session_id"),
+        "lock_release": lock_release,
+        "queue_drain": queue_drain,
         "slack": slack_result,
     }
 
 
 def handle_jsm_callback(event):
-    callback = normalize_callback(event)
-    if not callback.get("session_id"):
-        return {
-            "ok": False,
-            "error": "Missing callback session_id",
-            "error_code": "missing_session_id",
-        }
+    callback = enrich_missing_slack_context(normalize_callback(event))
 
-    if not callback.get("ticket_key"):
+    log_json({
+        "level": "INFO",
+        "message": "live_agent_ticket_created_payload_normalized",
+        "event_type": callback.get("event_type"),
+        "ticket_key": callback.get("ticket_key"),
+        "assignee_account_id": callback.get("assignee_account_id"),
+        "assignee_display_name": callback.get("assignee_display_name"),
+        "slack_channel": callback.get("slack_channel"),
+        "slack_thread_ts": callback.get("slack_thread_ts"),
+        "session_id": callback.get("session_id"),
+    })
+
+    required_fields = {
+        "ticket_key": "missing_ticket_key",
+        "slack_channel": "missing_slack_channel",
+        "slack_user": "missing_slack_user",
+        "session_id": "missing_session_id",
+    }
+    missing_fields = [
+        field for field in required_fields
+        if not callback.get(field)
+    ]
+
+    if missing_fields:
         return {
             "ok": False,
-            "error": "Missing callback ticket_key",
-            "error_code": "missing_ticket_key",
+            "error": f"Missing required callback field(s): {', '.join(missing_fields)}",
+            "error_code": required_fields[missing_fields[0]],
+            "missing_fields": missing_fields,
+            "event_type": callback.get("event_type"),
+            "ticket_key": callback.get("ticket_key"),
+            "slack_channel": callback.get("slack_channel"),
+            "slack_user": callback.get("slack_user"),
+            "session_id": callback.get("session_id"),
         }
 
     update_live_agent_session(callback)
     pointer_session_id = put_live_agent_ticket_pointer(callback)
 
+    ticket = callback_ticket(callback)
+    slack_context = callback_slack_context(callback)
+    oncall_user = get_current_oncall_user(
+        ticket_key=callback["ticket_key"],
+        webhook_payload=callback.get("raw_callback") or {},
+    )
+    lock_result = {"ok": False, "reason": "not_attempted"}
+    queue_result = None
+    live_agent_status = "ticket_created"
+    lock_acquired = False
+    queued = False
+
+    if oncall_user.get("ok"):
+        lock_result = chat_locks.acquire_chat_lock(
+            live_agent_agent_from_oncall(oncall_user),
+            ticket,
+            slack_context,
+        )
+        if lock_result.get("ok"):
+            lock_acquired = True
+            reply = live_agent_assigned_reply(
+                callback.get("ticket_key"),
+                callback.get("ticket_url"),
+                oncall_user.get("display_name"),
+            )
+            live_agent_status = "ticket_created"
+        elif lock_result.get("reason") == "agent_at_capacity":
+            queue_result = chat_locks.enqueue_live_agent_request(
+                ticket,
+                slack_context,
+                reason="agent_at_capacity",
+            )
+            queued = True
+            reply = live_agent_busy_queue_reply(callback.get("ticket_key"))
+            live_agent_status = "queued"
+        else:
+            queue_result = chat_locks.enqueue_live_agent_request(
+                ticket,
+                slack_context,
+                reason=lock_result.get("reason") or "lock_failed",
+            )
+            queued = True
+            reply = live_agent_busy_queue_reply(callback.get("ticket_key"))
+            live_agent_status = "queued"
+    else:
+        queue_result = chat_locks.enqueue_live_agent_request(
+            ticket,
+            slack_context,
+            reason="no_oncall_user",
+        )
+        queued = True
+        reply = live_agent_no_oncall_queue_reply(callback.get("ticket_key"))
+        live_agent_status = "queued"
+
+    log_json({
+        "level": "INFO",
+        "message": "live_agent_ticket_created_assignment_decision",
+        "event_type": callback.get("event_type"),
+        "ticket_key": callback.get("ticket_key"),
+        "session_id": callback.get("session_id"),
+        "slack_channel": callback.get("slack_channel"),
+        "slack_thread_ts": callback.get("slack_thread_ts"),
+        "oncall_ok": oncall_user.get("ok"),
+        "oncall_source": oncall_user.get("source"),
+        "assignee_account_id": oncall_user.get("account_id"),
+        "assignee_display_name": oncall_user.get("display_name"),
+        "lock_acquired": lock_acquired,
+        "queued": queued,
+        "lock_reason": lock_result.get("reason"),
+        "queue_reason": (queue_result or {}).get("reason"),
+    })
+
     slack_result = {"attempted": False, "deduped": False}
     if callback.get("slack_channel"):
         if acquire_slack_confirmation(callback, pointer_session_id):
             try:
-                slack_result = post_slack_ticket(callback)
+                slack_result = post_slack_message(
+                    callback["slack_channel"],
+                    reply,
+                    callback.get("slack_thread_ts"),
+                )
                 mark_slack_confirmation(pointer_session_id, "sent", result=slack_result)
             except Exception as error:
                 mark_slack_confirmation(pointer_session_id, "failed", error=error)
@@ -1097,19 +2249,30 @@ def handle_jsm_callback(event):
         else:
             slack_result = {"attempted": False, "deduped": True}
 
-    reply = live_agent_ticket_reply(callback.get("ticket_key"), callback.get("ticket_url"))
     return {
         "ok": True,
         "session_id": callback["session_id"],
         "ticket_key": callback["ticket_key"],
         "ticket_url": callback.get("ticket_url"),
         "pointer_session_id": pointer_session_id,
+        "assignee_account_id": callback.get("assignee_account_id"),
+        "assignee_display_name": callback.get("assignee_display_name"),
+        "assignee_email": callback.get("assignee_email"),
+        "slack_channel": callback.get("slack_channel"),
+        "slack_thread_ts": callback.get("slack_thread_ts"),
+        "slack_user": callback.get("slack_user"),
+        "user_request": callback.get("user_request"),
         "live_agent_jira_project": callback.get("jira_project"),
         "live_agent_issue_type": callback.get("issue_type"),
         "live_agent_portal_request_type": callback.get("portal_request_type"),
         "ticket_status": callback.get("ticket_status"),
         "status": callback.get("ticket_status"),
-        "live_agent_status": "ticket_created",
+        "live_agent_status": live_agent_status,
+        "oncall_user": oncall_user,
+        "lock": lock_result,
+        "queue": queue_result,
+        "lock_acquired": lock_acquired,
+        "queued": queued,
         "reply": reply,
         "message": reply,
         "slack": slack_result,
@@ -1176,10 +2339,33 @@ def lex_conversation_summary(event, description):
     return "\n".join(parts) or "User requested live agent support from IVY."
 
 
+def handoff_slack_context_from_lex(event):
+    normalized = normalize_callback(event)
+    return canonical_slack_context(
+        normalized.get("session_id"),
+        normalized.get("session_root_ts"),
+        normalized.get("slack_channel"),
+        normalized.get("slack_thread_ts"),
+        normalized.get("slack_user"),
+    )
+
+
+def handoff_slack_context_from_worker(event):
+    normalized = normalize_callback(event)
+    return canonical_slack_context(
+        normalized.get("session_id"),
+        normalized.get("session_root_ts"),
+        normalized.get("slack_channel"),
+        normalized.get("slack_thread_ts"),
+        normalized.get("slack_user"),
+    )
+
+
 def from_lex_event(event, config):
     attrs = lex_session_attributes(event)
     slots = ((event.get("sessionState") or {}).get("intent") or {}).get("slots") or {}
     config_params = parse_json_map((config or {}).get("parameters"))
+    slack_context = handoff_slack_context_from_lex(event)
     description = (
         get_slot_value(slots, "jira_description")
         or event.get("inputTranscript")
@@ -1190,14 +2376,14 @@ def from_lex_event(event, config):
     return {
         "type": "live_agent_handoff",
         "source": "lex",
-        "session_id": event.get("sessionId"),
+        **slack_context,
         "intent_name": lex_intent_name(event),
         "title": attrs.get("title") or (config or {}).get("title") or "Live agent support request",
         "description": description,
         "conversation_summary": attrs.get("conversation_summary") or lex_conversation_summary(event, description),
         "conversation_text": attrs.get("conversation_text") or lex_conversation_summary(event, description),
-        "requestType": (config or {}).get("requestType"),
-        "branching": (config or {}).get("branching"),
+        "requestType": (config or {}).get("requestType") or LIVE_AGENT_DEFAULT_REQUEST_TYPE,
+        "branching": (config or {}).get("branching") or LIVE_AGENT_DEFAULT_BRANCHING,
         "assignment": {
             "assignee": config_params.get("assignee"),
             "projectParams": config_params.get("projectParams") or config_params.get("assignee"),
@@ -1207,12 +2393,7 @@ def from_lex_event(event, config):
             "additionsDetails": [],
             "slackMessage": [],
         },
-        "slack": {
-            "threadTs": attrs.get("slackThreadTs"),
-            "channelId": attrs.get("slackChannelId"),
-            "userId": attrs.get("slackUserId"),
-        },
-        "user": attrs.get("slackUserId"),
+        "user": slack_context["slack_user"],
         "email": attrs.get("email"),
         "atlassianAccountId": attrs.get("atlassianAccountId"),
         "config": config,
@@ -1223,18 +2404,24 @@ def from_worker_event(event, config):
     config_params = parse_json_map((config or event.get("config") or {}).get("parameters"))
     incoming_config = event.get("config") if isinstance(event.get("config"), dict) else {}
     effective_config = config or incoming_config
-    slack = event.get("slack") or {}
+    slack = event.get("slack") if isinstance(event.get("slack"), dict) else {}
+    slack_context = handoff_slack_context_from_worker(event)
+    canonical_slack = {
+        **slack,
+        **slack_context["slack"],
+    }
 
     return {
         **event,
         "type": "live_agent_handoff",
         "source": event.get("source") or "slack",
+        **{key: value for key, value in slack_context.items() if key != "slack"},
         "title": event.get("title") or effective_config.get("title") or "Live agent support request",
         "description": event.get("description") or event.get("raw_text") or "",
         "conversation_summary": event.get("conversation_summary"),
         "conversation_text": event.get("conversation_text"),
-        "requestType": event.get("requestType") or effective_config.get("requestType"),
-        "branching": event.get("branching") or effective_config.get("branching"),
+        "requestType": event.get("requestType") or effective_config.get("requestType") or LIVE_AGENT_DEFAULT_REQUEST_TYPE,
+        "branching": event.get("branching") or effective_config.get("branching") or LIVE_AGENT_DEFAULT_BRANCHING,
         "assignment": {
             **(event.get("assignment") or {}),
             "assignee": (event.get("assignment") or {}).get("assignee") or config_params.get("assignee"),
@@ -1249,7 +2436,8 @@ def from_worker_event(event, config):
             "additionsDetails": [],
             "slackMessage": [],
         },
-        "slack": slack,
+        "slack": canonical_slack,
+        "user": slack_context["slack_user"],
         "conversation": compact_conversation(event),
         "config": effective_config,
     }
@@ -1320,15 +2508,49 @@ def reply_from_webhook(result):
     return SUCCESS_REPLY if result.get("ok") else FAILURE_REPLY
 
 
+def validate_api_handoff_payload(payload):
+    context = handoff_slack_context_from_worker(payload)
+    missing_fields = [
+        field for field in ("session_id", "slack_channel", "slack_user")
+        if not context.get(field)
+    ]
+    if not first_text(payload.get("description"), payload.get("conversation_summary")):
+        missing_fields.append("description_or_conversation_summary")
+
+    if missing_fields:
+        return {
+            "ok": False,
+            "error": "Invalid live agent handoff payload",
+            "error_code": "invalid_live_agent_handoff_payload",
+            "missing_fields": missing_fields,
+            "session_id": context.get("session_id"),
+            "session_root_ts": context.get("session_root_ts"),
+            "slack_channel": context.get("slack_channel"),
+            "slack_thread_ts": context.get("slack_thread_ts"),
+            "slack_user": context.get("slack_user"),
+        }
+
+    return {"ok": True, **context}
+
+
 def lambda_handler(event, context):
     api_gateway_event = isinstance(event, dict) and "body" in event
     effective_event = parse_api_gateway_body(event) if api_gateway_event else event
     effective_event = effective_event if isinstance(effective_event, dict) else {}
+    received_context = (
+        normalize_callback(effective_event)
+        if is_jsm_callback(effective_event) or is_unsupported_jsm_callback(effective_event)
+        else handoff_slack_context_from_worker(effective_event)
+    )
 
     log_json({
         "level": "INFO",
         "message": "live_agent_received",
-        "session_id": effective_event.get("session_id") or effective_event.get("sessionId"),
+        "session_id": received_context.get("session_id"),
+        "session_root_ts": received_context.get("session_root_ts"),
+        "slack_channel": received_context.get("slack_channel"),
+        "slack_thread_ts": received_context.get("slack_thread_ts"),
+        "slack_user": received_context.get("slack_user"),
         "intent_name": lex_intent_name(effective_event),
         "api_gateway_event": api_gateway_event,
         "callback": is_jsm_callback(effective_event),
@@ -1373,6 +2595,22 @@ def lambda_handler(event, context):
             }
             return api_response(202, result) if api_gateway_event else result
 
+        if api_gateway_event:
+            validation = validate_api_handoff_payload(effective_event)
+            if not validation.get("ok"):
+                log_json({
+                    "level": "ERROR",
+                    "message": "live_agent_invalid_handoff_payload",
+                    "session_id": validation.get("session_id"),
+                    "session_root_ts": validation.get("session_root_ts"),
+                    "slack_channel": validation.get("slack_channel"),
+                    "slack_thread_ts": validation.get("slack_thread_ts"),
+                    "slack_user": validation.get("slack_user"),
+                    "missing_fields": validation.get("missing_fields"),
+                    "error_code": validation.get("error_code"),
+                })
+                return api_response(400, validation)
+
         payload = build_handoff_payload(effective_event)
         result = call_webhook(payload)
         reply = reply_from_webhook(result)
@@ -1381,6 +2619,8 @@ def lambda_handler(event, context):
             "level": "INFO" if result.get("ok") else "ERROR",
             "message": "live_agent_completed",
             "session_id": payload.get("session_id"),
+            "request_type": payload.get("requestType"),
+            "branching": payload.get("branching"),
             "ok": result.get("ok"),
             "status": result.get("status"),
             "error_code": result.get("error_code"),
@@ -1398,7 +2638,8 @@ def lambda_handler(event, context):
         log_json({
             "level": "ERROR",
             "message": "live_agent_http_error",
-            "session_id": effective_event.get("session_id") or effective_event.get("sessionId"),
+            "session_id": received_context.get("session_id"),
+            "session_root_ts": received_context.get("session_root_ts"),
             "status": error.code,
         })
         result = {
@@ -1415,7 +2656,8 @@ def lambda_handler(event, context):
         log_json({
             "level": "ERROR",
             "message": "live_agent_failed",
-            "session_id": effective_event.get("session_id") or effective_event.get("sessionId"),
+            "session_id": received_context.get("session_id"),
+            "session_root_ts": received_context.get("session_root_ts"),
             "error": str(error),
         })
         result = {

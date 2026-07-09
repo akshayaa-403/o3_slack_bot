@@ -58,9 +58,11 @@ LIVE_AGENT_FUNCTION = os.environ.get("LIVE_AGENT_FUNCTION")
 LIVE_AGENT_WEBHOOK_URL = os.environ.get("LIVE_AGENT_WEBHOOK_URL") or os.environ.get("AUTOMATION_WEBHOOK_URL")
 LIVE_AGENT_CONFIG_TABLE = os.environ.get("LIVE_AGENT_CONFIG_TABLE") or os.environ.get("CONFIG_TABLE")
 LIVE_AGENT_CONFIG_INTENT = os.environ.get("LIVE_AGENT_CONFIG_INTENT", "LiveAgent")
+LIVE_AGENT_DEFAULT_REQUEST_TYPE = os.environ.get("LIVE_AGENT_DEFAULT_REQUEST_TYPE", "live_agent")
+LIVE_AGENT_DEFAULT_BRANCHING = os.environ.get("LIVE_AGENT_DEFAULT_BRANCHING", "live_agent")
 LIVE_AGENT_WEBHOOK_TIMEOUT_SECONDS = int(os.environ.get("LIVE_AGENT_WEBHOOK_TIMEOUT_SECONDS", "10"))
-ENABLE_REQUEST_AI_SUMMARY = os.environ.get("ENABLE_REQUEST_AI_SUMMARY", "true").lower() == "true"
-REQUEST_SUMMARY_MODEL_ID = os.environ.get("REQUEST_SUMMARY_MODEL_ID", "amazon.nova-2-lite-v1:0")
+ENABLE_REQUEST_AI_SUMMARY = os.environ.get("ENABLE_REQUEST_AI_SUMMARY", "false").lower() == "true"
+REQUEST_SUMMARY_MODEL_ID = os.environ.get("REQUEST_SUMMARY_MODEL_ID")
 REQUEST_SUMMARY_MAX_TOKENS = int(os.environ.get("REQUEST_SUMMARY_MAX_TOKENS", "180"))
 REQUEST_SUMMARY_TEMPERATURE = float(os.environ.get("REQUEST_SUMMARY_TEMPERATURE", "0.1"))
 SUMMARIZER_FUNCTION_NAME = os.environ.get("SUMMARIZER_FUNCTION_NAME")
@@ -73,7 +75,7 @@ IMAGE_ANALYSIS_UNAVAILABLE_REPLY = os.environ.get(
 SCREENSHOT_MATCH_ENABLED = os.environ.get("SCREENSHOT_MATCH_ENABLED", "true").lower() == "true"
 SCREENSHOT_ISSUE_TABLE = os.environ.get("SCREENSHOT_ISSUE_TABLE", "o3_screenshot_issue_kb")
 SCREENSHOT_VECTOR_ENDPOINT = os.environ.get("SCREENSHOT_VECTOR_ENDPOINT", "").rstrip("/")
-SCREENSHOT_VECTOR_BACKEND = os.environ.get("SCREENSHOT_VECTOR_BACKEND", "opensearch").lower()
+SCREENSHOT_VECTOR_BACKEND = os.environ.get("SCREENSHOT_VECTOR_BACKEND").lower()
 SCREENSHOT_VECTOR_INDEX = os.environ.get("SCREENSHOT_VECTOR_INDEX", "o3-screenshot-issues")
 SCREENSHOT_VECTOR_FIELD = os.environ.get("SCREENSHOT_VECTOR_FIELD", "image_vector")
 SCREENSHOT_OPENSEARCH_SERVICE = os.environ.get("SCREENSHOT_OPENSEARCH_SERVICE", "aoss")
@@ -3176,7 +3178,10 @@ def build_final_support_result(session_item, claude_result, now_iso):
     )
     claude_reply = (claude_result.get("reply") or "").strip()
     claude_ok = bool(claude_result.get("ok") and claude_reply)
-    final_answer = claude_reply if claude_ok else CLAUDE_UNRESOLVED_REPLY
+    claude_disabled = claude_result.get("error") == "claude_fallback_disabled"
+    final_answer = claude_reply if claude_ok else (
+        lex_reply if claude_disabled and lex_reply else CLAUDE_UNRESOLVED_REPLY
+    )
     support_text = original_text
     support_raw = raw_text
 
@@ -3487,12 +3492,17 @@ def build_live_agent_payload(session_item, body, session_id, now_iso):
     slack_thread_ts = None if is_one_to_one_dm_conversation(conversation_metadata) else (
         session_item.get("thread_ts") or body.get("thread_ts") or session_root_ts
     )
+    slack_channel = body.get("channel") or session_item.get("channel") or ""
+    slack_user = body.get("user") or session_item.get("user") or ""
 
     payload = {
         "type": "live_agent_handoff",
         "source": "slack",
         "session_id": session_id,
         "session_root_ts": session_root_ts,
+        "slack_channel": slack_channel,
+        "slack_thread_ts": slack_thread_ts or "",
+        "slack_user": slack_user,
         "intent_name": LIVE_AGENT_CONFIG_INTENT,
         "configIntent": LIVE_AGENT_CONFIG_INTENT,
         "requested_at": now_iso,
@@ -3505,8 +3515,8 @@ def build_live_agent_payload(session_item, body, session_id, now_iso):
         "conversation_summary_usage": summary_result.get("usage", {}),
         "conversation_summary_error": summary_result.get("error"),
         "conversation_summary_fallback_used": summary_result.get("fallback_used", False),
-        "requestType": (config or {}).get("requestType"),
-        "branching": (config or {}).get("branching"),
+        "requestType": (config or {}).get("requestType") or LIVE_AGENT_DEFAULT_REQUEST_TYPE,
+        "branching": (config or {}).get("branching") or LIVE_AGENT_DEFAULT_BRANCHING,
         "assignment": {
             "assignee": config_parameters.get("assignee"),
             "projectParams": config_parameters.get("projectParams") or config_parameters.get("assignee"),
@@ -3517,15 +3527,15 @@ def build_live_agent_payload(session_item, body, session_id, now_iso):
             "slackMessage": [],
         },
         "slack": {
-            "channelId": body.get("channel") or session_item.get("channel"),
+            "channelId": slack_channel,
             "threadTs": slack_thread_ts,
-            "userId": body.get("user") or session_item.get("user"),
+            "userId": slack_user,
             "eventTs": body.get("ts"),
             "channelType": body.get("channel_type") or session_item.get("channel_type"),
             "conversationType": session_item.get("conversation_type"),
             "conversationMetadata": session_item.get("conversation_metadata") or {},
         },
-        "user": body.get("user") or session_item.get("user"),
+        "user": slack_user,
         "email": session_item.get("email") or session_item.get("user_email"),
         "atlassianAccountId": session_item.get("atlassianAccountId") or session_item.get("atlassian_account_id"),
         "conversation": compact_session_messages(session_item),
