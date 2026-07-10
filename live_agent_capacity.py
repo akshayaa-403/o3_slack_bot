@@ -20,7 +20,15 @@ JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "")
 JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
 JIRA_PROJECT_KEY = os.environ.get("JIRA_PROJECT_KEY", "")
 LIVE_AGENT_TIMEZONE = os.environ.get("LIVE_AGENT_TIMEZONE", "Asia/Kolkata")
-DEFAULT_AGENT_CAPACITY = int(os.environ.get("DEFAULT_AGENT_CAPACITY", "5"))
+DEFAULT_AGENT_CAPACITY = int(
+    os.environ.get(
+        "MAX_ACTIVE_CHATS_PER_AGENT",
+        os.environ.get("LIVE_AGENT_MAX_ACTIVE_CHATS", os.environ.get("DEFAULT_AGENT_CAPACITY", "5")),
+    )
+)
+CAPACITY_RECONCILE_ENABLED = os.environ.get("CAPACITY_RECONCILE_ENABLED", "true").lower() == "true"
+CAPACITY_RECONCILE_MAX_ITEMS = max(0, int(os.environ.get("CAPACITY_RECONCILE_MAX_ITEMS", "25")))
+JSM_SCHEDULE_SYNC_ENABLED = os.environ.get("JSM_SCHEDULE_SYNC_ENABLED", "true").lower() == "true"
 AUTO_CREATE_JSM_ONCALL_AGENTS = os.environ.get("AUTO_CREATE_JSM_ONCALL_AGENTS", "true").lower() == "true"
 AUTO_DISABLE_JSM_ONCALL_AGENTS = os.environ.get("AUTO_DISABLE_JSM_ONCALL_AGENTS", "true").lower() == "true"
 AUTO_ONCALL_AGENT_PRIORITY = int(os.environ.get("AUTO_ONCALL_AGENT_PRIORITY", "500"))
@@ -255,6 +263,94 @@ def get_jsm_oncall_user_ids(now=None):
     }
 
 
+def get_jsm_schedule_definitions():
+    if not JSM_ONCALL_SCHEDULE_IDS:
+        return {
+            "ok": False,
+            "schedules": [],
+            "error_code": "missing_jsm_oncall_schedule_ids",
+        }
+
+    schedules = []
+    results = []
+    for schedule_id in JSM_ONCALL_SCHEDULE_IDS:
+        safe_schedule_id = urllib.parse.quote(schedule_id, safe="")
+        result = jsm_ops_request(
+            "GET",
+            f"/api/{urllib.parse.quote(JSM_OPS_CLOUD_ID, safe='')}/v1/schedules/{safe_schedule_id}",
+        )
+        if result.get("ok") and isinstance(result.get("response"), dict):
+            schedule = result["response"]
+            schedule["id"] = schedule.get("id") or schedule_id
+            schedules.append(schedule)
+        results.append({
+            "schedule_id": schedule_id,
+            "ok": result.get("ok"),
+            "status": result.get("status"),
+            "error_code": result.get("error_code"),
+        })
+
+    ok = all(item.get("ok") for item in results)
+    return {
+        "ok": ok,
+        "schedules": schedules,
+        "schedule_results": results,
+        "error_code": None if ok else "jsm_schedule_lookup_failed",
+    }
+
+
+def hhmm_from_restriction(restriction, prefix):
+    hour = int(restriction.get(f"{prefix}Hour", 0))
+    minute = int(restriction.get(f"{prefix}Min", 0))
+    return f"{hour:02d}:{minute:02d}"
+
+
+def rotation_shift_window(rotation):
+    restrictions = (
+        (rotation.get("timeRestriction") or {}).get("restrictions")
+        if isinstance(rotation, dict)
+        else None
+    )
+    if not restrictions:
+        return {"shift_start": "00:00", "shift_end": "00:00"}
+
+    restriction = restrictions[0]
+    return {
+        "shift_start": hhmm_from_restriction(restriction, "start"),
+        "shift_end": hhmm_from_restriction(restriction, "end"),
+    }
+
+
+def rotation_participant_ids(rotation):
+    participant_ids = set()
+    for participant in rotation.get("participants") or []:
+        participant_ids.update(extract_oncall_user_ids(participant))
+    return participant_ids
+
+
+def schedule_metadata_by_oncall_user(schedule_result):
+    metadata = {}
+    if not schedule_result.get("ok"):
+        return metadata
+
+    for schedule in schedule_result.get("schedules") or []:
+        timezone_name = (
+            schedule.get("timezone")
+            or schedule.get("timeZone")
+            or LIVE_AGENT_TIMEZONE
+        )
+        for rotation in schedule.get("rotations") or []:
+            shift = rotation_shift_window(rotation)
+            for account_id in rotation_participant_ids(rotation):
+                metadata[account_id] = {
+                    **shift,
+                    "shift_name": rotation.get("name") or schedule.get("name") or "JSM_ONCALL",
+                    "timezone": timezone_name,
+                    "source": "jsm_oncall_sync",
+                }
+    return metadata
+
+
 def agent_matches_oncall_user(agent, oncall_user_ids):
     identifiers = {
         str(agent.get("jira_account_id") or "").strip(),
@@ -265,6 +361,102 @@ def agent_matches_oncall_user(agent, oncall_user_ids):
     }
     identifiers.discard("")
     return bool(identifiers & set(oncall_user_ids or []))
+
+
+def sync_oncall_schedule_fields(oncall_user_ids, existing_agents):
+    if not JSM_SCHEDULE_SYNC_ENABLED:
+        return {"ok": True, "enabled": False, "updated_agents": [], "disabled_agents": []}
+
+    oncall_user_ids = {
+        str(value).strip()
+        for value in oncall_user_ids or []
+        if str(value).strip()
+    }
+    if not oncall_user_ids:
+        return {
+            "ok": True,
+            "enabled": True,
+            "updated_agents": [],
+            "disabled_agents": [],
+            "reason": "no_current_oncall_users",
+        }
+
+    schedule_result = get_jsm_schedule_definitions()
+    metadata_by_account = schedule_metadata_by_oncall_user(schedule_result)
+    updated = []
+    disabled = []
+    errors = []
+
+    for agent in existing_agents or []:
+        identifiers = agent_oncall_identifiers(agent)
+        matched_ids = identifiers & oncall_user_ids
+        if not matched_ids:
+            continue
+
+        account_id = sorted(matched_ids)[0]
+        metadata = metadata_by_account.get(account_id)
+        if not metadata:
+            continue
+
+        assignable = jira_user_assignable(account_id)
+        enabled = bool(assignable.get("assignable"))
+        now_iso = utc_now_iso()
+        values = {
+            ":shift_start": metadata["shift_start"],
+            ":shift_end": metadata["shift_end"],
+            ":shift_name": metadata["shift_name"],
+            ":timezone": metadata["timezone"],
+            ":enabled": enabled,
+            ":updated_at": now_iso,
+            ":source": "jsm_oncall_sync",
+        }
+        names = {
+            "#timezone": "timezone",
+            "#source": "source",
+            "#reason": "auto_disabled_reason",
+        }
+        expression = (
+            "SET shift_start = :shift_start, shift_end = :shift_end, "
+            "shift_name = :shift_name, #timezone = :timezone, enabled = :enabled, "
+            "updated_at = :updated_at, #source = :source"
+        )
+        if enabled:
+            expression += " REMOVE #reason"
+        else:
+            expression += ", #reason = :reason"
+            values[":reason"] = assignable.get("reason") or "jira_user_not_assignable"
+
+        try:
+            capacity_table.update_item(
+                Key={"agent_id": agent["agent_id"]},
+                UpdateExpression=expression,
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+            )
+            item = {
+                "agent_id": agent.get("agent_id"),
+                "account_id": account_id,
+                "shift_start": metadata["shift_start"],
+                "shift_end": metadata["shift_end"],
+                "shift_name": metadata["shift_name"],
+                "timezone": metadata["timezone"],
+            }
+            if enabled:
+                updated.append(item)
+            else:
+                disabled.append({**item, "reason": values[":reason"]})
+        except Exception as error:
+            errors.append({"agent_id": agent.get("agent_id"), "error": str(error)})
+
+    return {
+        "ok": bool(schedule_result.get("ok")) and not errors,
+        "enabled": True,
+        "updated_agents": updated,
+        "disabled_agents": disabled,
+        "errors": errors,
+        "schedule_results": schedule_result.get("schedule_results") or [],
+        "error_code": None if schedule_result.get("ok") else schedule_result.get("error_code"),
+    }
 
 
 def sanitize_oncall_result(result):
@@ -521,7 +713,8 @@ def ensure_oncall_capacity_agents(oncall_user_ids, existing_agents):
 
 
 def agent_capacity(agent):
-    return int(agent.get("max_capacity", DEFAULT_AGENT_CAPACITY))
+    row_capacity = int(agent.get("max_capacity") or DEFAULT_AGENT_CAPACITY)
+    return min(row_capacity, DEFAULT_AGENT_CAPACITY)
 
 
 def agent_active_count(agent):
@@ -609,6 +802,7 @@ def release_agent_capacity(agent_id):
 
 def choose_and_reserve_agent(now=None):
     now = now or get_current_time_in_timezone()
+    reconcile_result = reconcile_active_assignments()
     oncall_result = get_jsm_oncall_user_ids(now) if ENABLE_JSM_ONCALL_SOURCE else None
     use_oncall_source = bool(oncall_result and oncall_result.get("ok"))
     oncall_user_ids = oncall_result.get("user_ids") if use_oncall_source else set()
@@ -616,6 +810,16 @@ def choose_and_reserve_agent(now=None):
     auto_created_agents = ensure_oncall_capacity_agents(oncall_user_ids, all_agents) if use_oncall_source else []
     if auto_created_agents:
         all_agents = [*all_agents, *auto_created_agents]
+    schedule_sync_result = (
+        sync_oncall_schedule_fields(oncall_user_ids, all_agents)
+        if use_oncall_source
+        else None
+    )
+    if schedule_sync_result and (
+        schedule_sync_result.get("updated_agents")
+        or schedule_sync_result.get("disabled_agents")
+    ):
+        all_agents = get_enabled_agents(include_disabled=True)
     eligible = []
     skipped = []
 
@@ -651,6 +855,8 @@ def choose_and_reserve_agent(now=None):
                 "current_time_ist": now.astimezone(ZoneInfo(LIVE_AGENT_TIMEZONE)).isoformat(),
                 "assignment_source": "jsm_oncall" if use_oncall_source else "dynamodb_shift",
                 "jsm_oncall": sanitize_oncall_result(oncall_result),
+                "jsm_schedule_sync": schedule_sync_result,
+                "capacity_reconcile": reconcile_result,
                 "auto_created_agents": [item.get("agent_id") for item in auto_created_agents],
                 "eligible_agents": [item.get("agent_id") for item in eligible],
                 "skipped_agents_with_reason": skipped,
@@ -668,6 +874,8 @@ def choose_and_reserve_agent(now=None):
         "current_time_ist": now.astimezone(ZoneInfo(LIVE_AGENT_TIMEZONE)).isoformat(),
         "assignment_source": "jsm_oncall" if use_oncall_source else "dynamodb_shift",
         "jsm_oncall": sanitize_oncall_result(oncall_result),
+        "jsm_schedule_sync": schedule_sync_result,
+        "capacity_reconcile": reconcile_result,
         "auto_created_agents": [item.get("agent_id") for item in auto_created_agents],
         "eligible_agents": [item.get("agent_id") for item in eligible],
         "skipped_agents_with_reason": skipped,
@@ -717,6 +925,32 @@ def assign_jira_issue(issue_key, jira_account_id):
         f"/rest/api/3/issue/{key}/assignee",
         {"accountId": jira_account_id},
     )
+
+
+def jira_issue_status(issue_key):
+    if not issue_key:
+        return {"ok": False, "error": "Missing issue key", "error_code": "missing_issue_key"}
+
+    key = urllib.parse.quote(str(issue_key), safe="")
+    result = jira_request("GET", f"/rest/api/3/issue/{key}?fields=status")
+    if not result.get("ok"):
+        return {
+            "ok": False,
+            "status": result.get("status"),
+            "error": result.get("error", "jira_issue_status_lookup_failed"),
+            "error_code": "jira_issue_status_lookup_failed",
+        }
+
+    response = result.get("response") or {}
+    status = (((response.get("fields") or {}).get("status") or {}).get("name") or "").strip()
+    if not status:
+        return {
+            "ok": False,
+            "error": "Jira issue status missing from response",
+            "error_code": "missing_jira_issue_status",
+        }
+
+    return {"ok": True, "ticket_status": status}
 
 
 def update_jira_labels(issue_key, add_labels=None, remove_labels=None):
@@ -785,6 +1019,113 @@ def save_live_agent_session_mapping(ticket_key, values):
 
 def is_terminal_status(status):
     return str(status or "").strip().lower() in TERMINAL_STATUSES
+
+
+def active_reserved_ticket_items(max_items=None):
+    max_items = CAPACITY_RECONCILE_MAX_ITEMS if max_items is None else max(0, int(max_items))
+    if max_items == 0:
+        return []
+
+    items = []
+    request = {
+        "FilterExpression": (
+            Attr("assignment_status").eq("ASSIGNED")
+            & Attr("capacity_reserved").eq(True)
+            & (Attr("capacity_released").not_exists() | Attr("capacity_released").eq(False))
+        )
+    }
+    while True:
+        response = session_table.scan(**request)
+        for item in response.get("Items") or []:
+            items.append(item)
+            if len(items) >= max_items:
+                return items
+        if not response.get("LastEvaluatedKey"):
+            break
+        request["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+
+    return items
+
+
+def save_reconcile_status(ticket_key, status=None, error=None):
+    values = {
+        "last_reconciled_at": utc_now_iso(),
+    }
+    if status:
+        values["last_jira_status_checked"] = status
+    if error:
+        values["reconcile_error"] = str(error)[:1000]
+    else:
+        values["reconcile_error"] = None
+    save_live_agent_session_mapping(ticket_key, values)
+
+
+def reconcile_active_assignments(max_items=None, status_lookup=None, release_fn=None):
+    if not CAPACITY_RECONCILE_ENABLED:
+        return {
+            "ok": True,
+            "enabled": False,
+            "checked": 0,
+            "released": 0,
+            "errors": 0,
+            "released_tickets": [],
+        }
+
+    status_lookup = status_lookup or jira_issue_status
+    release_fn = release_fn or release_capacity_for_ticket
+    checked = 0
+    released = 0
+    errors = 0
+    released_tickets = []
+    retained_tickets = []
+    error_tickets = []
+
+    for pointer in active_reserved_ticket_items(max_items=max_items):
+        ticket_key = str(pointer.get("ticket_key") or "").strip()
+        if not ticket_key:
+            continue
+        checked += 1
+
+        result = status_lookup(ticket_key)
+        if not result.get("ok"):
+            errors += 1
+            error = result.get("error") or result.get("error_code") or "jira_status_lookup_failed"
+            save_reconcile_status(ticket_key, error=error)
+            error_tickets.append({"ticket_key": ticket_key, "error": error})
+            continue
+
+        status = result.get("ticket_status") or result.get("status") or ""
+        save_reconcile_status(ticket_key, status=status)
+        if is_terminal_status(status):
+            release = release_fn(ticket_key, status)
+            if release.get("released"):
+                released += 1
+                released_tickets.append(ticket_key)
+            else:
+                retained_tickets.append({
+                    "ticket_key": ticket_key,
+                    "status": status,
+                    "reason": release.get("reason", "not_released"),
+                })
+        else:
+            retained_tickets.append({"ticket_key": ticket_key, "status": status})
+
+    result = {
+        "ok": True,
+        "enabled": True,
+        "checked": checked,
+        "released": released,
+        "errors": errors,
+        "released_tickets": released_tickets,
+        "retained_tickets": retained_tickets,
+        "error_tickets": error_tickets,
+    }
+    log_json({
+        "level": "INFO" if errors == 0 else "WARN",
+        "message": "live_agent_capacity_reconcile_completed",
+        **result,
+    })
+    return result
 
 
 def release_capacity_for_ticket(ticket_key, status):

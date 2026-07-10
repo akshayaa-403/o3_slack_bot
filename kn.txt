@@ -4,10 +4,218 @@ explain the code flow.
 
 
 6:00 PM
+@'
+import base64, json, os, subprocess, urllib.parse, urllib.request
 
+AWS_ACCESS_KEY_ID = 'AKIASZAE72MUVXGMNXCS'
+AWS_SECRET_ACCESS_KEY = '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'
+REGION = 'ap-southeast-2'
 
+def aws_json(args):
+    env = os.environ.copy()
+    env['AWS_ACCESS_KEY_ID'] = AWS_ACCESS_KEY_ID
+    env['AWS_SECRET_ACCESS_KEY'] = AWS_SECRET_ACCESS_KEY
+    env['AWS_DEFAULT_REGION'] = REGION
+    return json.loads(subprocess.check_output(args, env=env, text=True))
 
+def extract_oncall_user_ids(value):
+    ids = set()
+    if isinstance(value, str) and value.strip():
+        ids.add(value.strip())
+        return ids
+    if isinstance(value, list):
+        for item in value:
+            ids.update(extract_oncall_user_ids(item))
+        return ids
+    if not isinstance(value, dict):
+        return ids
+    for key in ('accountId','account_id','userId','user_id','id','identifier','userIdentifier'):
+        item_value = value.get(key)
+        if isinstance(item_value, str) and item_value.strip():
+            ids.add(item_value.strip())
+    for key in ('user','responder','participant','account'):
+        ids.update(extract_oncall_user_ids(value.get(key)))
+    for key in ('users','values','participants','responders','onCalls','onCallUsers','onCallParticipants'):
+        ids.update(extract_oncall_user_ids(value.get(key)))
+    return ids
 
+lambda_env = aws_json([
+    'aws','lambda','get-function-configuration',
+    '--function-name','o3_live_agent','--region',REGION,
+    '--query','Environment.Variables','--output','json'
+])
+cloud_id = lambda_env['JSM_OPS_CLOUD_ID']
+schedule_ids = [s.strip() for s in lambda_env['JSM_ONCALL_SCHEDULE_IDS'].split(',') if s.strip()]
+base_url = lambda_env.get('JSM_OPS_BASE_URL', 'https://api.atlassian.com/jsm/ops').rstrip('/')
+auth = 'Basic ' + base64.b64encode(f"{lambda_env['ATLASSIAN_EMAIL']}:{lambda_env['ATLASSIAN_API_TOKEN']}".encode()).decode()
+
+oncall_ids = set()
+raw = []
+for schedule_id in schedule_ids:
+    url = f"{base_url}/api/{urllib.parse.quote(cloud_id, safe='"''"')}/v1/schedules/{urllib.parse.quote(schedule_id, safe='"''"')}/on-calls?flat=true"
+    req = urllib.request.Request(url, headers={'Authorization': auth, 'Accept': 'application/json'})
+    with urllib.request.urlopen(req, timeout=20) as response:
+        body = json.loads(response.read().decode())
+    extracted = extract_oncall_user_ids(body)
+    oncall_ids.update(extracted)
+    raw.append({'schedule_id': schedule_id, 'status': response.status, 'body': body, 'extracted_ids': sorted(extracted)})
+
+capacity = aws_json(['aws','dynamodb','scan','--table-name','live_agent_capacity','--region',REGION,'--output','json'])
+agents = []
+for item in capacity.get('Items', []):
+    agent = {k: next(iter(v.values())) for k, v in item.items()}
+    ids = {str(agent.get(k) or '"''"').strip() for k in ('jira_account_id','atlassian_account_id','account_id','agent_id','email')}
+    ids.discard('"''"')
+    if ids & oncall_ids:
+        agents.append(agent)
+
+print(json.dumps({
+    'schedule_ids': schedule_ids,
+    'oncall_ids': sorted(oncall_ids),
+    'matched_capacity_agents': agents,
+    'raw_responses': raw,
+}, indent=2, default=str))
+'@ | python -
+
+what if in a shift there are more than one agent and each agent could handle 5users at a time,  if user<5 then it should  pass to the next live agent when  the queue is full.
+
+is there any jsm service which could handle this logic
+
+I want the ticket to expire if the agent is unable to interact with the created ticket after 12 hours!!
+
+add all intent into aws lex given in excel sheet
+
+$env:AWS_ACCESS_KEY_ID='AKIASZAE72MUVXGMNXCS'; $env:AWS_SECRET_ACCESS_KEY='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'; $env:AWS_DEFAULT_REGION='ap-southeast-2'; aws dynamodb scan --table-name live_agent_capacity --region ap-southeast-2 --output json
+
+$env:AWS_ACCESS_KEY_ID='AKIASZAE72MUVXGMNXCS'; $env:AWS_SECRET_ACCESS_KEY='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'; $env:AWS_DEFAULT_REGION='ap-southeast-2'; aws lambda get-function-configuration --function-name o3_live_agent --region ap-southeast-2 --query "Environment.Variables.{ENABLE_JSM_ONCALL_SOURCE:ENABLE_JSM_ONCALL_SOURCE,JSM_OPS_CLOUD_ID:JSM_OPS_CLOUD_ID,JSM_ONCALL_SCHEDULE_IDS:JSM_ONCALL_SCHEDULE_IDS,JSM_ONCALL_FALLBACK_TO_SHIFT:JSM_ONCALL_FALLBACK_TO_SHIFT,LIVE_AGENT_TIMEZONE:LIVE_AGENT_TIMEZONE}" --output json
+
+$env:AWS_ACCESS_KEY_ID='AKIASZAE72MUVXGMNXCS'; $env:AWS_SECRET_ACCESS_KEY='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'; $env:AWS_DEFAULT_REGION='ap-southeast-2'; $start=[DateTimeOffset]::UtcNow.AddMinutes(-10).ToUnixTimeMilliseconds(); aws logs filter-log-events --region ap-southeast-2 --log-group-name /aws/lambda/o3_live_agent --start-time $start --filter-pattern 'IVY-72' --query "events[].message" --output text
+
+@'
+import base64, json, os, subprocess, urllib.parse, urllib.request, urllib.error
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+AWS_ACCESS_KEY_ID='AKIASZAE72MUVXGMNXCS'
+AWS_SECRET_ACCESS_KEY='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'
+REGION='ap-southeast-2'
+ACCOUNT_ID='712020:31ede06d-e829-4dc4-8fd1-b39eab09bd76'
+
+def aws_json(args):
+    env=os.environ.copy(); env['AWS_ACCESS_KEY_ID']=AWS_ACCESS_KEY_ID; env['AWS_SECRET_ACCESS_KEY']=AWS_SECRET_ACCESS_KEY; env['AWS_DEFAULT_REGION']=REGION
+    return json.loads(subprocess.check_output(args, env=env, text=True))
+
+def req_json(url, auth):
+    req=urllib.request.Request(url, headers={'Authorization':auth,'Accept':'application/json'})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        body=r.read().decode()
+        return r.status, json.loads(body) if body.strip() else {}
+
+env=aws_json(['aws','lambda','get-function-configuration','--function-name','o3_live_agent','--region',REGION,'--query','Environment.Variables','--output','json'])
+base=env['JSM_OPS_BASE_URL'].rstrip('/')
+cloud=env['JSM_OPS_CLOUD_ID']
+schedule=env['JSM_ONCALL_SCHEDULE_IDS'].split(',')[0].strip()
+auth='Basic '+base64.b64encode(f"{env['ATLASSIAN_EMAIL']}:{env['ATLASSIAN_API_TOKEN']}".encode()).decode()
+paths=[
+ f'/api/{urllib.parse.quote(cloud,safe="")}/v1/schedules/{urllib.parse.quote(schedule,safe="")}',
+ f'/api/{urllib.parse.quote(cloud,safe="")}/v1/schedules/{urllib.parse.quote(schedule,safe="")}/timeline',
+ f'/api/{urllib.parse.quote(cloud,safe="")}/v1/schedules/{urllib.parse.quote(schedule,safe="")}/on-calls?flat=false',
+]
+for path in paths:
+    url=base+path
+    print('\nURL', url)
+    try:
+        status,data=req_json(url, auth)
+        print('STATUS', status)
+        print(json.dumps(data, indent=2)[:6000])
+    except urllib.error.HTTPError as e:
+        print('HTTP_ERROR', e.code, e.read().decode(errors='replace')[:2000])
+'@ | python -
+
+create guardrails for claude
+
+{
+    "Items": [
+        {
+            "agent_id": {
+                "S": "VIBHU"
+            },
+            "updated_at": {
+                "S": "2026-07-09T08:24:30Z"
+            },
+            "shift_end": {
+                "S": "08:00"
+            },
+            "enabled": {
+                "BOOL": true
+            },
+            "shift_start": {
+                "S": "20:00"
+            },
+            "max_capacity": {
+                "N": "5"
+            },
+            "jira_account_id": {
+                "S": "712020:bbedc9f1-9c97-4aca-8d97-e584cbe87969"
+            },
+            "active_count": {
+                "N": "0"
+            },
+            "timezone": {
+                "S": "Asia/Kolkata"
+            },
+            "priority": {
+                "N": "1"
+            },
+            "display_name": {
+                "S": "Vibhu Gandhi"
+            },
+            "shift_name": {
+                "S": "NIGHT"
+            }
+        },
+        {
+            "agent_id": {
+                "S": "KARAN"
+            },
+            "updated_at": {
+                "S": "2026-07-09T08:24:30Z"
+            },
+            "shift_end": {
+                "S": "20:00"
+            },
+            "enabled": {
+                "BOOL": true
+            },
+            "shift_start": {
+                "S": "08:00"
+            },
+            "max_capacity": {
+                "N": "5"
+            },
+            "jira_account_id": {
+                "S": "712020:5f424af7-c938-42bd-92a8-d23f2c4db636"
+            },
+            "active_count": {
+                "N": "0"
+            },
+            "timezone": {
+                "S": "Asia/Kolkata"
+            },
+            "priority": {
+                "N": "1"
+            },
+            "display_name": {
+                "S": "Karan"
+            },
+            "shift_name": {
+                "S": "DAY"
+            }
+        }
+    ],
+    "Count": 2,
+    "ScannedCount": 2,
+    "ConsumedCapacity": null
+}
 
 
 Worked for 18s
@@ -412,9 +620,9 @@ https://beipbsznd5.execute-api.ap-southeast-2.amazonaws.com/default/o3_live_agen
   "event_type": "live_agent_ticket_created",
   "session_id": "{{webhookData.session_id}}",
   "session_root_ts": "{{webhookData.session_root_ts}}",
-  "slack_channel": "{{webhookData.slack.channelId}}",
-  "slack_thread_ts": "{{webhookData.slack.threadTs}}",
-  "slack_user": "{{webhookData.slack.userId}}",
+  "slack_channel": "{{webhookData.slack_channel}}",
+  "slack_thread_ts": "{{webhookData.slack_thread_ts}}",
+  "slack_user": "{{webhookData.slack_user}}",
   "ticket_key": "{{createdIssue.key}}",
   "ticket_url": "{{baseUrl}}/browse/{{createdIssue.key}}",
   "ticket_status": "{{createdIssue.status.name}}",
@@ -434,19 +642,19 @@ b30b9b1e347587fa67edd9b619caa4de5306039c
 ==========
 audit log
 
-session_id={{webhookData.session_id}} session_root_ts={{webhookData.session_root_ts}} slack_channel={{webhookData.slack.channelId}} slack_thread_ts={{webhookData.slack.threadTs}} slack_user={{webhookData.slack.userId}}  createdIssue.key={{createdIssue.key}} createdIssue.status={{createdIssue.status.name}} createdIssues={{#createdIssues}}{{key}}{{/}} baseUrl={{baseUrl}}
+session_id={{webhookData.session_id}} session_root_ts={{webhookData.session_root_ts}} slack_channel={{webhookData.slack_channel}} slack_thread_ts={{webhookData.slack_thread_ts}} slack_user={{webhookData.slack_user}}  createdIssue.key={{createdIssue.key}} createdIssue.status={{createdIssue.status.name}} createdIssues={{#createdIssues}}{{key}}{{/}} baseUrl={{baseUrl}}
 ===========
 summary
 [IVY Live Agent] {{webhookData.title}}
 description
 Slack User:
-{{webhookData.slack.userId}}
+{{webhookData.slack_user}}
 
 Slack Channel:
-{{webhookData.slack.channelId}}
+{{webhookData.slack_channel}}
 
 Thread:
-{{webhookData.slack.threadTs}}
+{{webhookData.slack_thread_ts}}
 
 Session:
 {{webhookData.session_id}}
@@ -783,9 +991,9 @@ Add CloudWatch alarms for failed callbacks, DLQ messages, and Jira/JSM API failu
   "event_type": "live_agent_ticket_created",
   "session_id": "{{webhookData.session_id}}",
   "session_root_ts": "{{webhookData.session_root_ts}}",
-  "slack_channel": "{{webhookData.slack.channelId}}",
-  "slack_thread_ts": "{{webhookData.slack.threadTs}}",
-  "slack_user": "{{webhookData.slack.userId}}",
+  "slack_channel": "{{webhookData.slack_channel}}",
+  "slack_thread_ts": "{{webhookData.slack_thread_ts}}",
+  "slack_user": "{{webhookData.slack_user}}",
   "ticket_key": "{{createdIssue.key}}",
   "ticket_url": "{{baseUrl}}/browse/{{createdIssue.key}}",
   "ticket_status": "{{createdIssue.status.name}}",
@@ -804,11 +1012,13 @@ new:
   "assignee_account_id": "{{issue.assignee.accountId}}",
   "assignee_display_name": "{{issue.assignee.displayName}}",
   "assignee_email": "{{issue.assignee.emailAddress}}",
-  "slack_channel": "{{webhook.body.channel}}",
-  "slack_thread_ts": "{{webhook.body.thread}}",
+  "slack_channel": "{{webhook.body.slack_channel}}",
+  "slack_thread_ts": "{{webhook.body.slack_thread_ts}}",
   "slack_user": "{{webhook.body.slack_user}}",
+  "session_root_ts": "{{webhook.body.session_root_ts}}",
   "session_id": "{{webhook.body.session_id}}",
   "user_request": "{{webhook.body.user_request}}",
   "created_at": "{{issue.created}}",
   "updated_at": "{{issue.updated}}"
 }
+==========
