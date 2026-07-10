@@ -13,6 +13,7 @@ from boto3.dynamodb.conditions import Attr
 from botocore.exceptions import ClientError
 
 import chat_locks
+import live_agent_capacity as capacity_dispatcher
 import lambda_o3_jsm_oncall_user as oncall_user_helper
 from lambda_o3_jsm_oncall_user import get_current_oncall_user
 
@@ -40,6 +41,9 @@ AGENT_CHAT_LOCK_TABLE = os.environ.get("AGENT_CHAT_LOCK_TABLE", "O3_Lambda_Agent
 ENABLE_LIVE_AGENT_CAPACITY = os.environ.get("ENABLE_LIVE_AGENT_CAPACITY", "false").lower() == "true"
 LIVE_AGENT_MAX_ACTIVE_CHATS = int(os.environ.get("LIVE_AGENT_MAX_ACTIVE_CHATS", "5"))
 MAX_QUEUE_DRAIN_PER_INVOCATION = max(1, int(os.environ.get("MAX_QUEUE_DRAIN_PER_INVOCATION", "1")))
+ENABLE_CUSTOM_CAPACITY_DISPATCHER = (
+    os.environ.get("ENABLE_CUSTOM_CAPACITY_DISPATCHER", "false").lower() == "true"
+)
 LIVE_AGENT_BUSY_REPLY = os.environ.get(
     "LIVE_AGENT_BUSY_REPLY",
     "All live agents are busy right now. You are in the queue and support will pick this up as soon as someone is available."
@@ -419,21 +423,18 @@ def live_agent_ticket_reply(ticket_key, ticket_url):
 
 
 def live_agent_assigned_reply(ticket_key, ticket_url, agent_name):
-    agent_text = text_or_empty(agent_name) or "the on-call agent"
-    if ticket_key and ticket_url:
-        return f"✅ Live agent ticket {ticket_key} has been created and assigned to {agent_text}: {ticket_url}"
-
+    agent_text = text_or_empty(agent_name) or "a live agent"
     if ticket_key:
-        return f"✅ Live agent ticket {ticket_key} has been created and assigned to {agent_text}."
+        return f"✅ I have sent this to live agent support. {agent_text} has been assigned to {ticket_key}."
 
-    return f"✅ Your live agent ticket has been created and assigned to {agent_text}."
+    return f"✅ I have sent this to live agent support. {agent_text} has been assigned."
 
 
 def live_agent_busy_queue_reply(ticket_key):
     if ticket_key:
-        return f"⏳ All live agents are currently busy. Your request {ticket_key} is in the queue. We'll notify you as soon as an agent is available."
+        return f"⌛ All live agents are currently busy. Your request {ticket_key} is in the queue. We'll notify you as soon as an agent is available."
 
-    return "⏳ All live agents are currently busy. Your request is in the queue. We'll notify you as soon as an agent is available."
+    return "⌛ All live agents are currently busy. Your request is in the queue. We'll notify you as soon as an agent is available."
 
 
 def live_agent_no_oncall_queue_reply(ticket_key):
@@ -2052,6 +2053,218 @@ def enrich_missing_slack_context(callback):
     return enriched
 
 
+def save_capacity_target_state(callback, assignment):
+    if not (session_table and callback.get("session_id")):
+        return
+
+    now_iso = utc_now_iso()
+    expression_values = {
+        ":assignment_status": assignment["assignment_status"],
+        ":capacity_reserved": assignment["capacity_reserved"],
+        ":capacity_released": False,
+        ":updated_at": now_iso,
+        ":ttl": ttl_epoch(),
+    }
+    update_expression = """
+        SET
+            live_agent_assignment_status = :assignment_status,
+            live_agent_capacity_reserved = :capacity_reserved,
+            live_agent_capacity_released = :capacity_released,
+            live_agent_updated_at = :updated_at,
+            updated_at = :updated_at,
+            #ttl = :ttl
+    """
+    optional = {
+        "live_agent_assigned_agent_id": assignment.get("assigned_agent_id"),
+        "live_agent_assigned_agent_name": assignment.get("assigned_agent_name"),
+        "live_agent_assigned_jira_account_id": assignment.get("assigned_jira_account_id"),
+    }
+    removes = []
+    for name, value in optional.items():
+        if value:
+            token = f":{name}"
+            update_expression += f", {name} = {token}"
+            expression_values[token] = value
+        else:
+            removes.append(name)
+    if removes:
+        update_expression += " REMOVE " + ", ".join(removes)
+
+    session_table.update_item(
+        Key={"session_id": callback["session_id"]},
+        UpdateExpression=update_expression,
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues=expression_values,
+    )
+
+
+def capacity_assignment_for_ticket(callback, existing_pointer=None):
+    existing_pointer = existing_pointer or {}
+    existing_status = text_or_empty(existing_pointer.get("assignment_status")).upper()
+    if existing_status in {"ASSIGNED", "QUEUED"}:
+        return {
+            "assignment_status": existing_status,
+            "capacity_reserved": existing_pointer.get("capacity_reserved") is True,
+            "assigned_agent_id": existing_pointer.get("assigned_agent_id"),
+            "assigned_agent_name": existing_pointer.get("assigned_agent_name"),
+            "assigned_jira_account_id": existing_pointer.get("assigned_jira_account_id"),
+            "idempotent": True,
+            "jira_assignment": {"ok": True, "skipped": True},
+        }
+
+    reservation = capacity_dispatcher.choose_and_reserve_agent()
+    assignment = {
+        "assignment_status": "QUEUED",
+        "capacity_reserved": False,
+        "assigned_agent_id": None,
+        "assigned_agent_name": None,
+        "assigned_jira_account_id": None,
+        "reservation": reservation,
+        "jira_assignment": {"ok": False, "skipped": True},
+    }
+
+    if reservation.get("ok"):
+        agent = reservation["agent"]
+        jira_assignment = capacity_dispatcher.assign_jira_issue(
+            callback["ticket_key"],
+            agent["jira_account_id"],
+        )
+        assignment["jira_assignment"] = jira_assignment
+        if jira_assignment.get("ok"):
+            assignment.update({
+                "assignment_status": "ASSIGNED",
+                "capacity_reserved": True,
+                "assigned_agent_id": agent["agent_id"],
+                "assigned_agent_name": agent.get("display_name") or agent["agent_id"],
+                "assigned_jira_account_id": agent["jira_account_id"],
+            })
+            capacity_dispatcher.mark_jira_ticket_assigned(callback["ticket_key"])
+        else:
+            rollback = capacity_dispatcher.release_agent_capacity(agent["agent_id"])
+            assignment["rollback"] = rollback
+            capacity_dispatcher.mark_jira_ticket_queued(callback["ticket_key"])
+            if not rollback.get("released"):
+                log_json({
+                    "level": "CRITICAL",
+                    "message": "live_agent_capacity_rollback_failed",
+                    "ticket_key": callback["ticket_key"],
+                    "session_id": callback.get("session_id"),
+                    "agent_id": agent["agent_id"],
+                    "rollback": rollback,
+                })
+    else:
+        capacity_dispatcher.mark_jira_ticket_queued(callback["ticket_key"])
+
+    raw = callback.get("raw_callback") or {}
+    ticket_id = first_text(
+        raw.get("ticket_id"),
+        raw.get("issue_id"),
+        nested_get(raw, "issue", "id"),
+        nested_get(raw, "createdIssue", "id"),
+    )
+    mapping = {
+        "target_session_id": callback.get("session_id"),
+        "ticket_key": callback.get("ticket_key"),
+        "ticket_id": ticket_id,
+        "ticket_url": callback.get("ticket_url") or "",
+        "slack_channel": callback.get("slack_channel") or "",
+        "slack_thread_ts": callback.get("slack_thread_ts") or "",
+        "slack_user": callback.get("slack_user") or "",
+        "ticket_status": callback.get("ticket_status") or "",
+        "assignment_status": assignment["assignment_status"],
+        "capacity_reserved": assignment["capacity_reserved"],
+        "capacity_released": False,
+        "assigned_agent_id": assignment.get("assigned_agent_id"),
+        "assigned_agent_name": assignment.get("assigned_agent_name"),
+        "assigned_jira_account_id": assignment.get("assigned_jira_account_id"),
+    }
+    capacity_dispatcher.save_live_agent_session_mapping(callback["ticket_key"], mapping)
+    save_capacity_target_state(callback, assignment)
+    capacity_dispatcher.log_assignment_decision({
+        "ok": assignment["assignment_status"] == "ASSIGNED",
+        "event_type": callback.get("event_type"),
+        "ticket_key": callback.get("ticket_key"),
+        "slack_channel": callback.get("slack_channel"),
+        "slack_thread_ts": callback.get("slack_thread_ts"),
+        "slack_user": callback.get("slack_user"),
+        "current_time_ist": reservation.get("current_time_ist"),
+        "eligible_agents": reservation.get("eligible_agents"),
+        "skipped_agents_with_reason": reservation.get("skipped_agents_with_reason"),
+        "selected_agent": assignment.get("assigned_agent_id"),
+        "assignment_status": assignment["assignment_status"],
+        "active_count_before": reservation.get("active_count_before"),
+        "active_count_after": reservation.get("active_count_after"),
+        "jira_assignment_result": assignment.get("jira_assignment"),
+        "capacity_reserved": assignment["capacity_reserved"],
+        "capacity_released": False,
+    })
+    return assignment
+
+
+def legacy_assignment_for_ticket(callback):
+    ticket = callback_ticket(callback)
+    slack_context = callback_slack_context(callback)
+    oncall_user = get_current_oncall_user(
+        ticket_key=callback["ticket_key"],
+        webhook_payload=callback.get("raw_callback") or {},
+    )
+    lock_result = {"ok": False, "reason": "not_attempted"}
+    queue_result = None
+    if oncall_user.get("ok"):
+        lock_result = chat_locks.acquire_chat_lock(
+            live_agent_agent_from_oncall(oncall_user),
+            ticket,
+            slack_context,
+        )
+        if lock_result.get("ok"):
+            return {
+                "assignment_status": "ASSIGNED",
+                "capacity_reserved": True,
+                "assigned_agent_id": agent_key_from_user(oncall_user),
+                "assigned_agent_name": oncall_user.get("display_name"),
+                "assigned_jira_account_id": oncall_user.get("account_id"),
+                "jira_assignment": {"ok": True, "skipped": True},
+                "legacy_lock": lock_result,
+                "oncall_user": oncall_user,
+            }
+        queue_result = chat_locks.enqueue_live_agent_request(
+            ticket,
+            slack_context,
+            reason=lock_result.get("reason") or "lock_failed",
+        )
+    else:
+        queue_result = chat_locks.enqueue_live_agent_request(
+            ticket,
+            slack_context,
+            reason="no_oncall_user",
+        )
+    return {
+        "assignment_status": "QUEUED",
+        "capacity_reserved": False,
+        "assigned_agent_id": None,
+        "assigned_agent_name": None,
+        "assigned_jira_account_id": None,
+        "jira_assignment": {"ok": False, "skipped": True},
+        "legacy_lock": lock_result,
+        "legacy_queue": queue_result,
+        "oncall_user": oncall_user,
+    }
+
+
+def notify_promoted_ticket(pointer, agent):
+    channel = text_or_empty(pointer.get("slack_channel"))
+    if not channel:
+        return {"attempted": False}
+    return post_slack_message(
+        channel,
+        live_agent_queue_assigned_reply(
+            pointer.get("ticket_key"),
+            agent.get("display_name") or agent.get("agent_id"),
+        ),
+        text_or_empty(pointer.get("slack_thread_ts")),
+    )
+
+
 def handle_live_agent_status_changed(event):
     callback = normalize_status_callback(event)
     if not callback.get("ticket_key"):
@@ -2119,26 +2332,47 @@ def handle_live_agent_status_changed(event):
                 "error": str(error),
             }
 
-    terminal_status = is_terminal_ticket_status(callback.get("ticket_status"))
+    terminal_status = (
+        capacity_dispatcher.is_terminal_status(callback.get("ticket_status"))
+        if ENABLE_CUSTOM_CAPACITY_DISPATCHER
+        else is_terminal_ticket_status(callback.get("ticket_status"))
+    )
     lock_release = {"ok": True, "released": False}
     queue_drain = {"drained": False, "reason": "not_terminal"}
     if terminal_status:
         try:
-            lock_release = chat_locks.release_chat_lock(
-                callback["ticket_key"],
-                close_reason=callback.get("ticket_status"),
-            )
-            if lock_release.get("released"):
-                queue_drain = drain_live_agent_queue()
+            if ENABLE_CUSTOM_CAPACITY_DISPATCHER:
+                lock_release = capacity_dispatcher.release_capacity_for_ticket(
+                    callback["ticket_key"],
+                    callback.get("ticket_status"),
+                )
+                if lock_release.get("released"):
+                    promotion = capacity_dispatcher.promote_oldest_queued_ticket(
+                        notify=notify_promoted_ticket,
+                    )
+                    queue_drain = {
+                        "drained": bool(promotion.get("promoted")),
+                        **promotion,
+                    }
+                else:
+                    queue_drain = {
+                        "drained": False,
+                        "reason": lock_release.get("reason") or "capacity_not_released",
+                    }
             else:
-                queue_drain = {
-                    "drained": False,
-                    "reason": "lock_not_released",
-                }
+                lock_release = chat_locks.release_chat_lock(
+                    callback["ticket_key"],
+                    close_reason=callback.get("ticket_status"),
+                )
+                queue_drain = (
+                    drain_live_agent_queue()
+                    if lock_release.get("released")
+                    else {"drained": False, "reason": "lock_not_released"}
+                )
         except Exception as error:
             log_json({
                 "level": "ERROR",
-                "message": "live_agent_chat_lock_release_failed",
+                "message": "live_agent_capacity_release_failed",
                 "ticket_key": callback["ticket_key"],
                 "ticket_status": callback.get("ticket_status"),
                 "error": str(error),
@@ -2151,12 +2385,12 @@ def handle_live_agent_status_changed(event):
 
     log_json({
         "level": "INFO",
-        "message": "live_agent_status_lock_release_checked",
+        "message": "live_agent_status_capacity_release_checked",
         "ticket_key": callback["ticket_key"],
         "ticket_status": callback.get("ticket_status"),
         "terminal_status": terminal_status,
         "lock_released": bool(lock_release.get("released")),
-        "released_agent_account_id": lock_release.get("agent_account_id"),
+        "released_agent_id": lock_release.get("agent_id"),
     })
 
     return {
@@ -2213,62 +2447,40 @@ def handle_jsm_callback(event):
             "session_id": callback.get("session_id"),
         }
 
+    existing_pointer = (
+        get_live_agent_ticket_pointer(callback["ticket_key"])
+        if ENABLE_CUSTOM_CAPACITY_DISPATCHER
+        else {}
+    )
     update_live_agent_session(callback)
     pointer_session_id = put_live_agent_ticket_pointer(callback)
-
-    ticket = callback_ticket(callback)
-    slack_context = callback_slack_context(callback)
-    oncall_user = get_current_oncall_user(
-        ticket_key=callback["ticket_key"],
-        webhook_payload=callback.get("raw_callback") or {},
+    assignment = (
+        capacity_assignment_for_ticket(callback, existing_pointer)
+        if ENABLE_CUSTOM_CAPACITY_DISPATCHER
+        else legacy_assignment_for_ticket(callback)
     )
-    lock_result = {"ok": False, "reason": "not_attempted"}
-    queue_result = None
-    live_agent_status = "ticket_created"
-    lock_acquired = False
-    queued = False
-
-    if oncall_user.get("ok"):
-        lock_result = chat_locks.acquire_chat_lock(
-            live_agent_agent_from_oncall(oncall_user),
-            ticket,
-            slack_context,
-        )
-        if lock_result.get("ok"):
-            lock_acquired = True
+    assigned = assignment.get("assignment_status") == "ASSIGNED"
+    queued = not assigned
+    if assigned:
+        if ENABLE_CUSTOM_CAPACITY_DISPATCHER:
             reply = live_agent_assigned_reply(
                 callback.get("ticket_key"),
                 callback.get("ticket_url"),
-                oncall_user.get("display_name"),
+                assignment.get("assigned_agent_name"),
             )
-            live_agent_status = "ticket_created"
-        elif lock_result.get("reason") == "agent_at_capacity":
-            queue_result = chat_locks.enqueue_live_agent_request(
-                ticket,
-                slack_context,
-                reason="agent_at_capacity",
-            )
-            queued = True
-            reply = live_agent_busy_queue_reply(callback.get("ticket_key"))
-            live_agent_status = "queued"
         else:
-            queue_result = chat_locks.enqueue_live_agent_request(
-                ticket,
-                slack_context,
-                reason=lock_result.get("reason") or "lock_failed",
+            reply = (
+                f"✅ Live agent ticket {callback.get('ticket_key')} has been created "
+                f"and assigned to {assignment.get('assigned_agent_name')}."
             )
-            queued = True
-            reply = live_agent_busy_queue_reply(callback.get("ticket_key"))
-            live_agent_status = "queued"
-    else:
-        queue_result = chat_locks.enqueue_live_agent_request(
-            ticket,
-            slack_context,
-            reason="no_oncall_user",
-        )
-        queued = True
+    elif (
+        not ENABLE_CUSTOM_CAPACITY_DISPATCHER
+        and not (assignment.get("oncall_user") or {}).get("ok")
+    ):
         reply = live_agent_no_oncall_queue_reply(callback.get("ticket_key"))
-        live_agent_status = "queued"
+    else:
+        reply = live_agent_busy_queue_reply(callback.get("ticket_key"))
+    live_agent_status = "ticket_created" if assigned else "queued"
 
     log_json({
         "level": "INFO",
@@ -2278,14 +2490,13 @@ def handle_jsm_callback(event):
         "session_id": callback.get("session_id"),
         "slack_channel": callback.get("slack_channel"),
         "slack_thread_ts": callback.get("slack_thread_ts"),
-        "oncall_ok": oncall_user.get("ok"),
-        "oncall_source": oncall_user.get("source"),
-        "assignee_account_id": oncall_user.get("account_id"),
-        "assignee_display_name": oncall_user.get("display_name"),
-        "lock_acquired": lock_acquired,
+        "assigned_agent_id": assignment.get("assigned_agent_id"),
+        "assignee_account_id": assignment.get("assigned_jira_account_id"),
+        "assignee_display_name": assignment.get("assigned_agent_name"),
+        "capacity_reserved": assignment.get("capacity_reserved"),
         "queued": queued,
-        "lock_reason": lock_result.get("reason"),
-        "queue_reason": (queue_result or {}).get("reason"),
+        "assignment_status": assignment.get("assignment_status"),
+        "jira_assignment_result": assignment.get("jira_assignment"),
     })
 
     slack_result = {"attempted": False, "deduped": False}
@@ -2334,10 +2545,23 @@ def handle_jsm_callback(event):
         "ticket_status": callback.get("ticket_status"),
         "status": callback.get("ticket_status"),
         "live_agent_status": live_agent_status,
-        "oncall_user": oncall_user,
-        "lock": lock_result,
-        "queue": queue_result,
-        "lock_acquired": lock_acquired,
+        "assigned_agent_id": assignment.get("assigned_agent_id"),
+        "assigned_agent_name": assignment.get("assigned_agent_name"),
+        "assigned_jira_account_id": assignment.get("assigned_jira_account_id"),
+        "assignment_status": assignment.get("assignment_status"),
+        "capacity_reserved": assignment.get("capacity_reserved"),
+        "capacity_released": False,
+        "jira_assignment": assignment.get("jira_assignment"),
+        "oncall_user": assignment.get("oncall_user"),
+        "lock": assignment.get("legacy_lock"),
+        "queue": assignment.get("legacy_queue"),
+        "lock_acquired": bool(
+            assignment.get("legacy_lock", {}).get("ok")
+            or (
+                ENABLE_CUSTOM_CAPACITY_DISPATCHER
+                and assignment.get("capacity_reserved")
+            )
+        ),
         "queued": queued,
         "reply": reply,
         "message": reply,

@@ -1026,7 +1026,7 @@ def delete_timeout_schedule(session_id, phase):
 
 
 def should_use_claude_fallback(text, lex_intent, lex_state, lex_reply_empty):
-    if not ENABLE_CLAUDE_FALLBACK or not text:
+    if not text:
         return False
 
     return (
@@ -1034,6 +1034,24 @@ def should_use_claude_fallback(text, lex_intent, lex_state, lex_reply_empty):
         or lex_reply_empty
         or lex_intent in CLAUDE_FALLBACK_INTENTS
     )
+
+
+def disabled_claude_fallback_result(previous_reply):
+    reply = (previous_reply or "").strip()
+    if not reply:
+        return {
+            "ok": False,
+            "error": "claude_fallback_disabled_no_previous_reply",
+            "fallback_disabled": True,
+        }
+
+    return {
+        "ok": True,
+        "reply": reply,
+        "error": None,
+        "model_id": None,
+        "fallback_disabled": True,
+    }
 
 
 def invoke_claude_fallback(payload):
@@ -5027,10 +5045,11 @@ def process_record(record):
                 )
             )
         else:
-            claude_result = {
-                "ok": False,
-                "error": "claude_fallback_disabled"
-            }
+            claude_result = disabled_claude_fallback_result(
+                details_session.get("assistance_lex_reply")
+                or details_session.get("support_lex_reply")
+                or details_session.get("last_bot_reply")
+            )
 
         final_support_result = build_final_support_result(
             details_session,
@@ -5197,7 +5216,10 @@ def process_record(record):
                 "conversation_status": get_conversation_status(lex_state)
             }
         }
-        claude_result = invoke_claude_fallback(claude_payload)
+        if ENABLE_CLAUDE_FALLBACK:
+            claude_result = invoke_claude_fallback(claude_payload)
+        else:
+            claude_result = disabled_claude_fallback_result(original_lex_reply)
         final_support_session = {
             **existing_session,
             "session_id": session_id,
