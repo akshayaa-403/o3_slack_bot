@@ -53,7 +53,11 @@ CLAUDE_FAILURE_REPLY = os.environ.get(
 )
 CREATE_JIRA_TICKET_FUNCTION = os.environ.get("CREATE_JIRA_TICKET_FUNCTION")
 ENABLE_CREATE_JIRA_TICKET = os.environ.get("ENABLE_CREATE_JIRA_TICKET", "true").lower() == "true"
-ENABLE_CLOSE_SUMMARY = os.environ.get("ENABLE_CLOSE_SUMMARY", "true").lower() == "true"
+ENABLE_CLOSE_SUMMARY = (
+    os.environ.get("ENABLE_CLOSE_SUMMARY")
+    or os.environ.get("ENABLE_SUMMARIZATION")
+    or "true"
+).lower() == "true"
 ENABLE_ROVO_ENRICHMENT = os.environ.get("ENABLE_ROVO_ENRICHMENT", "false").lower() == "true"
 ROVO_ENRICHMENT_FUNCTION = os.environ.get("ROVO_ENRICHMENT_FUNCTION")
 LIVE_AGENT_FUNCTION = os.environ.get("LIVE_AGENT_FUNCTION")
@@ -87,6 +91,8 @@ SCREENSHOT_VECTOR_K = int(os.environ.get("SCREENSHOT_VECTOR_K", "1"))
 SCREENSHOT_EMBEDDING_MAX_BYTES = int(os.environ.get("SCREENSHOT_EMBEDDING_MAX_BYTES", "5000000"))
 BEDROCK_KNOWLEDGE_BASE_ID = os.environ.get("BEDROCK_KNOWLEDGE_BASE_ID")
 BEDROCK_KB_MODEL_ARN = os.environ.get("BEDROCK_KB_MODEL_ARN")
+ENABLE_BEDROCK_KB_ASSIST = os.environ.get("ENABLE_BEDROCK_KB_ASSIST", "true").lower() == "true"
+BEDROCK_KB_INTENT_NAME = os.environ.get("BEDROCK_KB_INTENT_NAME", "KBAtlassianAssist")
 BEDROCK_KB_NUMBER_OF_RESULTS = int(os.environ.get("BEDROCK_KB_NUMBER_OF_RESULTS", "5"))
 BEDROCK_KB_NO_ANSWER_MARKERS = [
     marker.strip().lower()
@@ -1156,6 +1162,14 @@ def invoke_claude_fallback(payload):
 
 
 def invoke_create_jira_ticket(payload):
+    if not ENABLE_CREATE_JIRA_TICKET:
+        return {
+            "ok": False,
+            "skipped": True,
+            "error": "Jira ticket creation is disabled.",
+            "error_code": "jira_ticket_creation_disabled"
+        }
+
     if not CREATE_JIRA_TICKET_FUNCTION:
         return {
             "ok": False,
@@ -3953,6 +3967,15 @@ def handle_interactive_action(session_item, body, session_id):
     result = base_interactive_result(session_item)
 
     if action_id == ACTION_ID_CLOSE_AND_SUMMARIZE:
+        if not ENABLE_CLOSE_SUMMARY:
+            result.update({
+                "lex_state": "Ignored",
+                "response_source": "manual_close_summary_disabled",
+                "next_action": None,
+                "reply": "Conversation summarization is currently disabled.",
+            })
+            return result
+
         if session_item.get("conversation_status") == "summarizing" or session_item.get("summary_status") == "started":
             result.update({
                 "response_source": "manual_close_summary_duplicate",
@@ -4025,6 +4048,16 @@ def handle_interactive_action(session_item, body, session_id):
         return result
 
     if action_id == ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET:
+        if not ENABLE_CREATE_JIRA_TICKET:
+            result.update({
+                "lex_state": "Ignored",
+                "response_source": "jira_disabled",
+                "next_action": None,
+                "jira_status": None,
+                "reply": "Jira ticket creation is currently disabled."
+            })
+            return result
+
         if not (
             has_pending_assistance_confirmation(session_item)
             or has_pending_assistance_details(session_item)
@@ -4109,6 +4142,16 @@ def handle_interactive_action(session_item, body, session_id):
         return result
 
     if action_id == ACTION_ID_CREATE_JIRA_TICKET:
+        if not ENABLE_CREATE_JIRA_TICKET:
+            result.update({
+                "lex_state": "Ignored",
+                "response_source": "jira_disabled",
+                "next_action": None,
+                "jira_status": None,
+                "reply": "Jira ticket creation is currently disabled."
+            })
+            return result
+
         return handle_support_create_jira(session_item, body, session_id, now_iso)
 
     result.update({
@@ -4190,6 +4233,16 @@ def handle_jira_confirmation(session_item, body, session_id, text, raw_text):
         return {
             **base_result,
             "reply": JIRA_UNCLEAR_CONFIRMATION_REPLY,
+        }
+
+    if not ENABLE_CREATE_JIRA_TICKET:
+        return {
+            **base_result,
+            "lex_state": "Ignored",
+            "response_source": "jira_disabled",
+            "next_action": None,
+            "jira_status": None,
+            "reply": "Jira ticket creation is currently disabled.",
         }
 
     if not acquire_jira_creation_lock(
@@ -5379,13 +5432,49 @@ def process_record(record):
             "jira_status": jira_status
         })
 
-    if (
-        AUTO_CLAUDE_FALLBACK_ENABLED
-        and not interactive_action_handled
+    should_try_fallback = (
+        not interactive_action_handled
         and not assistance_details_handled
         and not jira_confirmation_handled
         and response_source != "router"
         and should_use_claude_fallback(text, lex_intent, lex_state, lex_reply_empty)
+    )
+
+    if (
+        should_try_fallback
+        and ENABLE_BEDROCK_KB_ASSIST
+    ):
+        kb_result = invoke_bedrock_knowledge_base(text)
+        if kb_result.get("ok"):
+            lex_intent = BEDROCK_KB_INTENT_NAME
+            lex_state = "Fulfilled"
+            lex_slots = {}
+            lex_reply = kb_result.get("reply") or ""
+            lex_reply_empty = not bool(lex_reply.strip())
+            response_source = "bedrock_knowledge_base"
+            should_try_fallback = False
+
+            log_json({
+                "level": "INFO",
+                "message": "bedrock_kb_assist_answered",
+                "event_id": event_id,
+                "session_id": session_id,
+                "intent": lex_intent,
+                "citation_count": len(kb_result.get("citations") or []),
+            })
+        else:
+            log_json({
+                "level": "INFO",
+                "message": "bedrock_kb_assist_no_answer",
+                "event_id": event_id,
+                "session_id": session_id,
+                "error_code": kb_result.get("error_code"),
+                "error": kb_result.get("error"),
+            })
+
+    if (
+        AUTO_CLAUDE_FALLBACK_ENABLED
+        and should_try_fallback
     ):
         claude_fallback_attempted = True
         original_lex_reply = lex_reply

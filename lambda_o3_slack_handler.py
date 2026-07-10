@@ -22,6 +22,8 @@ VERIFY_SLACK_SIGNATURE = os.environ.get("VERIFY_SLACK_SIGNATURE", "false").lower
 DEDUP_TABLE = os.environ.get("DEDUP_TABLE", "O3_EventDedup2")
 DEDUP_TTL_SECONDS = int(os.environ.get("DEDUP_TTL_SECONDS", "172800"))
 SLACK_SIGNATURE_TOLERANCE_SECONDS = int(os.environ.get("SLACK_SIGNATURE_TOLERANCE_SECONDS", "300"))
+ENABLE_FEEDBACK_RATING = os.environ.get("ENABLE_FEEDBACK_RATING", "true").lower() == "true"
+ENABLE_FEEDBACK_FORM = os.environ.get("ENABLE_FEEDBACK_FORM", "true").lower() == "true"
 
 dedup_table = dynamodb.Table(DEDUP_TABLE)
 ACTION_ID_FEEDBACK_RATING = "ivy_feedback_rating"
@@ -455,7 +457,8 @@ def lambda_handler(event, context):
 
     if interactive_payload:
         if interactive_payload.get("type") == "view_submission":
-            enqueue_feedback_submission(interactive_payload)
+            if ENABLE_FEEDBACK_FORM:
+                enqueue_feedback_submission(interactive_payload)
             return {
                 "statusCode": 200,
                 "body": "",
@@ -464,6 +467,12 @@ def lambda_handler(event, context):
         actions = interactive_payload.get("actions") or []
         action = actions[0] if actions else {}
         if str(action.get("action_id") or "").startswith(ACTION_ID_FEEDBACK_RATING):
+            if not ENABLE_FEEDBACK_RATING:
+                return {
+                    "statusCode": 200,
+                    "body": "",
+                }
+
             try:
                 open_feedback_modal(interactive_payload, action)
                 return {

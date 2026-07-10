@@ -38,6 +38,7 @@ SCHEDULER_GROUP_NAME = os.environ.get("SCHEDULER_GROUP_NAME", "default")
 SCHEDULER_NAME_PREFIX = os.environ.get("SCHEDULER_NAME_PREFIX", "o3-slack-timeout")
 SEND_CLOSE_NOTIFICATION = os.environ.get("SEND_CLOSE_NOTIFICATION", "true").lower() == "true"
 SEND_FEEDBACK_PROMPT = os.environ.get("SEND_FEEDBACK_PROMPT", "true").lower() == "true"
+ENABLE_SUMMARIZATION = os.environ.get("ENABLE_SUMMARIZATION", "true").lower() == "true"
 ENABLE_AI_SUMMARY = os.environ.get("ENABLE_AI_SUMMARY", "true").lower() == "true"
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "amazon.nova-2-lite-v1:0")
 AI_SUMMARY_MAX_TOKENS = int(os.environ.get("AI_SUMMARY_MAX_TOKENS", "220"))
@@ -1128,6 +1129,20 @@ def lambda_handler(event, context):
         "session_id": session_id,
         "reason": event.get("reason"),
     })
+
+    if not ENABLE_SUMMARIZATION:
+        log_json({
+            "level": "INFO",
+            "message": "summary_ignored",
+            "session_id": session_id,
+            "reason": "summarization_disabled",
+        })
+        return {
+            "ok": False,
+            "ignored": True,
+            "reason": "summarization_disabled",
+            "session_id": session_id,
+        }
 
     try:
         # Ignore events for missing sessions rather than failing the Lambda.
