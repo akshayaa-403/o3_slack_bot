@@ -640,6 +640,73 @@ def extract_claude_text(response_body):
     return "\n".join(parts).strip()
 
 
+def extract_nova_text(response_body):
+    # Amazon Nova responses return text under output.message.content blocks.
+    parts = []
+
+    content = (
+        ((response_body.get("output") or {}).get("message") or {}).get("content")
+        or []
+    )
+    for item in content:
+        text = text_or_empty(item.get("text"))
+        if text:
+            parts.append(text)
+
+    return "\n".join(parts).strip()
+
+
+def is_anthropic_model(model_id):
+    return str(model_id or "").startswith("anthropic.")
+
+
+def build_bedrock_summary_body(prompt):
+    if is_anthropic_model(BEDROCK_MODEL_ID):
+        return {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": AI_SUMMARY_MAX_TOKENS,
+            "temperature": AI_SUMMARY_TEMPERATURE,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt,
+                        }
+                    ],
+                }
+            ],
+        }
+
+    return {
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"text": prompt}],
+            }
+        ],
+        "inferenceConfig": {
+            "maxTokens": AI_SUMMARY_MAX_TOKENS,
+            "temperature": AI_SUMMARY_TEMPERATURE,
+        },
+    }
+
+
+def extract_bedrock_summary_text(response_body):
+    if is_anthropic_model(BEDROCK_MODEL_ID):
+        return extract_claude_text(response_body)
+
+    return extract_nova_text(response_body)
+
+
+def bedrock_stop_reason(response_body):
+    return (
+        response_body.get("stop_reason")
+        or response_body.get("stopReason")
+    )
+
+
 def build_ai_summary_prompt(cleaned_history, summary, session_item, closed_at, close_reason):
     # Construct the prompt that asks Bedrock/Claude for a concise internal audit
     # summary with strict grounding rules.
@@ -689,28 +756,14 @@ def generate_ai_summary(cleaned_history, summary, session_item, closed_at, close
     if not cleaned_history:
         return None
 
-    body = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": AI_SUMMARY_MAX_TOKENS,
-        "temperature": AI_SUMMARY_TEMPERATURE,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": build_ai_summary_prompt(
-                            cleaned_history,
-                            summary,
-                            session_item,
-                            closed_at,
-                            close_reason,
-                        ),
-                    }
-                ],
-            }
-        ],
-    }
+    prompt = build_ai_summary_prompt(
+        cleaned_history,
+        summary,
+        session_item,
+        closed_at,
+        close_reason,
+    )
+    body = build_bedrock_summary_body(prompt)
 
     response = bedrock.invoke_model(
         modelId=BEDROCK_MODEL_ID,
@@ -720,7 +773,7 @@ def generate_ai_summary(cleaned_history, summary, session_item, closed_at, close
     )
 
     response_body = json.loads(response["body"].read().decode("utf-8"))
-    ai_summary = extract_claude_text(response_body)
+    ai_summary = extract_bedrock_summary_text(response_body)
 
     if not ai_summary:
         raise ValueError("Bedrock returned an empty AI summary")
@@ -728,7 +781,7 @@ def generate_ai_summary(cleaned_history, summary, session_item, closed_at, close
     return {
         "text": ai_summary,
         "model_id": BEDROCK_MODEL_ID,
-        "stop_reason": response_body.get("stop_reason"),
+        "stop_reason": bedrock_stop_reason(response_body),
         "usage": response_body.get("usage", {}),
     }
 
@@ -917,8 +970,36 @@ def structured_summary_text(webhook_response, summary):
     return summary.get("ai_summary")
 
 
-def final_close_message(webhook_response, summary):
+def summary_jira_status_text(summary_jira_result):
+    if summary_jira_result is None:
+        if CREATE_SUMMARY_JIRA_TICKET:
+            return "Jira follow-up ticket: not attempted."
+        return "Jira follow-up ticket: disabled."
+
+    if summary_jira_result.get("ok"):
+        ticket_key = text_or_empty(summary_jira_result.get("ticket_key"))
+        ticket_url = text_or_empty(summary_jira_result.get("ticket_url"))
+        if ticket_key and ticket_url:
+            return f"Jira follow-up ticket created: {ticket_key} {ticket_url}"
+        if ticket_key:
+            return f"Jira follow-up ticket created: {ticket_key}"
+        return "Jira follow-up ticket created."
+
+    if summary_jira_result.get("skipped"):
+        reason = text_or_empty(summary_jira_result.get("reason") or summary_jira_result.get("error_code"))
+        return f"Jira follow-up ticket skipped: {reason or 'not configured'}."
+
+    error = text_or_empty(
+        summary_jira_result.get("error")
+        or summary_jira_result.get("error_code")
+        or "unknown error"
+    )
+    return f"Jira follow-up ticket creation failed: {error}"
+
+
+def final_close_message(webhook_response, summary, summary_jira_result=None):
     summary_text = structured_summary_text(webhook_response, summary)
+    jira_status = summary_jira_status_text(summary_jira_result)
 
     if summary_text:
         return "\n".join([
@@ -927,11 +1008,15 @@ def final_close_message(webhook_response, summary):
             "Summary:",
             summary_text,
             "",
+            jira_status,
+            "",
             "Saved successfully for follow-up.",
         ])
 
     return "\n".join([
         "This session is now closed.",
+        "",
+        jira_status,
         "",
         "Summary saved successfully for follow-up.",
     ])
@@ -1203,7 +1288,7 @@ def lambda_handler(event, context):
 
         # Record the completed summary and all delivery outcomes.
         completed_at = datetime.now(timezone.utc).replace(microsecond=0)
-        final_message = final_close_message(webhook_response, summary)
+        final_message = final_close_message(webhook_response, summary, summary_jira_result)
         mark_summary_completed(
             session_id,
             completed_at,
