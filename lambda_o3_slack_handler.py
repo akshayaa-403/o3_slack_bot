@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import base64
 import urllib.parse
+import urllib.request
 import boto3
 from botocore.exceptions import ClientError
 
@@ -15,6 +16,7 @@ QUEUE_URL = os.environ["SQS_QUEUE_URL"]
 # Slack signature verification is disabled by default for open testing.
 # Set VERIFY_SLACK_SIGNATURE=true and SLACK_SIGNING_SECRET to enforce it again.
 SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "")
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_BOT_USER_ID = os.environ.get("SLACK_BOT_USER_ID", "")
 VERIFY_SLACK_SIGNATURE = os.environ.get("VERIFY_SLACK_SIGNATURE", "false").lower() == "true"
 DEDUP_TABLE = os.environ.get("DEDUP_TABLE", "O3_EventDedup2")
@@ -22,6 +24,8 @@ DEDUP_TTL_SECONDS = int(os.environ.get("DEDUP_TTL_SECONDS", "172800"))
 SLACK_SIGNATURE_TOLERANCE_SECONDS = int(os.environ.get("SLACK_SIGNATURE_TOLERANCE_SECONDS", "300"))
 
 dedup_table = dynamodb.Table(DEDUP_TABLE)
+ACTION_ID_FEEDBACK_RATING = "ivy_feedback_rating"
+CALLBACK_ID_FEEDBACK_FORM = "ivy_feedback_form"
 
 
 def log_json(data):
@@ -166,6 +170,162 @@ def parse_interactive_payload(raw_body):
     return json.loads(payload_values[0])
 
 
+def parse_action_value(value):
+    if not isinstance(value, str) or not value.strip():
+        return {}
+
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, dict):
+            return parsed
+    except ValueError:
+        pass
+
+    return {"action": value}
+
+
+def slack_api(method, payload):
+    if not SLACK_BOT_TOKEN:
+        raise ValueError("Missing SLACK_BOT_TOKEN")
+
+    request = urllib.request.Request(
+        f"https://slack.com/api/{method}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        result = json.loads(response.read().decode("utf-8"))
+
+    if not result.get("ok"):
+        raise ValueError(f"Slack API {method} failed: {result.get('error')}")
+
+    return result
+
+
+def feedback_stars(rating):
+    rating = max(1, min(5, int(rating or 1)))
+    return "★" * rating + "☆" * (5 - rating)
+
+
+def feedback_modal_metadata(payload, action):
+    user = payload.get("user", {}) or {}
+    channel = payload.get("channel", {}) or {}
+    action_payload = parse_action_value(action.get("value"))
+    metadata = {
+        **action_payload,
+        "user": user.get("id"),
+        "channel": channel.get("id"),
+    }
+    return metadata
+
+
+def open_feedback_modal(payload, action):
+    metadata = feedback_modal_metadata(payload, action)
+    rating = int(metadata.get("rating") or 0)
+    modal = {
+        "type": "modal",
+        "callback_id": CALLBACK_ID_FEEDBACK_FORM,
+        "private_metadata": json.dumps(metadata, ensure_ascii=True, separators=(",", ":")),
+        "title": {"type": "plain_text", "text": "IVY feedback"},
+        "submit": {"type": "plain_text", "text": "Submit"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"Rating: *{feedback_stars(rating)}*",
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "feedback_details",
+                "optional": True,
+                "label": {
+                    "type": "plain_text",
+                    "text": "Tell us more",
+                },
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "feedback_text",
+                    "multiline": True,
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "What worked well or what should improve?",
+                    },
+                },
+            },
+        ],
+    }
+    return slack_api(
+        "views.open",
+        {
+            "trigger_id": payload.get("trigger_id"),
+            "view": modal,
+        },
+    )
+
+
+def extract_feedback_text(view):
+    state_values = ((view or {}).get("state") or {}).get("values") or {}
+    for block in state_values.values():
+        if not isinstance(block, dict):
+            continue
+        for action in block.values():
+            if isinstance(action, dict) and "value" in action:
+                return action.get("value") or ""
+    return ""
+
+
+def enqueue_feedback_submission(payload):
+    view = payload.get("view") or {}
+    metadata = parse_action_value(view.get("private_metadata"))
+    user = payload.get("user", {}) or {}
+    event_id = "feedback-" + hashlib.sha256(
+        "|".join([
+            metadata.get("session_id") or "",
+            str(metadata.get("rating") or ""),
+            user.get("id") or "",
+            view.get("id") or "",
+        ]).encode("utf-8")
+    ).hexdigest()[:32]
+    now = int(time.time())
+
+    try:
+        dedup_table.put_item(
+            Item={
+                "event_id": event_id,
+                "event_time": now,
+                "created_at": now,
+                "ttl": now + DEDUP_TTL_SECONDS,
+            },
+            ConditionExpression="attribute_not_exists(event_id)",
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return "duplicate ignored"
+        raise
+
+    sqs.send_message(
+        QueueUrl=QUEUE_URL,
+        MessageBody=json.dumps({
+            "event_id": event_id,
+            "event_type": "feedback_submission",
+            "routing_reason": "feedback_submission",
+            "channel": metadata.get("channel"),
+            "user": user.get("id") or metadata.get("user"),
+            "feedback_rating": metadata.get("rating"),
+            "feedback_text": extract_feedback_text(view),
+            "feedback_metadata": metadata,
+        }),
+    )
+    return "OK"
+
+
 def build_interactive_event_id(payload, action):
     user = payload.get("user", {}) or {}
     channel = payload.get("channel", {}) or {}
@@ -294,6 +454,33 @@ def lambda_handler(event, context):
     interactive_payload = parse_interactive_payload(raw_body)
 
     if interactive_payload:
+        if interactive_payload.get("type") == "view_submission":
+            enqueue_feedback_submission(interactive_payload)
+            return {
+                "statusCode": 200,
+                "body": "",
+            }
+
+        actions = interactive_payload.get("actions") or []
+        action = actions[0] if actions else {}
+        if str(action.get("action_id") or "").startswith(ACTION_ID_FEEDBACK_RATING):
+            try:
+                open_feedback_modal(interactive_payload, action)
+                return {
+                    "statusCode": 200,
+                    "body": "OK",
+                }
+            except Exception as error:
+                log_json({
+                    "level": "ERROR",
+                    "message": "feedback_modal_open_failed",
+                    "error": str(error),
+                })
+                return {
+                    "statusCode": 200,
+                    "body": "feedback modal failed",
+                }
+
         result = enqueue_interactive_action(interactive_payload)
         return {
             "statusCode": 200,

@@ -52,6 +52,8 @@ CLAUDE_FAILURE_REPLY = os.environ.get(
     "I could not resolve this automatically. Do you want me to create a Jira ticket? Reply yes to create it, or no to cancel."
 )
 CREATE_JIRA_TICKET_FUNCTION = os.environ.get("CREATE_JIRA_TICKET_FUNCTION")
+ENABLE_CREATE_JIRA_TICKET = os.environ.get("ENABLE_CREATE_JIRA_TICKET", "true").lower() == "true"
+ENABLE_CLOSE_SUMMARY = os.environ.get("ENABLE_CLOSE_SUMMARY", "true").lower() == "true"
 ENABLE_ROVO_ENRICHMENT = os.environ.get("ENABLE_ROVO_ENRICHMENT", "false").lower() == "true"
 ROVO_ENRICHMENT_FUNCTION = os.environ.get("ROVO_ENRICHMENT_FUNCTION")
 LIVE_AGENT_FUNCTION = os.environ.get("LIVE_AGENT_FUNCTION")
@@ -182,6 +184,7 @@ ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET = "ivy_assistance_create_jira_ticket"
 ACTION_ID_LIVE_AGENT_SUPPORT = "ivy_live_agent_support"
 ACTION_ID_CREATE_JIRA_TICKET = "ivy_create_jira_ticket"
 ACTION_ID_CLOSE_AND_SUMMARIZE = "ivy_close_and_summarize"
+ACTION_ID_FEEDBACK_RATING = "ivy_feedback_rating"
 
 SESSION_STATE_OPEN = "OPEN"
 SESSION_STATE_COLLECTING_DETAILS = "COLLECTING_DETAILS"
@@ -272,6 +275,13 @@ def log_json(data):
     print(json.dumps(data, default=str))
 
 
+def text_or_empty(value):
+    if value is None:
+        return ""
+
+    return str(value).strip()
+
+
 def value_is_false(value):
     return str(value).strip().lower() in {"false", "0", "no", "disabled"}
 
@@ -330,6 +340,51 @@ def add_jsm_request_comment(ticket_key, body, public=True):
         "public": bool(public),
     }
 
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": atlassian_auth_header(),
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=10) as response:
+        response_text = response.read().decode("utf-8").strip()
+
+    if response_text:
+        try:
+            return json.loads(response_text)
+        except ValueError:
+            return {"message": response_text}
+
+    return {"ok": True}
+
+
+def jira_adf_doc(text):
+    lines = str(text or "").splitlines() or [""]
+    return {
+        "version": 1,
+        "type": "doc",
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [{"type": "text", "text": line or " "}],
+            }
+            for line in lines
+        ],
+    }
+
+
+def add_jira_issue_comment(issue_key, body):
+    if not ATLASSIAN_DOMAIN:
+        raise ValueError("Missing ATLASSIAN_DOMAIN")
+
+    safe_issue_key = urllib.parse.quote(str(issue_key), safe="")
+    url = f"{ATLASSIAN_DOMAIN}/rest/api/3/issue/{safe_issue_key}/comment"
+    payload = {"body": jira_adf_doc(body)}
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -667,7 +722,7 @@ def assistance_blocks(lex_reply, session_id=None, session_root_ts=None):
                     "type": "button",
                     "text": {
                         "type": "plain_text",
-                        "text": "Close & summarize"
+                        "text": "Resolved"
                     },
                     "action_id": ACTION_ID_CLOSE_AND_SUMMARIZE,
                     "value": action_button_value("close_and_summarize", session_id, session_root_ts)
@@ -691,6 +746,39 @@ def final_support_reply_text(reply):
 
 
 def final_support_blocks(reply, session_id=None, session_root_ts=None):
+    elements = [
+        {
+            "type": "button",
+            "text": {
+                "type": "plain_text",
+                "text": "Live agent support"
+            },
+            "action_id": ACTION_ID_LIVE_AGENT_SUPPORT,
+            "value": action_button_value("live_agent_support", session_id, session_root_ts)
+        }
+    ]
+    if ENABLE_CREATE_JIRA_TICKET:
+        elements.append({
+            "type": "button",
+            "text": {
+                "type": "plain_text",
+                "text": "Create Jira ticket"
+            },
+            "style": "primary",
+            "action_id": ACTION_ID_CREATE_JIRA_TICKET,
+            "value": action_button_value("create_jira_ticket", session_id, session_root_ts)
+        })
+    if ENABLE_CLOSE_SUMMARY:
+        elements.append({
+            "type": "button",
+            "text": {
+                "type": "plain_text",
+                "text": "Resolved"
+            },
+            "action_id": ACTION_ID_CLOSE_AND_SUMMARIZE,
+            "value": action_button_value("close_and_summarize", session_id, session_root_ts)
+        })
+
     return [
         {
             "type": "section",
@@ -709,68 +797,43 @@ def final_support_blocks(reply, session_id=None, session_root_ts=None):
         {
             "type": "actions",
             "block_id": "ivy_final_support_actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "Live agent support"
-                    },
-                    "action_id": ACTION_ID_LIVE_AGENT_SUPPORT,
-                    "value": action_button_value("live_agent_support", session_id, session_root_ts)
-                },
-                {
-                    "type": "button",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "Create Jira ticket"
-                    },
-                    "style": "primary",
-                    "action_id": ACTION_ID_CREATE_JIRA_TICKET,
-                    "value": action_button_value("create_jira_ticket", session_id, session_root_ts)
-                },
-                {
-                    "type": "button",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "Close & summarize"
-                    },
-                    "action_id": ACTION_ID_CLOSE_AND_SUMMARIZE,
-                    "value": action_button_value("close_and_summarize", session_id, session_root_ts)
-                }
-            ]
+            "elements": elements
         }
     ]
 
 
 def close_summary_actions_block(session_id=None, session_root_ts=None):
+    elements = []
+    if ENABLE_CLOSE_SUMMARY:
+        elements.append({
+            "type": "button",
+            "text": {
+                "type": "plain_text",
+                "text": "Resolved"
+            },
+            "action_id": ACTION_ID_CLOSE_AND_SUMMARIZE,
+            "value": action_button_value("close_and_summarize", session_id, session_root_ts)
+        })
+    elements.append({
+        "type": "button",
+        "text": {
+            "type": "plain_text",
+            "text": "I need more help"
+        },
+        "action_id": ACTION_ID_ASSISTANCE_NEED_MORE_HELP,
+        "value": action_button_value("need_more_help", session_id, session_root_ts)
+    })
     return {
         "type": "actions",
         "block_id": "ivy_close_summary_actions",
-        "elements": [
-            {
-                "type": "button",
-                "text": {
-                    "type": "plain_text",
-                    "text": "Close & summarize"
-                },
-                "action_id": ACTION_ID_CLOSE_AND_SUMMARIZE,
-                "value": action_button_value("close_and_summarize", session_id, session_root_ts)
-            },
-            {
-                "type": "button",
-                "text": {
-                    "type": "plain_text",
-                    "text": "I need more help"
-                },
-                "action_id": ACTION_ID_ASSISTANCE_NEED_MORE_HELP,
-                "value": action_button_value("need_more_help", session_id, session_root_ts)
-            }
-        ]
+        "elements": elements
     }
 
 
 def add_close_summary_actions(blocks, reply=None, session_id=None, session_root_ts=None):
+    if not ENABLE_CLOSE_SUMMARY:
+        return list(blocks or [])
+
     value = list(blocks or [])
 
     if not value and reply:
@@ -4440,6 +4503,131 @@ def handle_live_agent_user_reply(session_id, session_item, body, channel, user, 
     }
 
 
+def feedback_stars(rating):
+    value = max(1, min(5, int(rating or 1)))
+    return "★" * value + "☆" * (5 - value)
+
+
+def feedback_comment_text(session_id, rating, feedback_text, user, channel):
+    parts = [
+        "IVY user feedback",
+        f"Rating: {feedback_stars(rating)} ({rating}/5)",
+    ]
+    if feedback_text:
+        parts.extend(["", "Feedback:", feedback_text])
+    parts.extend([
+        "",
+        f"Slack user: {user or '-'}",
+        f"Slack channel: {channel or '-'}",
+        f"Session ID: {session_id or '-'}",
+    ])
+    return "\n".join(parts)
+
+
+def update_feedback_session(session_id, rating, feedback_text, user, channel, ticket_key, now_iso, jira_comment_result=None):
+    if not session_id:
+        return
+
+    sessions_table.update_item(
+        Key={"session_id": session_id},
+        UpdateExpression="""
+            SET
+                feedback_rating = :rating,
+                feedback_stars = :stars,
+                feedback_text = :feedback_text,
+                feedback_user = :user,
+                feedback_channel = :channel,
+                feedback_submitted_at = :now,
+                feedback_jira_ticket_key = :ticket_key,
+                feedback_jira_comment_status = :comment_status,
+                updated_at = :now,
+                #ttl = :ttl
+        """,
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues={
+            ":rating": int(rating),
+            ":stars": feedback_stars(rating),
+            ":feedback_text": feedback_text or "",
+            ":user": user or "",
+            ":channel": channel or "",
+            ":now": now_iso,
+            ":ticket_key": ticket_key or "",
+            ":comment_status": "posted" if (jira_comment_result or {}).get("ok") else "not_posted",
+            ":ttl": ttl_epoch(),
+        },
+    )
+
+
+def handle_feedback_submission(body):
+    metadata = body.get("feedback_metadata") or {}
+    session_id = text_or_empty(metadata.get("session_id"))
+    rating = int(metadata.get("rating") or body.get("feedback_rating") or 0)
+    feedback_text = text_or_empty(body.get("feedback_text"))
+    user = text_or_empty(body.get("user"))
+    channel = text_or_empty(body.get("channel"))
+    now_iso = to_iso(datetime.now(timezone.utc))
+    session_item = get_session_item(session_id) if session_id else {}
+    ticket_key = (
+        text_or_empty(metadata.get("summary_jira_ticket_key"))
+        or text_or_empty((session_item or {}).get("summary_jira_ticket_key"))
+    )
+
+    comment_result = {"ok": False, "skipped": True, "reason": "missing_ticket_key"}
+    if ticket_key:
+        comment_body = feedback_comment_text(session_id, rating, feedback_text, user, channel)
+        try:
+            add_jira_issue_comment(ticket_key, comment_body)
+            comment_result = {"ok": True, "ticket_key": ticket_key}
+        except Exception as error:
+            comment_result = {
+                "ok": False,
+                "ticket_key": ticket_key,
+                "error": str(error),
+            }
+
+    update_feedback_session(
+        session_id,
+        rating,
+        feedback_text,
+        user,
+        channel,
+        ticket_key,
+        now_iso,
+        jira_comment_result=comment_result,
+    )
+
+    try:
+        send_slack_message(
+            channel,
+            "Thanks for the feedback. It has been added to the follow-up ticket."
+            if comment_result.get("ok")
+            else "Thanks for the feedback. I saved it, but could not add it to the follow-up ticket.",
+        )
+    except Exception as error:
+        log_json({
+            "level": "WARN",
+            "message": "feedback_ack_failed",
+            "session_id": session_id,
+            "error": str(error),
+        })
+
+    log_json({
+        "level": "INFO" if comment_result.get("ok") else "ERROR",
+        "message": "feedback_submission_processed",
+        "session_id": session_id,
+        "rating": rating,
+        "ticket_key": ticket_key,
+        "jira_comment_ok": comment_result.get("ok"),
+        "error": comment_result.get("error"),
+    })
+    return {
+        "ok": bool(comment_result.get("ok")),
+        "session_id": session_id,
+        "ticket_key": ticket_key,
+        "comment_result": comment_result,
+    }
+
+
 def process_record(record):
     body = json.loads(record["body"])
 
@@ -4457,6 +4645,10 @@ def process_record(record):
     routing_reason = body.get("routing_reason")
     action_id = body.get("action_id")
     action_value = body.get("action_value")
+    if event_type == "feedback_submission":
+        handle_feedback_submission(body)
+        return
+
     is_interactive_action = event_type == "interactive_action"
     action_payload = parse_action_value(action_value)
     body["action_payload"] = action_payload

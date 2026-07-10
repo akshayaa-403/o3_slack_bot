@@ -205,6 +205,7 @@ def mark_summary_started(session_id, timeout_token, started_at):
         AND (
             attribute_not_exists(summary_status)
             OR summary_status = :summarizing
+            OR summary_status = :started
             OR summary_status = :failed
         )
         AND (
@@ -1036,8 +1037,27 @@ def send_close_notification(channel, text):
     )
 
 
-def send_feedback_prompt(channel):
-    # Optional Slack feedback prompt with 1-5 star buttons.
+def feedback_action_value(session_id, rating, summary_jira_result=None):
+    return json.dumps(
+        {
+            "action": "feedback_rating",
+            "session_id": session_id,
+            "rating": rating,
+            "summary_jira_ticket_key": (summary_jira_result or {}).get("ticket_key"),
+            "summary_jira_ticket_url": (summary_jira_result or {}).get("ticket_url"),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def star_rating_label(rating):
+    rating = max(1, min(5, int(rating or 1)))
+    return " ".join([":star:"] * rating)
+
+
+def send_feedback_prompt(channel, session_id=None, summary_jira_result=None):
+    # Optional Slack feedback prompt with star rating buttons.
     if not SEND_FEEDBACK_PROMPT or not channel:
         return
 
@@ -1060,9 +1080,17 @@ def send_feedback_prompt(channel):
                     "elements": [
                         {
                             "type": "button",
-                            "text": {"type": "plain_text", "text": f"{rating} star" if rating == 1 else f"{rating} stars", "emoji": True},
-                            "action_id": f"feedback_{rating}",
-                            "value": str(rating),
+                            "text": {
+                                "type": "plain_text",
+                                "text": star_rating_label(rating),
+                                "emoji": True,
+                            },
+                            "action_id": f"ivy_feedback_rating_{rating}",
+                            "value": feedback_action_value(
+                                session_id,
+                                rating,
+                                summary_jira_result,
+                            ),
                         }
                         for rating in (1, 2, 3, 4, 5)
                     ],
@@ -1304,7 +1332,7 @@ def lambda_handler(event, context):
 
         try:
             send_close_notification(session_item.get("channel"), final_message)
-            send_feedback_prompt(session_item.get("channel"))
+            send_feedback_prompt(session_item.get("channel"), session_id, summary_jira_result)
         except Exception as error:
             log_json({
                 "level": "ERROR",
