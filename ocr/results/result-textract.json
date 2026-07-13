@@ -1,0 +1,6 @@
+{
+  "engine": "textract",
+  "available": false,
+  "reason": "no valid AWS credentials: ClientError",
+  "generated_at": "2026-07-13T10:15:30+00:00"
+}
