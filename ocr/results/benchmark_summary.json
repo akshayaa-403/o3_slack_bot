@@ -1,0 +1,286 @@
+{
+  "generated_at": "2026-07-13T05:34:50+00:00",
+  "engines": {
+    "easyocr": {
+      "engine": "easyocr",
+      "kind": "local-cpu",
+      "description": "EasyOCR (PyTorch) detector+recognizer; CPU/GPU, 80+ languages.",
+      "available": true,
+      "reason": "ready",
+      "load_ms": 15488.1,
+      "images": 5,
+      "images_ok": 5,
+      "mean_char_accuracy": 0.9743,
+      "mean_word_accuracy": 0.94,
+      "mean_latency_ms": 3798.3,
+      "median_latency_ms": 2732.9,
+      "per_image": [
+        {
+          "image": "adam_login_mfa_error.png",
+          "ok": true,
+          "latency_ms": 6896.9,
+          "predicted_text": "ADAM Portal\nUnable to sign in\nError: ADAM portal shows blank page after MFA\nUser completed Microsoft Authenticator approval\nBrowser: Chrome\nRequest: help me fix ADAM login issue\nProject IVY image-flow test screenshot",
+          "accuracy": {
+            "cer": 0.0046,
+            "wer": 0.0303,
+            "char_accuracy": 0.9954,
+            "word_accuracy": 0.9697,
+            "ref_chars": 217,
+            "ref_words": 33
+          },
+          "error": null
+        },
+        {
+          "image": "vpn_connection_failed.png",
+          "ok": true,
+          "latency_ms": 5106.1,
+          "predicted_text": "GlobalProtect VPN\nConnection Failed\nError: VPN connection failed\nThe network connection is unreachable_\nGateway: gpcloudservicecom\nRequest: VPN not connecting\nProject IVY image-flow test screenshot",
+          "accuracy": {
+            "cer": 0.0101,
+            "wer": 0.0833,
+            "char_accuracy": 0.9899,
+            "word_accuracy": 0.9167,
+            "ref_chars": 198,
+            "ref_words": 24
+          },
+          "error": null
+        },
+        {
+          "image": "pcq_access_denied.png",
+          "ok": true,
+          "latency_ms": 2161.6,
+          "predicted_text": "PCQ Access\nAccess Denied\nError: You do not have access to PCQ\nContact IT support to request access\nUser needs PCQ application access.\nneed access to PCQ\nRequest:\nProject IVY image-flow test screenshot",
+          "accuracy": {
+            "cer": 0.1034,
+            "wer": 0.1176,
+            "char_accuracy": 0.8966,
+            "word_accuracy": 0.8824,
+            "ref_chars": 203,
+            "ref_words": 34
+          },
+          "error": null
+        },
+        {
+          "image": "outlook_mailbox_full.png",
+          "ok": true,
+          "latency_ms": 2094.0,
+          "predicted_text": "Microsoft Outlook\nMailbox Full\nError: Your mailbox is full\nYou cannot send or receive email:\nPlease reduce mailbox size:\nRequest: Outlook mailbox full issue\nProject IVY image-flow test screenshot",
+          "accuracy": {
+            "cer": 0.0103,
+            "wer": 0.069,
+            "char_accuracy": 0.9897,
+            "word_accuracy": 0.931,
+            "ref_chars": 195,
+            "ref_words": 29
+          },
+          "error": null
+        },
+        {
+          "image": "unmatched_hr_timesheet_error.png",
+          "ok": true,
+          "latency_ms": 2732.9,
+          "predicted_text": "TimeTrack Portal\nTimesheet submission failed\nError: Timesheet period is locked for payroll processing\nEmployee: Test User\nWeek ending: 30 Jun 2026\nRequest: help me submit my locked timesheet\nProject IVY unmatched image-flow test screenshot",
+          "accuracy": {
+            "cer": 0.0,
+            "wer": 0.0,
+            "char_accuracy": 1.0,
+            "word_accuracy": 1.0,
+            "ref_chars": 239,
+            "ref_words": 34
+          },
+          "error": null
+        }
+      ],
+      "generated_at": "2026-07-13T04:53:59+00:00"
+    },
+    "paddleocr": {
+      "engine": "paddleocr",
+      "kind": "local-cpu",
+      "description": "PaddleOCR (Baidu) detection+recognition; robust multi-language, CPU/GPU.",
+      "available": true,
+      "reason": "ready",
+      "load_ms": 29824.7,
+      "images": 5,
+      "images_ok": 5,
+      "mean_char_accuracy": 0.9894,
+      "mean_word_accuracy": 0.9256,
+      "mean_latency_ms": 1118.4,
+      "median_latency_ms": 839.3,
+      "per_image": [
+        {
+          "image": "adam_login_mfa_error.png",
+          "ok": true,
+          "latency_ms": 1474.3,
+          "predicted_text": "ADAM Portal\nUnable to sign in.\nError: ADAM portal shows blank page after MFA\nUser completed Microsoft Authenticator approval.\nBrowser: Chrome\nRequest: help me fix ADAM login issue.\nProject IVY image-flow test screenshot",
+          "accuracy": {
+            "cer": 0.0092,
+            "wer": 0.0606,
+            "char_accuracy": 0.9908,
+            "word_accuracy": 0.9394,
+            "ref_chars": 217,
+            "ref_words": 33
+          },
+          "error": null
+        },
+        {
+          "image": "vpn_connection_failed.png",
+          "ok": true,
+          "latency_ms": 839.3,
+          "predicted_text": "GlobalProtect VPN\nConnection Failed\nError: VPN connection failed.\nThe network connection is unreachable\nGateway: gpcloudservice.com\nRequest: VPN not connecting.\nProject IVY image-flow test screenshot",
+          "accuracy": {
+            "cer": 0.0152,
+            "wer": 0.125,
+            "char_accuracy": 0.9848,
+            "word_accuracy": 0.875,
+            "ref_chars": 198,
+            "ref_words": 24
+          },
+          "error": null
+        },
+        {
+          "image": "pcq_access_denied.png",
+          "ok": true,
+          "latency_ms": 830.2,
+          "predicted_text": "PCQ Access\nAccess Denied\nError: You do not have access to PCQ\nContact IT support to request access..\nUser needs PCQ application access..\nRequest: I need access to PCQ\nProject IVY image-flow test screenshot",
+          "accuracy": {
+            "cer": 0.0099,
+            "wer": 0.0588,
+            "char_accuracy": 0.9901,
+            "word_accuracy": 0.9412,
+            "ref_chars": 203,
+            "ref_words": 34
+          },
+          "error": null
+        },
+        {
+          "image": "outlook_mailbox_full.png",
+          "ok": true,
+          "latency_ms": 773.4,
+          "predicted_text": "Microsoft Outlook.\nMailbox Full\nError: Your mailbox is full.\nYou cannot send or receive email.\nPlease reduce mailbox size.\nRequest: Outlook mailbox full issue\nProject IVY image-flow test screenshot",
+          "accuracy": {
+            "cer": 0.0103,
+            "wer": 0.069,
+            "char_accuracy": 0.9897,
+            "word_accuracy": 0.931,
+            "ref_chars": 195,
+            "ref_words": 29
+          },
+          "error": null
+        },
+        {
+          "image": "unmatched_hr_timesheet_error.png",
+          "ok": true,
+          "latency_ms": 1674.6,
+          "predicted_text": "TimeTrack Portal\nTimesheet submissjon failed.\nError: Timesheet period is locked for payroll processing\nEmployee: Test User\nWeek ending: 30 Jun 2026\nRequest: help me submit my locked timesheet\nProject IVY unmatched image-flow test screenshot",
+          "accuracy": {
+            "cer": 0.0084,
+            "wer": 0.0588,
+            "char_accuracy": 0.9916,
+            "word_accuracy": 0.9412,
+            "ref_chars": 239,
+            "ref_words": 34
+          },
+          "error": null
+        }
+      ],
+      "generated_at": "2026-07-13T04:59:50+00:00"
+    },
+    "textract": {
+      "engine": "textract",
+      "available": false,
+      "reason": "no valid AWS credentials: ClientError"
+    },
+    "mistral-ocr": {
+      "engine": "mistral-ocr",
+      "kind": "cloud-api",
+      "description": "Mistral OCR API; structured markdown/tables/equations from complex docs.",
+      "available": true,
+      "reason": "ready (MISTRAL_API_KEY present)",
+      "load_ms": 1099.8,
+      "images": 5,
+      "images_ok": 5,
+      "mean_char_accuracy": 1.0,
+      "mean_word_accuracy": 1.0,
+      "mean_latency_ms": 833.7,
+      "median_latency_ms": 802.4,
+      "per_image": [
+        {
+          "image": "adam_login_mfa_error.png",
+          "ok": true,
+          "latency_ms": 930.8,
+          "predicted_text": "ADAM Portal\nUnable to sign in\nError: ADAM portal shows blank page after MFA\nUser completed Microsoft Authenticator approval.\nBrowser: Chrome\nRequest: help me fix ADAM login issue\nProject IVY image-flow test screenshot",
+          "accuracy": {
+            "cer": 0.0,
+            "wer": 0.0,
+            "char_accuracy": 1.0,
+            "word_accuracy": 1.0,
+            "ref_chars": 217,
+            "ref_words": 33
+          },
+          "error": null
+        },
+        {
+          "image": "vpn_connection_failed.png",
+          "ok": true,
+          "latency_ms": 802.4,
+          "predicted_text": "GlobalProtect VPN\nConnection Failed\nError: VPN connection failed\nThe network connection is unreachable.\nGateway: gpcloudservice.com\nRequest: VPN not connecting\nProject IVY image-flow test screenshot",
+          "accuracy": {
+            "cer": 0.0,
+            "wer": 0.0,
+            "char_accuracy": 1.0,
+            "word_accuracy": 1.0,
+            "ref_chars": 198,
+            "ref_words": 24
+          },
+          "error": null
+        },
+        {
+          "image": "pcq_access_denied.png",
+          "ok": true,
+          "latency_ms": 845.5,
+          "predicted_text": "PCQ Access\nAccess Denied\nError: You do not have access to PCQ\nContact IT support to request access.\nUser needs PCQ application access.\nRequest: I need access to PCQ\nProject IVY image-flow test screenshot",
+          "accuracy": {
+            "cer": 0.0,
+            "wer": 0.0,
+            "char_accuracy": 1.0,
+            "word_accuracy": 1.0,
+            "ref_chars": 203,
+            "ref_words": 34
+          },
+          "error": null
+        },
+        {
+          "image": "outlook_mailbox_full.png",
+          "ok": true,
+          "latency_ms": 787.7,
+          "predicted_text": "Microsoft Outlook\nMailbox Full\nError: Your mailbox is full\nYou cannot send or receive email.\nPlease reduce mailbox size.\nRequest: Outlook mailbox full issue\nProject IVY image-flow test screenshot",
+          "accuracy": {
+            "cer": 0.0,
+            "wer": 0.0,
+            "char_accuracy": 1.0,
+            "word_accuracy": 1.0,
+            "ref_chars": 195,
+            "ref_words": 29
+          },
+          "error": null
+        },
+        {
+          "image": "unmatched_hr_timesheet_error.png",
+          "ok": true,
+          "latency_ms": 802.0,
+          "predicted_text": "TimeTrack Portal\nTimesheet submission failed\nError: Timesheet period is locked for payroll processing\nEmployee: Test User\nWeek ending: 30 Jun 2026\nRequest: help me submit my locked timesheet\nProject IVY unmatched image-flow test screenshot",
+          "accuracy": {
+            "cer": 0.0,
+            "wer": 0.0,
+            "char_accuracy": 1.0,
+            "word_accuracy": 1.0,
+            "ref_chars": 239,
+            "ref_words": 34
+          },
+          "error": null
+        }
+      ],
+      "generated_at": "2026-07-13T05:34:25+00:00"
+    }
+  }
+}

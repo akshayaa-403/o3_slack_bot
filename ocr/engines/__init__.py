@@ -1,0 +1,1 @@
+"""OCR engine adapters need to be registered here to be benchmarked."""
