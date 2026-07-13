@@ -28,7 +28,9 @@ LIVE_AGENT_SUPPORT_CHANNEL_ID = os.environ.get("LIVE_AGENT_SUPPORT_CHANNEL_ID", 
 
 dedup_table = dynamodb.Table(DEDUP_TABLE)
 ACTION_ID_FEEDBACK_RATING = "ivy_feedback_rating"
+ACTION_ID_LIVE_AGENT_REPLY = "ivy_live_agent_reply"
 CALLBACK_ID_FEEDBACK_FORM = "ivy_feedback_form"
+CALLBACK_ID_LIVE_AGENT_REPLY = "ivy_live_agent_reply_form"
 
 
 def log_json(data):
@@ -280,6 +282,67 @@ def open_feedback_modal(payload, action):
     )
 
 
+def support_reply_metadata(payload, action):
+    user = payload.get("user", {}) or {}
+    channel = payload.get("channel", {}) or {}
+    message = payload.get("message", {}) or {}
+    container = payload.get("container", {}) or {}
+    action_payload = parse_action_value(action.get("value"))
+    return {
+        **action_payload,
+        "user": user.get("id"),
+        "channel": channel.get("id"),
+        "message_ts": container.get("message_ts") or message.get("ts"),
+        "thread_ts": message.get("thread_ts") or container.get("thread_ts") or container.get("message_ts") or message.get("ts"),
+    }
+
+
+def open_live_agent_reply_modal(payload, action):
+    metadata = support_reply_metadata(payload, action)
+    ticket_key = metadata.get("ticket_key") or "live-agent request"
+    modal = {
+        "type": "modal",
+        "callback_id": CALLBACK_ID_LIVE_AGENT_REPLY,
+        "private_metadata": json.dumps(metadata, ensure_ascii=True, separators=(",", ":")),
+        "title": {"type": "plain_text", "text": "Reply to customer"},
+        "submit": {"type": "plain_text", "text": "Send"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"Ticket: *{ticket_key}*",
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "live_agent_reply",
+                "label": {
+                    "type": "plain_text",
+                    "text": "Message",
+                },
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "reply_text",
+                    "multiline": True,
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "Write the message to send to the requester",
+                    },
+                },
+            },
+        ],
+    }
+    return slack_api(
+        "views.open",
+        {
+            "trigger_id": payload.get("trigger_id"),
+            "view": modal,
+        },
+    )
+
+
 def extract_feedback_text(view):
     state_values = ((view or {}).get("state") or {}).get("values") or {}
     for block in state_values.values():
@@ -289,6 +352,13 @@ def extract_feedback_text(view):
             if isinstance(action, dict) and "value" in action:
                 return action.get("value") or ""
     return ""
+
+
+def extract_live_agent_reply_text(view):
+    state_values = ((view or {}).get("state") or {}).get("values") or {}
+    reply_block = state_values.get("live_agent_reply") or {}
+    reply_action = reply_block.get("reply_text") or {}
+    return reply_action.get("value") or ""
 
 
 def enqueue_feedback_submission(payload):
@@ -331,6 +401,55 @@ def enqueue_feedback_submission(payload):
             "feedback_rating": metadata.get("rating"),
             "feedback_text": extract_feedback_text(view),
             "feedback_metadata": metadata,
+        }),
+    )
+    return "OK"
+
+
+def enqueue_live_agent_reply_submission(payload):
+    view = payload.get("view") or {}
+    metadata = parse_action_value(view.get("private_metadata"))
+    user = payload.get("user", {}) or {}
+    reply_text = extract_live_agent_reply_text(view).strip()
+    event_id = "live-agent-reply-" + hashlib.sha256(
+        "|".join([
+            metadata.get("ticket_key") or "",
+            user.get("id") or "",
+            view.get("id") or "",
+            reply_text,
+        ]).encode("utf-8")
+    ).hexdigest()[:32]
+    now = int(time.time())
+
+    try:
+        dedup_table.put_item(
+            Item={
+                "event_id": event_id,
+                "event_time": now,
+                "created_at": now,
+                "ttl": now + DEDUP_TTL_SECONDS,
+            },
+            ConditionExpression="attribute_not_exists(event_id)",
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return "duplicate ignored"
+        raise
+
+    sqs.send_message(
+        QueueUrl=QUEUE_URL,
+        MessageBody=json.dumps({
+            "event_id": event_id,
+            "event_type": "live_agent_reply_submission",
+            "routing_reason": "live_agent_reply_submission",
+            "channel": metadata.get("channel"),
+            "user": user.get("id") or metadata.get("user"),
+            "text": reply_text,
+            "raw_text": reply_text,
+            "ts": metadata.get("message_ts"),
+            "thread_ts": metadata.get("thread_ts"),
+            "message_ts": metadata.get("message_ts"),
+            "ticket_key": metadata.get("ticket_key"),
         }),
     )
     return "OK"
@@ -468,7 +587,10 @@ def lambda_handler(event, context):
 
     if interactive_payload:
         if interactive_payload.get("type") == "view_submission":
-            if ENABLE_FEEDBACK_FORM:
+            callback_id = (interactive_payload.get("view") or {}).get("callback_id")
+            if callback_id == CALLBACK_ID_LIVE_AGENT_REPLY:
+                enqueue_live_agent_reply_submission(interactive_payload)
+            elif ENABLE_FEEDBACK_FORM:
                 enqueue_feedback_submission(interactive_payload)
             return {
                 "statusCode": 200,
@@ -499,6 +621,24 @@ def lambda_handler(event, context):
                 return {
                     "statusCode": 200,
                     "body": "feedback modal failed",
+                }
+
+        if action.get("action_id") == ACTION_ID_LIVE_AGENT_REPLY:
+            try:
+                open_live_agent_reply_modal(interactive_payload, action)
+                return {
+                    "statusCode": 200,
+                    "body": "OK",
+                }
+            except Exception as error:
+                log_json({
+                    "level": "ERROR",
+                    "message": "live_agent_reply_modal_open_failed",
+                    "error": str(error),
+                })
+                return {
+                    "statusCode": 200,
+                    "body": "live agent reply modal failed",
                 }
 
         result = enqueue_interactive_action(interactive_payload)

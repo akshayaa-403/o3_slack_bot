@@ -193,6 +193,9 @@ ACTION_ID_ASSISTANCE_SOLVED = "ivy_assistance_solved"
 ACTION_ID_ASSISTANCE_NEED_MORE_HELP = "ivy_assistance_need_more_help"
 ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET = "ivy_assistance_create_jira_ticket"
 ACTION_ID_LIVE_AGENT_SUPPORT = "ivy_live_agent_support"
+ACTION_ID_LIVE_AGENT_REPLY = "ivy_live_agent_reply"
+ACTION_ID_LIVE_AGENT_RESOLVE = "ivy_live_agent_resolve"
+ACTION_ID_LIVE_AGENT_REASSIGN = "ivy_live_agent_reassign"
 ACTION_ID_CREATE_JIRA_TICKET = "ivy_create_jira_ticket"
 ACTION_ID_CLOSE_AND_SUMMARIZE = "ivy_close_and_summarize"
 ACTION_ID_FEEDBACK_RATING = "ivy_feedback_rating"
@@ -4528,6 +4531,60 @@ def find_live_agent_support_bridge(channel, thread_ts):
     return items[0] if items else None
 
 
+def find_live_agent_support_bridge_for_event(channel, *ts_values):
+    for ts_value in ts_values:
+        pointer = find_live_agent_support_bridge(channel, text_or_empty(ts_value))
+        if pointer:
+            return pointer
+    return None
+
+
+def is_live_agent_support_control_action(action_id):
+    return action_id in {ACTION_ID_LIVE_AGENT_RESOLVE, ACTION_ID_LIVE_AGENT_REASSIGN}
+
+
+def live_agent_support_control_event_type(action_id):
+    if action_id == ACTION_ID_LIVE_AGENT_RESOLVE:
+        return "live_agent_support_resolve"
+    return "live_agent_support_reassign"
+
+
+def invoke_live_agent_support_control(pointer, body, action_id):
+    if not LIVE_AGENT_FUNCTION:
+        raise ValueError("Missing LIVE_AGENT_FUNCTION for support control action")
+
+    payload = {
+        "source": "slack_support",
+        "event_type": live_agent_support_control_event_type(action_id),
+        "event_id": body.get("event_id"),
+        "action": body.get("action_value"),
+        "action_id": action_id,
+        "action_user": body.get("user"),
+        "action_ts": body.get("ts"),
+        "message_ts": body.get("message_ts") or body.get("thread_ts") or body.get("ts"),
+        "support_channel": body.get("channel"),
+        "support_thread_ts": pointer.get("support_thread_ts"),
+        "ticket_key": pointer.get("ticket_key"),
+        "session_id": pointer.get("target_session_id"),
+    }
+    response = lambda_client.invoke(
+        FunctionName=LIVE_AGENT_FUNCTION,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(payload).encode("utf-8"),
+    )
+    raw_payload = response.get("Payload").read().decode("utf-8") if response.get("Payload") else "{}"
+    parsed = json.loads(raw_payload or "{}")
+    if response.get("FunctionError"):
+        raise RuntimeError(parsed.get("error") or response.get("FunctionError"))
+    if isinstance(parsed, dict) and "body" in parsed:
+        try:
+            parsed_body = json.loads(parsed.get("body") or "{}")
+        except ValueError:
+            parsed_body = {"raw_body": parsed.get("body")}
+        return {**parsed, "parsed_body": parsed_body}
+    return parsed
+
+
 def live_agent_bridge_marker_id(direction, pointer, body, text):
     source_id = body.get("event_id") or body.get("ts") or hashlib.sha256(
         "|".join([
@@ -4662,6 +4719,29 @@ def handle_live_agent_support_thread_reply(pointer, body, text):
         "support_thread_ts": body.get("thread_ts"),
     })
     return {"ok": True, "ticket_key": pointer.get("ticket_key")}
+
+
+def handle_live_agent_reply_submission(body):
+    ticket_key = text_or_empty(body.get("ticket_key"))
+    text = text_or_empty(body.get("text"))
+    if not ticket_key:
+        return {"ok": False, "error": "missing_ticket_key"}
+    if not text:
+        return {"ok": False, "error": "missing_reply_text", "ticket_key": ticket_key}
+
+    pointer = get_session_item(f"live_agent_ticket:{ticket_key}")
+    if not pointer:
+        return {"ok": False, "error": "missing_live_agent_ticket_pointer", "ticket_key": ticket_key}
+    if pointer.get("bridge_status") != "active":
+        return {"ok": False, "error": "inactive_live_agent_bridge", "ticket_key": ticket_key}
+
+    reply_body = {
+        **body,
+        "channel": body.get("channel") or pointer.get("support_channel"),
+        "thread_ts": body.get("thread_ts") or pointer.get("support_thread_ts"),
+        "ts": body.get("ts") or body.get("message_ts"),
+    }
+    return handle_live_agent_support_thread_reply(pointer, reply_body, text)
 
 
 def handle_live_agent_user_reply(session_id, session_item, body, channel, user, text, thread_ts, ts):
@@ -4898,6 +4978,18 @@ def process_record(record):
         handle_feedback_submission(body)
         return
 
+    if event_type == "live_agent_reply_submission":
+        result = handle_live_agent_reply_submission(body)
+        log_json({
+            "level": "INFO" if result.get("ok") else "ERROR",
+            "message": "live_agent_reply_submission_processed",
+            "event_id": event_id,
+            "ticket_key": body.get("ticket_key"),
+            "ok": result.get("ok"),
+            "error": result.get("error"),
+        })
+        return
+
     is_interactive_action = event_type == "interactive_action"
     action_payload = parse_action_value(action_value)
     body["action_payload"] = action_payload
@@ -4942,7 +5034,23 @@ def process_record(record):
         or body.get("bot_user_id")
         or body.get("subtype") in {"bot_message", "message_changed", "message_deleted"}
     )
-    support_bridge = find_live_agent_support_bridge(channel, body.get("thread_ts"))
+    support_bridge = find_live_agent_support_bridge_for_event(
+        channel,
+        body.get("thread_ts"),
+        body.get("message_ts"),
+    )
+    if support_bridge and is_interactive_action and is_live_agent_support_control_action(action_id):
+        control_result = invoke_live_agent_support_control(support_bridge, body, action_id)
+        log_json({
+            "level": "INFO",
+            "message": "live_agent_support_control_forwarded",
+            "event_id": event_id,
+            "ticket_key": support_bridge.get("ticket_key"),
+            "action_id": action_id,
+            "result": control_result,
+        })
+        return
+
     if support_bridge and not is_interactive_action:
         if is_bot_message or not text:
             log_json({
