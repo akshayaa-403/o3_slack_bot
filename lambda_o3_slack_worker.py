@@ -176,6 +176,11 @@ ATLASSIAN_DOMAIN = os.environ.get("ATLASSIAN_DOMAIN", "").rstrip("/")
 ATLASSIAN_EMAIL = os.environ.get("ATLASSIAN_EMAIL", "")
 ATLASSIAN_API_TOKEN = os.environ.get("ATLASSIAN_API_TOKEN", "")
 JSM_COMMENT_PUBLIC = os.environ.get("JSM_COMMENT_PUBLIC", "true").lower() == "true"
+LIVE_AGENT_SUPPORT_MODE = os.environ.get("LIVE_AGENT_SUPPORT_MODE", "").strip().lower()
+LIVE_AGENT_SUPPORT_CHANNEL_ID = os.environ.get("LIVE_AGENT_SUPPORT_CHANNEL_ID", "").strip()
+LIVE_AGENT_SYNC_AGENT_REPLIES_TO_JSM = (
+    os.environ.get("LIVE_AGENT_SYNC_AGENT_REPLIES_TO_JSM", "true").lower() == "true"
+)
 
 NEXT_ACTION_CREATE_JIRA_TICKET = "O3_CreateJiraTicket"
 NEXT_ACTION_CLAUDE_ASSISTANCE = "O3_ClaudeFurtherAssistance"
@@ -4495,6 +4500,170 @@ def update_live_agent_user_reply_pointer(ticket_key, text, now_iso):
     )
 
 
+def support_bridge_enabled():
+    return LIVE_AGENT_SUPPORT_MODE == "slack_console" and bool(LIVE_AGENT_SUPPORT_CHANNEL_ID)
+
+
+def requester_thread_ts(pointer):
+    channel = text_or_empty(pointer.get("slack_channel"))
+    if channel.startswith("D"):
+        return None
+    return text_or_empty(pointer.get("slack_thread_ts")) or None
+
+
+def find_live_agent_support_bridge(channel, thread_ts):
+    if not (support_bridge_enabled() and channel and thread_ts):
+        return None
+
+    response = sessions_table.scan(
+        FilterExpression=(
+            Attr("pointer_type").eq("live_agent_ticket")
+            & Attr("support_channel").eq(channel)
+            & Attr("support_thread_ts").eq(thread_ts)
+            & Attr("bridge_status").eq("active")
+        ),
+        Limit=1,
+    )
+    items = response.get("Items") or []
+    return items[0] if items else None
+
+
+def live_agent_bridge_marker_id(direction, pointer, body, text):
+    source_id = body.get("event_id") or body.get("ts") or hashlib.sha256(
+        "|".join([
+            direction,
+            text_or_empty(pointer.get("ticket_key")),
+            text_or_empty(body.get("channel")),
+            text_or_empty(body.get("user")),
+            text_or_empty(text),
+        ]).encode("utf-8")
+    ).hexdigest()[:32]
+    return f"live_agent_bridge:{direction}:{source_id}"
+
+
+def acquire_live_agent_bridge_marker(direction, pointer, body, text, now_iso):
+    marker_session_id = live_agent_bridge_marker_id(direction, pointer, body, text)
+    try:
+        sessions_table.put_item(
+            Item={
+                "session_id": marker_session_id,
+                "record_type": "live_agent_bridge_marker",
+                "direction": direction,
+                "ticket_key": pointer.get("ticket_key") or "",
+                "source_event_id": body.get("event_id") or "",
+                "source_channel": body.get("channel") or "",
+                "source_ts": body.get("ts") or "",
+                "created_at": now_iso,
+                "ttl": ttl_epoch(),
+            },
+            ConditionExpression="attribute_not_exists(session_id)",
+        )
+        return {"acquired": True, "session_id": marker_session_id}
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return {"acquired": False, "session_id": marker_session_id}
+        raise
+
+
+def append_live_agent_bridge_message(pointer, sender, text, ts, now_iso):
+    entries = [transcript_entry(sender, text, ts)]
+    entries = [entry for entry in entries if entry]
+    if not entries:
+        return
+
+    for session_id in dict.fromkeys([pointer.get("session_id"), pointer.get("target_session_id")]):
+        if not session_id:
+            continue
+        sessions_table.update_item(
+            Key={"session_id": session_id},
+            UpdateExpression="""
+                SET
+                    last_live_agent_bridge_message = :text,
+                    last_live_agent_bridge_message_at = :now,
+                    live_agent_updated_at = :now,
+                    updated_at = :now,
+                    #ttl = :ttl,
+                    session_messages = list_append(if_not_exists(session_messages, :empty_list), :entries)
+            """,
+            ExpressionAttributeNames={"#ttl": "ttl"},
+            ExpressionAttributeValues={
+                ":text": truncate_text(text, 2000),
+                ":now": now_iso,
+                ":ttl": ttl_epoch(),
+                ":empty_list": [],
+                ":entries": entries,
+            },
+        )
+
+
+def agent_reply_to_user_text(pointer, agent_user, text):
+    agent_label = pointer.get("assignee_display_name") or "Support agent"
+    return f"{agent_label}: {text}"
+
+
+def agent_reply_to_jsm_comment(agent_user, text, support_channel, support_thread_ts):
+    return (
+        f"[From Slack] Agent {agent_user} replied:\n\n"
+        f"{text}\n\n"
+        f"Slack support channel: {support_channel}\n"
+        f"Slack support thread: {support_thread_ts}"
+    )
+
+
+def handle_live_agent_support_thread_reply(pointer, body, text):
+    now_iso = to_iso(datetime.now(timezone.utc))
+    marker = acquire_live_agent_bridge_marker("agent_to_user", pointer, body, text, now_iso)
+    if not marker.get("acquired"):
+        log_json({
+            "level": "INFO",
+            "message": "live_agent_support_reply_duplicate",
+            "ticket_key": pointer.get("ticket_key"),
+            "marker_session_id": marker.get("session_id"),
+        })
+        return {"ok": True, "duplicate": True, "ticket_key": pointer.get("ticket_key")}
+
+    requester_channel = text_or_empty(pointer.get("slack_channel"))
+    if not requester_channel:
+        return {"ok": False, "error": "missing_requester_channel", "ticket_key": pointer.get("ticket_key")}
+
+    send_slack_message(
+        requester_channel,
+        agent_reply_to_user_text(pointer, body.get("user"), text),
+        thread_ts=requester_thread_ts(pointer),
+    )
+
+    if LIVE_AGENT_SYNC_AGENT_REPLIES_TO_JSM and pointer.get("ticket_key"):
+        try:
+            add_jsm_request_comment(
+                pointer["ticket_key"],
+                agent_reply_to_jsm_comment(
+                    body.get("user"),
+                    text,
+                    body.get("channel"),
+                    body.get("thread_ts") or body.get("ts"),
+                ),
+                public=JSM_COMMENT_PUBLIC,
+            )
+        except Exception as error:
+            log_json({
+                "level": "ERROR",
+                "message": "live_agent_support_reply_jsm_sync_failed",
+                "ticket_key": pointer.get("ticket_key"),
+                "error": str(error),
+            })
+
+    append_live_agent_bridge_message(pointer, "Agent", text, body.get("ts"), now_iso)
+    log_json({
+        "level": "INFO",
+        "message": "live_agent_support_reply_forwarded",
+        "ticket_key": pointer.get("ticket_key"),
+        "requester_channel": requester_channel,
+        "support_channel": body.get("channel"),
+        "support_thread_ts": body.get("thread_ts"),
+    })
+    return {"ok": True, "ticket_key": pointer.get("ticket_key")}
+
+
 def handle_live_agent_user_reply(session_id, session_item, body, channel, user, text, thread_ts, ts):
     ticket_key = session_item.get("live_agent_ticket_key") or session_item.get("last_live_agent_ticket_key")
     event_id = body.get("event_id")
@@ -4529,9 +4698,36 @@ def handle_live_agent_user_reply(session_id, session_item, body, channel, user, 
     comment_body = build_live_agent_slack_comment(user, text, channel, thread_ts, ts)
 
     try:
+        support_channel = text_or_empty(session_item.get("support_channel"))
+        support_thread_ts = text_or_empty(session_item.get("support_thread_ts"))
+        if support_bridge_enabled() and support_channel and support_thread_ts and session_item.get("bridge_status") == "active":
+            try:
+                send_slack_message(
+                    support_channel,
+                    f"Requester <@{user}> replied:\n\n{text}",
+                    thread_ts=support_thread_ts,
+                )
+            except Exception as error:
+                log_json({
+                    "level": "ERROR",
+                    "message": "live_agent_user_reply_support_thread_forward_failed",
+                    "session_id": session_id,
+                    "ticket_key": ticket_key,
+                    "error": str(error),
+                })
         add_jsm_request_comment(ticket_key, comment_body, public=JSM_COMMENT_PUBLIC)
         update_live_agent_user_reply_session(session_id, session_item, event_id, text, now_iso)
         update_live_agent_user_reply_pointer(ticket_key, text, now_iso)
+        append_live_agent_bridge_message(
+            {
+                "session_id": session_id,
+                "target_session_id": session_id,
+            },
+            "User",
+            text,
+            ts,
+            now_iso,
+        )
         update_live_agent_slack_comment_marker(marker["session_id"], "posted", now_iso)
     except Exception as e:
         update_live_agent_slack_comment_marker(marker["session_id"], "failed", now_iso, error=e)
@@ -4741,6 +4937,26 @@ def process_record(record):
         "action_id": action_id
     })
 
+    is_bot_message = bool(
+        body.get("bot_id")
+        or body.get("bot_user_id")
+        or body.get("subtype") in {"bot_message", "message_changed", "message_deleted"}
+    )
+    support_bridge = find_live_agent_support_bridge(channel, body.get("thread_ts"))
+    if support_bridge and not is_interactive_action:
+        if is_bot_message or not text:
+            log_json({
+                "level": "INFO",
+                "message": "live_agent_support_thread_message_ignored",
+                "event_id": event_id,
+                "ticket_key": support_bridge.get("ticket_key"),
+                "is_bot_message": is_bot_message,
+                "has_text": bool(text),
+            })
+            return
+        handle_live_agent_support_thread_reply(support_bridge, body, text)
+        return
+
     existing_session = get_session_item(session_id)
     if (
         one_to_one_dm
@@ -4829,11 +5045,6 @@ def process_record(record):
         })
         return
 
-    is_bot_message = bool(
-        body.get("bot_id")
-        or body.get("bot_user_id")
-        or body.get("subtype") in {"bot_message", "message_changed", "message_deleted"}
-    )
     if existing_session and not is_interactive_action and is_live_agent_dm_session_pending_or_active(existing_session):
         if is_bot_message or not text:
             log_json({

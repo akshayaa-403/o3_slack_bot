@@ -24,6 +24,7 @@ DEDUP_TTL_SECONDS = int(os.environ.get("DEDUP_TTL_SECONDS", "172800"))
 SLACK_SIGNATURE_TOLERANCE_SECONDS = int(os.environ.get("SLACK_SIGNATURE_TOLERANCE_SECONDS", "300"))
 ENABLE_FEEDBACK_RATING = os.environ.get("ENABLE_FEEDBACK_RATING", "true").lower() == "true"
 ENABLE_FEEDBACK_FORM = os.environ.get("ENABLE_FEEDBACK_FORM", "true").lower() == "true"
+LIVE_AGENT_SUPPORT_CHANNEL_ID = os.environ.get("LIVE_AGENT_SUPPORT_CHANNEL_ID", "").strip()
 
 dedup_table = dynamodb.Table(DEDUP_TABLE)
 ACTION_ID_FEEDBACK_RATING = "ivy_feedback_rating"
@@ -117,6 +118,13 @@ def message_mentions_bot(slack_event):
         return True
 
     return slack_event.get("type") == "app_mention"
+
+
+def is_live_agent_support_channel(slack_event):
+    return bool(
+        LIVE_AGENT_SUPPORT_CHANNEL_ID
+        and slack_event.get("channel") == LIVE_AGENT_SUPPORT_CHANNEL_ID
+    )
 
 
 def clean_slack_text(text):
@@ -437,6 +445,9 @@ def should_process_slack_event(slack_event):
 
     if is_direct_message(slack_event):
         return True, "direct_message"
+
+    if is_live_agent_support_channel(slack_event):
+        return True, "live_agent_support_channel"
 
     if message_mentions_bot(slack_event):
         return True, "bot_mentioned"

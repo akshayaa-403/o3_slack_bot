@@ -48,6 +48,14 @@ LIVE_AGENT_BUSY_REPLY = os.environ.get(
     "LIVE_AGENT_BUSY_REPLY",
     "All live agents are busy right now. You are in the queue and support will pick this up as soon as someone is available."
 )
+LIVE_AGENT_SUPPORT_MODE = os.environ.get("LIVE_AGENT_SUPPORT_MODE", "").strip().lower()
+LIVE_AGENT_SUPPORT_CHANNEL_ID = os.environ.get("LIVE_AGENT_SUPPORT_CHANNEL_ID", "").strip()
+try:
+    LIVE_AGENT_AGENT_SLACK_MAP = json.loads(os.environ.get("LIVE_AGENT_AGENT_SLACK_MAP", "{}") or "{}")
+    if not isinstance(LIVE_AGENT_AGENT_SLACK_MAP, dict):
+        LIVE_AGENT_AGENT_SLACK_MAP = {}
+except ValueError:
+    LIVE_AGENT_AGENT_SLACK_MAP = {}
 
 SUCCESS_REPLY = os.environ.get(
     "LIVE_AGENT_SUCCESS_REPLY",
@@ -485,6 +493,116 @@ def live_agent_queue_assigned_reply(ticket_key, agent_name):
         return f"✅ A live agent is now available. {agent_text} has been assigned to {ticket_key}."
 
     return f"✅ A live agent is now available. {agent_text} has been assigned to your request."
+
+
+def live_agent_slack_console_enabled():
+    return LIVE_AGENT_SUPPORT_MODE == "slack_console" and bool(LIVE_AGENT_SUPPORT_CHANNEL_ID)
+
+
+def slack_user_mention(user_id):
+    user_id = text_or_empty(user_id)
+    return f"<@{user_id}>" if user_id else "Unassigned"
+
+
+def resolve_agent_slack_user_id(callback, assignment=None):
+    assignment = assignment or {}
+    agent = assignment.get("agent") if isinstance(assignment.get("agent"), dict) else {}
+    candidates = [
+        callback.get("assigned_agent_slack_user_id"),
+        callback.get("assignee_slack_user_id"),
+        assignment.get("assigned_agent_slack_user_id"),
+        agent.get("slack_user_id"),
+    ]
+    for value in candidates:
+        value = text_or_empty(value)
+        if value:
+            return value
+
+    lookup_keys = [
+        callback.get("assignee_account_id"),
+        callback.get("assignee_email"),
+        assignment.get("assigned_jira_account_id"),
+        assignment.get("assigned_agent_id"),
+        assignment.get("assigned_agent_name"),
+        agent.get("jira_account_id"),
+        agent.get("agent_id"),
+        agent.get("email"),
+        agent.get("display_name"),
+    ]
+    for key in lookup_keys:
+        value = LIVE_AGENT_AGENT_SLACK_MAP.get(text_or_empty(key))
+        if text_or_empty(value):
+            return text_or_empty(value)
+
+    return ""
+
+
+def live_agent_support_thread_text(callback, assignment, assigned_slack_user_id):
+    ticket_key = callback.get("ticket_key") or "live-agent request"
+    parts = [
+        f"*New IVY live-agent request:* {ticket_key}",
+        f"*Assigned agent:* {slack_user_mention(assigned_slack_user_id)}",
+    ]
+    if callback.get("ticket_url"):
+        parts.append(f"*JSM ticket:* {callback['ticket_url']}")
+    if callback.get("slack_user"):
+        parts.append(f"*Requester:* <@{callback['slack_user']}>")
+    if callback.get("user_request"):
+        parts.append(f"*User request:*\n{callback['user_request']}")
+    elif callback.get("conversation_summary"):
+        parts.append(f"*Summary:*\n{callback['conversation_summary']}")
+    parts.append("Reply in this thread to message the requester. Use JSM for ticket/audit updates.")
+    return "\n\n".join(parts)
+
+
+def mark_live_agent_support_thread(pointer_session_id, target_session_id, support_result):
+    if not (session_table and pointer_session_id and support_result.get("ts")):
+        return
+
+    now_iso = utc_now_iso()
+    values = {
+        ":support_channel": LIVE_AGENT_SUPPORT_CHANNEL_ID,
+        ":support_thread_ts": support_result["ts"],
+        ":assigned_slack_user": support_result.get("assigned_slack_user_id") or "",
+        ":bridge_status": "active",
+        ":now": now_iso,
+        ":ttl": ttl_epoch(),
+    }
+    expression = """
+        SET
+            support_channel = :support_channel,
+            support_thread_ts = :support_thread_ts,
+            assigned_agent_slack_user_id = :assigned_slack_user,
+            bridge_status = :bridge_status,
+            support_thread_created_at = :now,
+            updated_at = :now,
+            #ttl = :ttl
+    """
+    names = {"#ttl": "ttl"}
+
+    for session_id in [pointer_session_id, target_session_id]:
+        if not session_id:
+            continue
+        session_table.update_item(
+            Key={"session_id": session_id},
+            UpdateExpression=expression,
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+        )
+
+
+def post_live_agent_support_thread(callback, assignment):
+    if not live_agent_slack_console_enabled():
+        return {"attempted": False, "reason": "slack_console_disabled"}
+
+    assigned_slack_user_id = resolve_agent_slack_user_id(callback, assignment)
+    text = live_agent_support_thread_text(callback, assignment, assigned_slack_user_id)
+    result = post_slack_message(LIVE_AGENT_SUPPORT_CHANNEL_ID, text)
+    return {
+        "attempted": True,
+        "ts": result.get("ts"),
+        "assigned_slack_user_id": assigned_slack_user_id,
+    }
 
 
 def agent_key_from_user(user):
@@ -1633,24 +1751,31 @@ def update_status_pointer(pointer_session_id, callback):
         return
 
     now_iso = utc_now_iso()
+    live_agent_status = callback.get("live_agent_status") or ""
+    bridge_status_expression = "bridge_status = :bridge_status," if live_agent_status == "resolved" else ""
+    expression_values = {
+        ":ticket_status": callback.get("ticket_status") or "",
+        ":live_agent_status": live_agent_status,
+        ":now": now_iso,
+        ":ttl": ttl_epoch(),
+    }
+    if live_agent_status == "resolved":
+        expression_values[":bridge_status"] = "resolved"
+
     session_table.update_item(
         Key={"session_id": pointer_session_id},
-        UpdateExpression="""
+        UpdateExpression=f"""
             SET
                 ticket_status = :ticket_status,
                 live_agent_status = :live_agent_status,
+                {bridge_status_expression}
                 live_agent_status_changed_at = :now,
                 live_agent_updated_at = :now,
                 updated_at = :now,
                 #ttl = :ttl
         """,
         ExpressionAttributeNames={"#ttl": "ttl"},
-        ExpressionAttributeValues={
-            ":ticket_status": callback.get("ticket_status") or "",
-            ":live_agent_status": callback.get("live_agent_status") or "",
-            ":now": now_iso,
-            ":ttl": ttl_epoch(),
-        },
+        ExpressionAttributeValues=expression_values,
     )
 
 
@@ -1679,10 +1804,12 @@ def update_status_target_session(target_session_id, callback):
         update_expression += """,
             conversation_status = :conversation_closed,
             support_options_status = :support_resolved,
-            live_agent_resolved_at = :now
+            live_agent_resolved_at = :now,
+            bridge_status = :bridge_resolved
         """
         expression_values[":conversation_closed"] = "closed"
         expression_values[":support_resolved"] = "live_agent_resolved"
+        expression_values[":bridge_resolved"] = "resolved"
 
     session_table.update_item(
         Key={"session_id": target_session_id},
@@ -2526,6 +2653,29 @@ def handle_jsm_callback(event):
         else:
             slack_result = {"attempted": False, "deduped": True}
 
+    support_thread_result = {"attempted": False}
+    if assigned:
+        try:
+            support_thread_result = post_live_agent_support_thread(callback, assignment)
+            mark_live_agent_support_thread(
+                pointer_session_id,
+                callback.get("session_id"),
+                support_thread_result,
+            )
+        except Exception as error:
+            support_thread_result = {
+                "attempted": True,
+                "ok": False,
+                "error": str(error),
+            }
+            log_json({
+                "level": "ERROR",
+                "message": "live_agent_support_thread_post_failed",
+                "session_id": callback["session_id"],
+                "ticket_key": callback["ticket_key"],
+                "error": str(error),
+            })
+
     return {
         "ok": True,
         "session_id": callback["session_id"],
@@ -2566,6 +2716,7 @@ def handle_jsm_callback(event):
         "reply": reply,
         "message": reply,
         "slack": slack_result,
+        "support_thread": support_thread_result,
     }
 
 
