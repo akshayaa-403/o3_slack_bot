@@ -218,6 +218,32 @@ def slack_api(method, payload):
     return result
 
 
+def maybe_send_ephemeral(channel, user, text, thread_ts=None):
+    if not channel or not user:
+        return None
+
+    payload = {
+        "channel": channel,
+        "user": user,
+        "text": text,
+    }
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+
+    try:
+        return slack_api("chat.postEphemeral", payload)
+    except Exception as error:
+        log_json({
+            "level": "WARN",
+            "message": "ephemeral_processing_message_failed",
+            "channel": channel,
+            "user": user,
+            "thread_ts": thread_ts,
+            "error": str(error),
+        })
+        return None
+
+
 def feedback_stars(rating):
     rating = max(1, min(5, int(rating or 1)))
     return "★" * rating + "☆" * (5 - rating)
@@ -589,6 +615,13 @@ def lambda_handler(event, context):
         if interactive_payload.get("type") == "view_submission":
             callback_id = (interactive_payload.get("view") or {}).get("callback_id")
             if callback_id == CALLBACK_ID_LIVE_AGENT_REPLY:
+                metadata = parse_action_value((interactive_payload.get("view") or {}).get("private_metadata"))
+                maybe_send_ephemeral(
+                    metadata.get("channel"),
+                    (interactive_payload.get("user") or {}).get("id") or metadata.get("user"),
+                    "Sending reply...",
+                    metadata.get("thread_ts") or metadata.get("message_ts"),
+                )
                 enqueue_live_agent_reply_submission(interactive_payload)
             elif ENABLE_FEEDBACK_FORM:
                 enqueue_feedback_submission(interactive_payload)

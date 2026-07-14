@@ -335,6 +335,107 @@ def send_slack_message(channel, text, blocks=None, thread_ts=None):
     return result
 
 
+def update_slack_message(channel, ts, text, blocks=None):
+    payload = {
+        "channel": channel,
+        "ts": ts,
+        "text": text,
+    }
+    if blocks:
+        payload["blocks"] = blocks
+    else:
+        payload["blocks"] = []
+
+    return slack_api("chat.update", payload=payload)
+
+
+def send_slack_ephemeral(channel, user, text, thread_ts=None):
+    if not channel or not user:
+        return None
+
+    payload = {
+        "channel": channel,
+        "user": user,
+        "text": text,
+    }
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+
+    return slack_api("chat.postEphemeral", payload=payload)
+
+
+def post_processing_message(channel, text, thread_ts=None):
+    if not channel:
+        return None
+
+    try:
+        return send_slack_message(channel, text, thread_ts=thread_ts)
+    except Exception as error:
+        log_json({
+            "level": "WARN",
+            "message": "processing_message_post_failed",
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "error": str(error),
+        })
+        return None
+
+
+def update_processing_message(processing_message, text, blocks=None):
+    if not processing_message:
+        return None
+
+    channel = processing_message.get("channel")
+    ts = processing_message.get("ts")
+    if not channel or not ts:
+        return None
+
+    try:
+        return update_slack_message(channel, ts, text, blocks)
+    except Exception as error:
+        log_json({
+            "level": "WARN",
+            "message": "processing_message_update_failed",
+            "channel": channel,
+            "ts": ts,
+            "error": str(error),
+        })
+        return None
+
+
+def maybe_send_ephemeral(channel, user, text, thread_ts=None):
+    try:
+        return send_slack_ephemeral(channel, user, text, thread_ts)
+    except Exception as error:
+        log_json({
+            "level": "WARN",
+            "message": "ephemeral_processing_message_failed",
+            "channel": channel,
+            "user": user,
+            "thread_ts": thread_ts,
+            "error": str(error),
+        })
+        return None
+
+
+def interactive_processing_text(action_id):
+    if action_id in {ACTION_ID_CREATE_JIRA_TICKET, ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET}:
+        return "Creating Jira ticket..."
+    if action_id == ACTION_ID_LIVE_AGENT_SUPPORT:
+        return "Connecting you to a live agent..."
+    if action_id == ACTION_ID_CLOSE_AND_SUMMARIZE:
+        return "Closing and summarizing this session..."
+    return None
+
+
+def support_control_processing_text(action_id):
+    if action_id == ACTION_ID_LIVE_AGENT_RESOLVE:
+        return "Resolving..."
+    if action_id == ACTION_ID_LIVE_AGENT_REASSIGN:
+        return "Reassigning..."
+    return None
+
+
 def atlassian_auth_header():
     if not (ATLASSIAN_EMAIL and ATLASSIAN_API_TOKEN):
         raise ValueError("Missing ATLASSIAN_EMAIL or ATLASSIAN_API_TOKEN")
@@ -4744,7 +4845,7 @@ def handle_live_agent_reply_submission(body):
     return handle_live_agent_support_thread_reply(pointer, reply_body, text)
 
 
-def handle_live_agent_user_reply(session_id, session_item, body, channel, user, text, thread_ts, ts):
+def handle_live_agent_user_reply(session_id, session_item, body, channel, user, text, thread_ts, ts, processing_message=None):
     ticket_key = session_item.get("live_agent_ticket_key") or session_item.get("last_live_agent_ticket_key")
     event_id = body.get("event_id")
     now_iso = to_iso(datetime.now(timezone.utc))
@@ -4814,7 +4915,10 @@ def handle_live_agent_user_reply(session_id, session_item, body, channel, user, 
         raise
 
     ack = f"Sent your reply to support on {ticket_key}."
-    send_slack_message(channel, ack, thread_ts=thread_ts)
+    if processing_message:
+        update_processing_message(processing_message, ack)
+    else:
+        send_slack_message(channel, ack, thread_ts=thread_ts)
 
     log_json({
         "level": "INFO",
@@ -5040,6 +5144,12 @@ def process_record(record):
         body.get("message_ts"),
     )
     if support_bridge and is_interactive_action and is_live_agent_support_control_action(action_id):
+        maybe_send_ephemeral(
+            channel,
+            user,
+            support_control_processing_text(action_id) or "Processing...",
+            body.get("thread_ts") or body.get("message_ts") or body.get("ts"),
+        )
         control_result = invoke_live_agent_support_control(support_bridge, body, action_id)
         log_json({
             "level": "INFO",
@@ -5196,6 +5306,11 @@ def process_record(record):
             })
             return
 
+        processing_message = post_processing_message(
+            channel,
+            "Sending your reply to support...",
+            thread_ts=thread_ts or session_thread_ts,
+        )
         handle_live_agent_user_reply(
             session_id,
             existing_session,
@@ -5205,6 +5320,7 @@ def process_record(record):
             text,
             thread_ts or session_thread_ts,
             ts,
+            processing_message=processing_message,
         )
         return
 
@@ -5287,6 +5403,29 @@ def process_record(record):
     assistance_details_handled = False
     manual_close_summary = False
     manual_close_timeout_token = None
+    processing_message = None
+
+    if is_interactive_action:
+        processing_text = interactive_processing_text(action_id)
+        if processing_text:
+            maybe_send_ephemeral(
+                channel,
+                user,
+                processing_text,
+                session_thread_ts or body.get("thread_ts") or body.get("message_ts") or body.get("ts"),
+            )
+    elif has_image:
+        processing_message = post_processing_message(
+            channel,
+            "Analyzing screenshot...",
+            thread_ts=session_thread_ts,
+        )
+    elif text:
+        processing_message = post_processing_message(
+            channel,
+            "IVY is checking...",
+            thread_ts=session_thread_ts,
+        )
 
     if is_interactive_action:
         interactive_action_handled = True
@@ -5381,6 +5520,11 @@ def process_record(record):
 
         if manual_close_summary:
             closed_at = datetime.now(timezone.utc).replace(microsecond=0)
+            processing_message = post_processing_message(
+                channel,
+                "Closing and summarizing this session...",
+                thread_ts=session_thread_ts,
+            )
 
             try:
                 mark_session_summarizing(
@@ -5392,7 +5536,8 @@ def process_record(record):
             except ClientError as e:
                 if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                     lex_reply = "That action is no longer active. Please send a new message."
-                    send_slack_message(channel, lex_reply, thread_ts=session_thread_ts)
+                    if not update_processing_message(processing_message, lex_reply):
+                        send_slack_message(channel, lex_reply, thread_ts=session_thread_ts)
                     log_json({
                         "level": "INFO",
                         "message": "manual_close_summary_ignored",
@@ -5413,6 +5558,8 @@ def process_record(record):
                 "closed_at": to_iso(closed_at),
                 "reason": "manual_close_summary",
                 "conversation_type": conversation_type,
+                "processing_channel": (processing_message or {}).get("channel"),
+                "processing_ts": (processing_message or {}).get("ts"),
             })
 
             log_json({
@@ -5427,11 +5574,13 @@ def process_record(record):
             })
 
             if not summarizer_result.get("ok"):
-                send_slack_message(
-                    channel,
-                    "I could not complete the summary/save step. This session has not been fully closed.",
-                    thread_ts=session_thread_ts
-                )
+                failure_text = "I could not complete the summary/save step. This session has not been fully closed."
+                if not update_processing_message(processing_message, failure_text):
+                    send_slack_message(
+                        channel,
+                        failure_text,
+                        thread_ts=session_thread_ts
+                    )
 
             log_json({
                 "level": "INFO",
@@ -5510,6 +5659,10 @@ def process_record(record):
                         "lex_reply_empty": lex_reply_empty
                     })
 
+                    update_processing_message(
+                        processing_message,
+                        "Thinking through this screenshot...",
+                    )
                     gemini_result = invoke_gemini_fallback(
                         image_query,
                         image_result,
@@ -5542,6 +5695,10 @@ def process_record(record):
                         lex_reply_empty = False
 
             else:
+                update_processing_message(
+                    processing_message,
+                    "Thinking through this screenshot...",
+                )
                 gemini_result = invoke_gemini_fallback(
                     image_query,
                     image_result,
@@ -5616,6 +5773,7 @@ def process_record(record):
         }
 
         if ENABLE_CLAUDE_FALLBACK:
+            update_processing_message(processing_message, "Thinking through this issue...")
             claude_result = invoke_claude_fallback(
                 build_assistance_claude_payload(
                     details_session,
@@ -5675,6 +5833,8 @@ def process_record(record):
 
     elif has_jira_confirmation_state(existing_session, text):
         jira_confirmation_handled = True
+        if classify_jira_confirmation(text) == "yes":
+            update_processing_message(processing_message, "Creating Jira ticket...")
         confirmation_result = handle_jira_confirmation(
             existing_session,
             body,
@@ -5727,6 +5887,7 @@ def process_record(record):
         })
 
     elif text:
+        update_processing_message(processing_message, "Checking IVY routing...")
         response = lex.recognize_text(
             botId=BOT_ID,
             botAliasId=BOT_ALIAS_ID,
@@ -5780,6 +5941,7 @@ def process_record(record):
         should_try_fallback
         and ENABLE_BEDROCK_KB_ASSIST
     ):
+        update_processing_message(processing_message, "Searching knowledge base...")
         kb_result = invoke_bedrock_knowledge_base(text)
         if kb_result.get("ok"):
             lex_intent = BEDROCK_KB_INTENT_NAME
@@ -5812,6 +5974,7 @@ def process_record(record):
         AUTO_CLAUDE_FALLBACK_ENABLED
         and should_try_fallback
     ):
+        update_processing_message(processing_message, "Thinking through this issue...")
         claude_fallback_attempted = True
         original_lex_reply = lex_reply
         claude_payload = {
@@ -6709,7 +6872,9 @@ def process_record(record):
         delete_timeout_schedule(session_id, "prompt")
         delete_timeout_schedule(session_id, "close")
 
-    slack_response = send_slack_message(channel, lex_reply, slack_blocks, thread_ts=session_thread_ts)
+    slack_response = update_processing_message(processing_message, lex_reply, slack_blocks)
+    if not slack_response:
+        slack_response = send_slack_message(channel, lex_reply, slack_blocks, thread_ts=session_thread_ts)
     if rovo_should_invoke and jira_ticket_key:
         store_rovo_slack_message_target(
             session_id,
