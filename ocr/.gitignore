@@ -1,0 +1,28 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local environment and secrets
+.env
+.env.*
+
+# Downloaded OCR model weights / caches (easyocr, paddleocr)
+model_storage/
+inference/
+*.pdmodel
+*.pdiparams
+*.pdiparams.info
+.EasyOCR/
+.paddleocr/
+paddleocr/
+
+# Lambda/package build artifacts
+build/
+dist/
+*.zip

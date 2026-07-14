@@ -13,17 +13,14 @@ OCR_ENGINE = os.environ.get("OCR_ENGINE", "textract")
 
 _engine = None
 
-
 def log_json(data):
     print(json.dumps(data, default=str))
-
 
 def _get_engine():
     global _engine
     if _engine is None:
         _engine = load_engine(OCR_ENGINE)
     return _engine
-
 
 def _first_image_url(event):
     files = event.get("files") or []

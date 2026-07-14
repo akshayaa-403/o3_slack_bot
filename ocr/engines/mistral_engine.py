@@ -6,9 +6,27 @@ from __future__ import annotations
 
 import base64
 import os
+from pathlib import Path
 from typing import Any
 
 from ..base import OcrEngine, OcrLine
+
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+
+
+def _load_env_file() -> None:
+    """Populate ``os.environ`` from ``ocr/.env`` (existing env vars win)."""
+
+    if not _ENV_FILE.exists():
+        return
+    for line in _ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
 
 
 class MistralOcrEngine(OcrEngine):
@@ -22,6 +40,7 @@ class MistralOcrEngine(OcrEngine):
         ok, reason = super().available()
         if not ok:
             return ok, reason
+        _load_env_file()
         if not os.environ.get("MISTRAL_API_KEY"):
             return False, "no MISTRAL_API_KEY set"
         return True, "ready (MISTRAL_API_KEY present)"
