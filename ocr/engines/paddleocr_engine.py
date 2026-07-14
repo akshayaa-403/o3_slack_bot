@@ -4,16 +4,10 @@ Balanced default for complex documents. fast custom deployment, CPU or GPU. Firs
 
 from __future__ import annotations
 
-import logging
 import os
 from typing import Any
 
 from ..base import OcrEngine, OcrLine
-
-# PaddleOCR's own "ppocr" logger defaults to DEBUG and dumps its full config
-# Namespace plus a per-image detect/recognize trace on every call; none of it
-# indicates a problem, so keep it at ERROR to only surface real failures.
-logging.getLogger("ppocr").setLevel(logging.ERROR)
 
 
 class PaddleOcrEngine(OcrEngine):
@@ -33,9 +27,9 @@ class PaddleOcrEngine(OcrEngine):
         use_gpu = os.environ.get("OCR_USE_GPU", "false").lower() == "true"
         attempts = []
         if use_gpu:
-            attempts.append(dict(lang=lang, device="gpu", show_log=False))
-        attempts.append(dict(lang=lang, show_log=False))
-        attempts.append(dict(show_log=False))
+            attempts.append(dict(lang=lang, device="gpu"))
+        attempts.append(dict(lang=lang))
+        attempts.append(dict())
         last_error = None
         for kwargs in attempts:
             try:
@@ -55,9 +49,7 @@ class PaddleOcrEngine(OcrEngine):
         return lines, {"backend_return": type(raw).__name__}
 
     def _call(self, image):
-        # cls=False: this engine never sets use_angle_cls=True, so cls=True
-        # (ocr()'s default) is a no-op that only produces a per-call warning.
-        for method_name, kwargs in (("predict", {}), ("ocr", {"cls": False})):
+        for method_name, kwargs in (("predict", {}), ("ocr", {}), ("ocr", {"cls": True})):
             method = getattr(self._ocr, method_name, None)
             if method is None:
                 continue

@@ -1,0 +1,13 @@
+# Never bake secrets or local junk into the image.
+.env
+.env.*
+.git/
+__pycache__/
+*.pyc
+
+# Build/benchmark artifacts not needed at runtime.
+results/
+Dockerfile
+.dockerignore
+DEPLOY.md
+sample_lambda_event.json

@@ -1981,7 +1981,7 @@ def extract_gemini_text(response_body):
     return "\n".join(parts).strip()
 
 
-def invoke_gemini_fallback(query, image_result, kb_error=None):
+def invoke_gemini_from_text(query):
     api_key = get_gemini_api_key()
     if not api_key:
         return {
@@ -1992,20 +1992,13 @@ def invoke_gemini_fallback(query, image_result, kb_error=None):
 
     prompt = "\n".join([
         "You are IVY, a concise IT support assistant.",
-        "Use the user's screenshot context to suggest the most likely resolution.",
-        "If the screenshot text is ambiguous, ask one clear clarifying question.",
+        "The text below was extracted from a screenshot the user shared.",
+        "Use it to suggest the most likely resolution.",
+        "If the extracted text is ambiguous, ask one clear clarifying question.",
         "Do not claim that a Jira ticket was created.",
         "",
-        "Screenshot-derived issue:",
+        "Screenshot text:",
         query,
-        "",
-        "Image analysis JSON:",
-        json.dumps({
-            "summary": image_result.get("summary"),
-            "detected_text": image_result.get("detected_text"),
-            "labels": image_result.get("labels"),
-            "bedrock_kb_error": kb_error,
-        }, default=str, ensure_ascii=True),
     ])
 
     url = (
@@ -5071,120 +5064,36 @@ def process_record(record):
         image_query = image_issue_text(text, image_result)
 
         if image_result.get("ok") and image_query:
-            lex_session_attributes = {}
-            match_result = find_matching_screenshot_issue(image_result)
-            image_match_issue_id = match_result.get("issue_id")
-            image_match_score = match_result.get("score")
-            image_match_expected_lex_intent = match_result.get("expected_lex_intent")
-            image_match_fallback_reason = match_result.get("reason")
-
-            if match_result.get("matched"):
-                response = lex.recognize_text(
-                    botId=BOT_ID,
-                    botAliasId=BOT_ALIAS_ID,
-                    localeId=LOCALE_ID,
-                    sessionId=lex_session_id,
-                    text=match_result["lex_query"]
-                )
-
-                session_state = response.get("sessionState", {})
-                intent = session_state.get("intent", {})
-                lex_session_attributes = session_state.get("sessionAttributes", {}) or {}
-
-                lex_intent = intent.get("name", "ImageVectorMatch")
-                image_match_actual_lex_intent = lex_intent
-                lex_state = intent.get("state", "UNKNOWN")
-                lex_slots = simplify_slots(intent.get("slots", {}))
-                lex_reply, lex_reply_empty = get_lex_reply(response.get("messages", []))
-
-                expected_intent = match_result.get("expected_lex_intent")
-                lex_intent_matches = not expected_intent or lex_intent == expected_intent
-
-                if lex_intent_matches and lex_is_resolved(lex_intent, lex_state, lex_reply_empty):
-                    image_status = "completed"
-                    image_resolution_source = "screenshot_match_lex"
-                    response_source = "image_screenshot_match_lex"
-                    image_summary = match_result.get("lex_query") or image_summary
-
-                else:
-                    image_match_fallback_reason = "lex_intent_mismatch_or_unresolved"
-                    log_json({
-                        "level": "WARN",
-                        "message": "screenshot_match_lex_rejected",
-                        "event_id": event_id,
-                        "session_id": session_id,
-                        "issue_id": image_match_issue_id,
-                        "match_score": image_match_score,
-                        "expected_lex_intent": expected_intent,
-                        "actual_lex_intent": lex_intent,
-                        "lex_state": lex_state,
-                        "lex_reply_empty": lex_reply_empty
-                    })
-
-                    gemini_result = invoke_gemini_fallback(
-                        image_query,
-                        image_result,
-                        image_match_fallback_reason
-                    )
-                    if gemini_result.get("ok"):
-                        lex_intent = "ImageLLMFallback"
-                        lex_state = "Fulfilled"
-                        lex_slots = {}
-                        lex_reply = gemini_result["reply"]
-                        lex_reply_empty = False
-                        image_status = "completed"
-                        image_resolution_source = "gemini"
-                        response_source = "image_gemini"
-                        image_summary = gemini_result.get("summary") or image_summary
-                    else:
-                        lex_intent = "ImageLLMFallback"
-                        lex_state = "Failed"
-                        lex_slots = {}
-                        image_status = "failed"
-                        image_resolution_source = "unresolved"
-                        response_source = "image"
-                        image_error = gemini_result.get("error")
-                        image_error_code = gemini_result.get("error_code")
-                        lex_reply = image_reply_from_result({
-                            "ok": False,
-                            "error": image_error,
-                            "error_code": image_error_code,
-                        })
-                        lex_reply_empty = False
-
+            # Direct path: OCR-extracted text -> Gemini. No screenshot vector
+            # match, no Lex, no Bedrock KB.
+            gemini_result = invoke_gemini_from_text(image_query)
+            if gemini_result.get("ok"):
+                lex_intent = "ImageLLMFallback"
+                lex_state = "Fulfilled"
+                lex_slots = {}
+                lex_session_attributes = {}
+                lex_reply = gemini_result["reply"]
+                lex_reply_empty = False
+                image_status = "completed"
+                image_resolution_source = "gemini"
+                response_source = "image_gemini"
+                image_summary = gemini_result.get("summary") or image_summary
             else:
-                gemini_result = invoke_gemini_fallback(
-                    image_query,
-                    image_result,
-                    image_match_fallback_reason or "no_confident_screenshot_match"
-                )
-                if gemini_result.get("ok"):
-                    lex_intent = "ImageLLMFallback"
-                    lex_state = "Fulfilled"
-                    lex_slots = {}
-                    lex_session_attributes = {}
-                    lex_reply = gemini_result["reply"]
-                    lex_reply_empty = False
-                    image_status = "completed"
-                    image_resolution_source = "gemini"
-                    response_source = "image_gemini"
-                    image_summary = gemini_result.get("summary") or image_summary
-                else:
-                    lex_intent = "ImageLLMFallback"
-                    lex_state = "Failed"
-                    lex_slots = {}
-                    lex_session_attributes = {}
-                    image_status = "failed"
-                    image_resolution_source = "unresolved"
-                    response_source = "image"
-                    image_error = gemini_result.get("error") or match_result.get("error")
-                    image_error_code = gemini_result.get("error_code") or match_result.get("reason")
-                    lex_reply = image_reply_from_result({
-                        "ok": False,
-                        "error": image_error,
-                        "error_code": image_error_code,
-                    })
-                    lex_reply_empty = False
+                lex_intent = "ImageLLMFallback"
+                lex_state = "Failed"
+                lex_slots = {}
+                lex_session_attributes = {}
+                image_status = "failed"
+                image_resolution_source = "unresolved"
+                response_source = "image"
+                image_error = gemini_result.get("error")
+                image_error_code = gemini_result.get("error_code")
+                lex_reply = image_reply_from_result({
+                    "ok": False,
+                    "error": image_error,
+                    "error_code": image_error_code,
+                })
+                lex_reply_empty = False
 
         else:
             lex_intent = "ImageRek"
@@ -5203,11 +5112,6 @@ def process_record(record):
             "session_id": session_id,
             "image_status": image_status,
             "image_resolution_source": image_resolution_source,
-            "image_match_issue_id": image_match_issue_id,
-            "image_match_score": image_match_score,
-            "image_match_expected_lex_intent": image_match_expected_lex_intent,
-            "image_match_actual_lex_intent": image_match_actual_lex_intent,
-            "image_match_fallback_reason": image_match_fallback_reason,
             "image_file_count": len(image_files),
             "error_code": image_error_code
         })

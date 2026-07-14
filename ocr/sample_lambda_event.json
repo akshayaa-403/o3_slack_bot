@@ -1,0 +1,16 @@
+{
+  "files": [
+    {
+      "url_private_download": "http://host.docker.internal:8000/adam_login_mfa_error.png",
+      "name": "adam_login_mfa_error.png",
+      "id": "local-test",
+      "filetype": "png",
+      "mimetype": "image/png"
+    }
+  ],
+  "event_id": "local-test-1",
+  "user": "UTEST",
+  "session_id": "test:local",
+  "channel": "DTEST",
+  "text": "Can you help with this?"
+}

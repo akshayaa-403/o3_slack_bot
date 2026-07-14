@@ -1,0 +1,6 @@
+# Runtime dependencies for the Lambda functions in this repo (root *.py files).
+# boto3 is provided by the AWS Lambda runtime; pinned here for local dev/tests.
+# The OCR engines have separate, heavier deps — see ocr/requirements.txt.
+
+boto3
+openpyxl

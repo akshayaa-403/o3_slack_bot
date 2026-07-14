@@ -5,15 +5,9 @@ Lightweight, accessible Python OCR. Bundles detection + recognition, First run d
 from __future__ import annotations
 
 import os
-import warnings
 from typing import Any
 
 from ..base import OcrEngine, OcrLine
-
-# EasyOCR's CPU quantized RNN path and its DataLoader emit benign UserWarnings
-# (deprecated quantize_per_tensor dtypes, pin_memory with no accelerator) on
-# every load/inference call; they don't indicate a problem, just noise.
-warnings.filterwarnings("ignore", category=UserWarning, module="torch")
 
 
 class EasyOcrEngine(OcrEngine):
