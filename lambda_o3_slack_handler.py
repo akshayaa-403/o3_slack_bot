@@ -703,6 +703,21 @@ def lambda_handler(event, context):
             "body": routing_reason
         }
 
+    if is_live_agent_support_channel(slack_event):
+        log_json({
+            "level": "INFO",
+            "message": "live_agent_support_channel_event_accepted",
+            "event_id": event_id,
+            "channel": slack_event.get("channel"),
+            "event_type": event_type,
+            "channel_type": channel_type,
+            "subtype": slack_event.get("subtype"),
+            "thread_ts": slack_event.get("thread_ts"),
+            "ts": slack_event.get("ts"),
+            "user": slack_event.get("user"),
+            "has_text": bool((slack_event.get("text") or "").strip()),
+        })
+
     # Deduplicate accepted DM retry events before sending to SQS.
     if event_id:
         try:

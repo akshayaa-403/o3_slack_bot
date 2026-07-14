@@ -5065,6 +5065,23 @@ def process_record(record):
         handle_live_agent_support_thread_reply(support_bridge, body, text)
         return
 
+    if (
+        support_bridge_enabled()
+        and channel == LIVE_AGENT_SUPPORT_CHANNEL_ID
+        and not is_interactive_action
+    ):
+        log_json({
+            "level": "WARN",
+            "message": "live_agent_support_thread_bridge_not_found",
+            "event_id": event_id,
+            "channel": channel,
+            "thread_ts": body.get("thread_ts"),
+            "message_ts": body.get("message_ts"),
+            "ts": body.get("ts"),
+            "has_text": bool(text),
+            "is_bot_message": is_bot_message,
+        })
+
     existing_session = get_session_item(session_id)
     if (
         one_to_one_dm

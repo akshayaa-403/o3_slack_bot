@@ -588,7 +588,7 @@ def live_agent_support_thread_text(callback, assignment, assigned_slack_user_id)
         parts.append(f"*User request:*\n{callback['user_request']}")
     elif callback.get("conversation_summary"):
         parts.append(f"*Summary:*\n{callback['conversation_summary']}")
-    parts.append("Reply in this thread to message the requester. Use JSM for ticket/audit updates.")
+    parts.append("Reply in this thread to message the requester. Use Reply to customer if thread events are unavailable.")
     return "\n\n".join(parts)
 
 
@@ -656,7 +656,7 @@ def live_agent_support_thread_blocks(callback, assignment, assigned_slack_user_i
             "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": "Reply in this thread to message the requester. JSM remains the ticket/audit record.",
+                    "text": "Reply in this thread to message the requester. Use Reply to customer if thread events are unavailable.",
                 }
             ],
         },

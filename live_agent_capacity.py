@@ -721,6 +721,20 @@ def agent_active_count(agent):
     return int(agent.get("active_count", 0))
 
 
+def item_ttl_is_live(item, now_epoch=None):
+    ttl = item.get("ttl")
+    if ttl is None:
+        return True
+
+    try:
+        ttl_value = int(ttl)
+    except (TypeError, ValueError):
+        return True
+
+    now_epoch = now_epoch if now_epoch is not None else int(datetime.now(timezone.utc).timestamp())
+    return ttl_value > now_epoch
+
+
 def sort_agents_for_assignment(agents):
     return sorted(
         agents,
@@ -1047,6 +1061,119 @@ def active_reserved_ticket_items(max_items=None):
     return items
 
 
+def active_reserved_ticket_items_for_count_sync():
+    now_epoch = int(datetime.now(timezone.utc).timestamp())
+    items = []
+    request = {
+        "FilterExpression": (
+            Attr("assignment_status").eq("ASSIGNED")
+            & Attr("capacity_reserved").eq(True)
+            & (Attr("capacity_released").not_exists() | Attr("capacity_released").eq(False))
+            & (Attr("ttl").not_exists() | Attr("ttl").gt(now_epoch))
+        )
+    }
+    while True:
+        response = session_table.scan(**request)
+        items.extend(response.get("Items") or [])
+        if not response.get("LastEvaluatedKey"):
+            break
+        request["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+
+    return [
+        item for item in items
+        if item_ttl_is_live(item, now_epoch)
+    ]
+
+
+def reserved_assignment_counts_by_agent(items):
+    counts = {}
+    for item in items or []:
+        agent_id = str(item.get("assigned_agent_id") or "").strip()
+        if not agent_id:
+            continue
+        counts[agent_id] = counts.get(agent_id, 0) + 1
+    return counts
+
+
+def update_agent_active_count_if_unchanged(agent, active_count):
+    current_count = agent_active_count(agent)
+    values = {
+        ":active_count": int(active_count),
+        ":now": utc_now_iso(),
+    }
+    condition = Attr("active_count").eq(current_count)
+    if "active_count" not in agent:
+        condition = Attr("active_count").not_exists()
+
+    try:
+        capacity_table.update_item(
+            Key={"agent_id": agent["agent_id"]},
+            UpdateExpression="SET active_count = :active_count, updated_at = :now",
+            ConditionExpression=condition,
+            ExpressionAttributeValues=values,
+        )
+        return {"updated": True}
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return {
+                "updated": False,
+                "reason": "AGENT_ROW_CHANGED",
+            }
+        raise
+
+
+def sync_capacity_counts_from_session_mappings(agents=None, active_items=None):
+    agents = agents if agents is not None else get_enabled_agents(include_disabled=True)
+    active_items = active_items if active_items is not None else active_reserved_ticket_items_for_count_sync()
+    counts = reserved_assignment_counts_by_agent(active_items)
+    checked_agents = 0
+    updated_agents = []
+    unchanged_agents = []
+    skipped_agents = []
+
+    for agent in agents:
+        agent_id = str(agent.get("agent_id") or "").strip()
+        if not agent_id:
+            continue
+
+        checked_agents += 1
+        actual_count = int(counts.get(agent_id, 0))
+        current_count = agent_active_count(agent)
+        if current_count == actual_count:
+            unchanged_agents.append(agent_id)
+            continue
+
+        result = update_agent_active_count_if_unchanged(agent, actual_count)
+        if result.get("updated"):
+            updated_agents.append({
+                "agent_id": agent_id,
+                "from": current_count,
+                "to": actual_count,
+            })
+        else:
+            skipped_agents.append({
+                "agent_id": agent_id,
+                "from": current_count,
+                "to": actual_count,
+                "reason": result.get("reason"),
+            })
+
+    result = {
+        "ok": True,
+        "checked_agents": checked_agents,
+        "active_reserved_items": len(active_items or []),
+        "updated_agents": updated_agents,
+        "unchanged_agent_count": len(unchanged_agents),
+        "skipped_agents": skipped_agents,
+    }
+    log_json({
+        "level": "INFO" if not skipped_agents else "WARN",
+        "message": "live_agent_capacity_count_sync_completed",
+        **result,
+    })
+    return result
+
+
 def save_reconcile_status(ticket_key, status=None, error=None):
     values = {
         "last_reconciled_at": utc_now_iso(),
@@ -1060,7 +1187,7 @@ def save_reconcile_status(ticket_key, status=None, error=None):
     save_live_agent_session_mapping(ticket_key, values)
 
 
-def reconcile_active_assignments(max_items=None, status_lookup=None, release_fn=None):
+def reconcile_active_assignments(max_items=None, status_lookup=None, release_fn=None, count_sync_fn=None):
     if not CAPACITY_RECONCILE_ENABLED:
         return {
             "ok": True,
@@ -1073,6 +1200,7 @@ def reconcile_active_assignments(max_items=None, status_lookup=None, release_fn=
 
     status_lookup = status_lookup or jira_issue_status
     release_fn = release_fn or release_capacity_for_ticket
+    count_sync_fn = count_sync_fn or sync_capacity_counts_from_session_mappings
     checked = 0
     released = 0
     errors = 0
@@ -1120,6 +1248,7 @@ def reconcile_active_assignments(max_items=None, status_lookup=None, release_fn=
         "retained_tickets": retained_tickets,
         "error_tickets": error_tickets,
     }
+    result["count_sync"] = count_sync_fn()
     log_json({
         "level": "INFO" if errors == 0 else "WARN",
         "message": "live_agent_capacity_reconcile_completed",
