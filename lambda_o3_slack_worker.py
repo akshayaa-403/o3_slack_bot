@@ -5,6 +5,7 @@ import time
 import hashlib
 import base64
 import boto3
+import urllib.error
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -181,6 +182,14 @@ LIVE_AGENT_SUPPORT_CHANNEL_ID = os.environ.get("LIVE_AGENT_SUPPORT_CHANNEL_ID", 
 LIVE_AGENT_SYNC_AGENT_REPLIES_TO_JSM = (
     os.environ.get("LIVE_AGENT_SYNC_AGENT_REPLIES_TO_JSM", "true").lower() == "true"
 )
+LIVE_AGENT_START_STATUS_NAMES = [
+    name.strip()
+    for name in os.environ.get("LIVE_AGENT_START_STATUS_NAMES", "In Progress").split(",")
+    if name.strip()
+]
+LIVE_AGENT_BLOCK_REPLY_ON_START_TRANSITION_FAILURE = (
+    os.environ.get("LIVE_AGENT_BLOCK_REPLY_ON_START_TRANSITION_FAILURE", "true").lower() == "true"
+)
 
 NEXT_ACTION_CREATE_JIRA_TICKET = "O3_CreateJiraTicket"
 NEXT_ACTION_CLAUDE_ASSISTANCE = "O3_ClaudeFurtherAssistance"
@@ -195,6 +204,7 @@ ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET = "ivy_assistance_create_jira_ticket"
 ACTION_ID_LIVE_AGENT_SUPPORT = "ivy_live_agent_support"
 ACTION_ID_LIVE_AGENT_REPLY = "ivy_live_agent_reply"
 ACTION_ID_LIVE_AGENT_RESOLVE = "ivy_live_agent_resolve"
+ACTION_ID_LIVE_AGENT_CANCEL = "ivy_live_agent_cancel"
 ACTION_ID_LIVE_AGENT_REASSIGN = "ivy_live_agent_reassign"
 ACTION_ID_CREATE_JIRA_TICKET = "ivy_create_jira_ticket"
 ACTION_ID_CLOSE_AND_SUMMARIZE = "ivy_close_and_summarize"
@@ -431,6 +441,8 @@ def interactive_processing_text(action_id):
 def support_control_processing_text(action_id):
     if action_id == ACTION_ID_LIVE_AGENT_RESOLVE:
         return "Resolving..."
+    if action_id == ACTION_ID_LIVE_AGENT_CANCEL:
+        return "Cancelling..."
     if action_id == ACTION_ID_LIVE_AGENT_REASSIGN:
         return "Reassigning..."
     return None
@@ -521,6 +533,190 @@ def add_jira_issue_comment(issue_key, body):
             return {"message": response_text}
 
     return {"ok": True}
+
+
+def jira_api_request(method, path, payload=None):
+    if not ATLASSIAN_DOMAIN:
+        return {"ok": False, "error": "Missing ATLASSIAN_DOMAIN", "error_code": "jira_configuration_error"}
+
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    try:
+        headers = {
+            "Authorization": atlassian_auth_header(),
+            "Accept": "application/json",
+        }
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+
+        request = urllib.request.Request(
+            f"{ATLASSIAN_DOMAIN}{path}",
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response_text = response.read().decode("utf-8").strip()
+            return {
+                "ok": 200 <= response.status < 300,
+                "status_code": response.status,
+                "body": json.loads(response_text) if response_text else {},
+            }
+    except urllib.error.HTTPError as error:
+        response_text = error.read().decode("utf-8", errors="replace")[:2000]
+        return {
+            "ok": False,
+            "status_code": error.code,
+            "error": response_text or str(error),
+            "error_code": "jira_http_error",
+        }
+    except (urllib.error.URLError, TimeoutError) as error:
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": str(error),
+            "error_code": "jira_network_error",
+        }
+    except Exception as error:
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": str(error),
+            "error_code": "jira_configuration_error",
+        }
+
+
+def normalize_status_name(value):
+    return text_or_empty(value).lower()
+
+
+def jira_issue_status(ticket_key):
+    safe_ticket_key = urllib.parse.quote(str(ticket_key), safe="")
+    result = jira_api_request("GET", f"/rest/api/3/issue/{safe_ticket_key}?fields=status")
+    if not result.get("ok"):
+        return {
+            **result,
+            "error_code": result.get("error_code") or "jira_issue_status_lookup_failed",
+        }
+
+    status_name = (
+        ((result.get("body") or {}).get("fields") or {}).get("status") or {}
+    ).get("name")
+    if not status_name:
+        return {
+            "ok": False,
+            "error": "Jira issue status missing from response",
+            "error_code": "missing_jira_issue_status",
+            "status_code": result.get("status_code"),
+        }
+
+    return {"ok": True, "ticket_status": status_name, "status_code": result.get("status_code")}
+
+
+def jira_issue_transitions(ticket_key):
+    safe_ticket_key = urllib.parse.quote(str(ticket_key), safe="")
+    result = jira_api_request("GET", f"/rest/api/3/issue/{safe_ticket_key}/transitions")
+    if not result.get("ok"):
+        return {
+            **result,
+            "error_code": result.get("error_code") or "jira_transition_lookup_failed",
+        }
+    return {
+        "ok": True,
+        "transitions": (result.get("body") or {}).get("transitions") or [],
+        "status_code": result.get("status_code"),
+    }
+
+
+def transition_jira_issue_to_status(ticket_key, target_status_names, reason=None):
+    ticket_key = text_or_empty(ticket_key)
+    target_status_names = [name for name in (target_status_names or []) if text_or_empty(name)]
+    if not ticket_key:
+        return {"ok": False, "error": "Missing ticket key", "error_code": "missing_ticket_key"}
+    if not target_status_names:
+        return {"ok": False, "error": "Missing target status", "error_code": "missing_target_status"}
+
+    normalized_targets = {normalize_status_name(name) for name in target_status_names}
+    status_result = jira_issue_status(ticket_key)
+    if not status_result.get("ok"):
+        return status_result
+
+    current_status = status_result.get("ticket_status")
+    if normalize_status_name(current_status) in normalized_targets:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "already_in_target_status",
+            "ticket_key": ticket_key,
+            "ticket_status": current_status,
+            "target_status": current_status,
+        }
+
+    transitions_result = jira_issue_transitions(ticket_key)
+    if not transitions_result.get("ok"):
+        return transitions_result
+
+    matching_transition = None
+    for transition in transitions_result.get("transitions") or []:
+        to_status = ((transition.get("to") or {}).get("name") or "").strip()
+        if normalize_status_name(to_status) in normalized_targets:
+            matching_transition = transition
+            break
+
+    if not matching_transition:
+        return {
+            "ok": False,
+            "error": f"No Jira transition available to {', '.join(target_status_names)}.",
+            "error_code": "no_matching_jira_transition",
+            "ticket_key": ticket_key,
+            "ticket_status": current_status,
+            "target_status_names": target_status_names,
+            "available_transitions": [
+                {
+                    "id": transition.get("id"),
+                    "name": transition.get("name"),
+                    "to": ((transition.get("to") or {}).get("name") or ""),
+                }
+                for transition in transitions_result.get("transitions") or []
+            ],
+        }
+
+    safe_ticket_key = urllib.parse.quote(ticket_key, safe="")
+    payload = {"transition": {"id": matching_transition.get("id")}}
+    result = jira_api_request("POST", f"/rest/api/3/issue/{safe_ticket_key}/transitions", payload)
+    if not result.get("ok"):
+        return {
+            **result,
+            "error_code": result.get("error_code") or "jira_transition_failed",
+            "ticket_key": ticket_key,
+            "ticket_status": current_status,
+            "target_status": (matching_transition.get("to") or {}).get("name"),
+            "transition_id": matching_transition.get("id"),
+            "transition_name": matching_transition.get("name"),
+        }
+
+    return {
+        "ok": True,
+        "ticket_key": ticket_key,
+        "previous_status": current_status,
+        "target_status": (matching_transition.get("to") or {}).get("name"),
+        "transition_id": matching_transition.get("id"),
+        "transition_name": matching_transition.get("name"),
+        "reason": reason,
+        "status_code": result.get("status_code"),
+    }
+
+
+def live_agent_start_transition_failure_text(ticket_key, transition_result):
+    error_text = (
+        transition_result.get("error")
+        or transition_result.get("error_code")
+        or "unknown Jira transition error"
+    )
+    return (
+        f"Could not send this reply to the requester because Jira did not transition "
+        f"{ticket_key or 'the ticket'} to {', '.join(LIVE_AGENT_START_STATUS_NAMES)}. "
+        f"Reason: {error_text}"
+    )
 
 
 def slack_api(method, params=None, payload=None, http_method=None):
@@ -4660,12 +4856,14 @@ def is_live_agent_support_channel_message(channel, is_interactive_action=False):
 
 
 def is_live_agent_support_control_action(action_id):
-    return action_id in {ACTION_ID_LIVE_AGENT_RESOLVE, ACTION_ID_LIVE_AGENT_REASSIGN}
+    return action_id in {ACTION_ID_LIVE_AGENT_RESOLVE, ACTION_ID_LIVE_AGENT_CANCEL, ACTION_ID_LIVE_AGENT_REASSIGN}
 
 
 def live_agent_support_control_event_type(action_id):
     if action_id == ACTION_ID_LIVE_AGENT_RESOLVE:
         return "live_agent_support_resolve"
+    if action_id == ACTION_ID_LIVE_AGENT_CANCEL:
+        return "live_agent_support_cancel"
     return "live_agent_support_reassign"
 
 
@@ -4803,6 +5001,45 @@ def handle_live_agent_support_thread_reply(pointer, body, text):
     if not requester_channel:
         return {"ok": False, "error": "missing_requester_channel", "ticket_key": pointer.get("ticket_key")}
 
+    start_transition_result = transition_jira_issue_to_status(
+        pointer.get("ticket_key"),
+        LIVE_AGENT_START_STATUS_NAMES,
+        reason="slack_agent_reply",
+    )
+    if (
+        not start_transition_result.get("ok")
+        and LIVE_AGENT_BLOCK_REPLY_ON_START_TRANSITION_FAILURE
+    ):
+        warning = live_agent_start_transition_failure_text(pointer.get("ticket_key"), start_transition_result)
+        try:
+            send_slack_message(
+                body.get("channel") or pointer.get("support_channel"),
+                warning,
+                thread_ts=body.get("thread_ts") or pointer.get("support_thread_ts"),
+            )
+        except Exception as error:
+            log_json({
+                "level": "ERROR",
+                "message": "live_agent_start_transition_warning_failed",
+                "ticket_key": pointer.get("ticket_key"),
+                "error": str(error),
+            })
+        log_json({
+            "level": "ERROR",
+            "message": "live_agent_support_reply_blocked_by_jira_transition",
+            "ticket_key": pointer.get("ticket_key"),
+            "error_code": start_transition_result.get("error_code"),
+            "transition_result": start_transition_result,
+        })
+        return {
+            "ok": False,
+            "blocked": True,
+            "ticket_key": pointer.get("ticket_key"),
+            "error": start_transition_result.get("error"),
+            "error_code": start_transition_result.get("error_code") or "jira_start_transition_failed",
+            "transition_result": start_transition_result,
+        }
+
     send_slack_message(
         requester_channel,
         agent_reply_to_user_text(pointer, body.get("user"), text),
@@ -4837,8 +5074,9 @@ def handle_live_agent_support_thread_reply(pointer, body, text):
         "requester_channel": requester_channel,
         "support_channel": body.get("channel"),
         "support_thread_ts": body.get("thread_ts"),
+        "jira_start_transition": start_transition_result,
     })
-    return {"ok": True, "ticket_key": pointer.get("ticket_key")}
+    return {"ok": True, "ticket_key": pointer.get("ticket_key"), "jira_start_transition": start_transition_result}
 
 
 def handle_live_agent_reply_submission(body):
@@ -4976,6 +5214,18 @@ def feedback_comment_text(session_id, rating, feedback_text, user, channel):
     return "\n".join(parts)
 
 
+def feedback_comment_is_public(metadata):
+    if not isinstance(metadata, dict):
+        return True
+
+    value = metadata.get("comment_public")
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return True
+    return str(value).strip().lower() not in {"false", "0", "no", "private", "internal"}
+
+
 def update_feedback_session(session_id, rating, feedback_text, user, channel, ticket_key, now_iso, jira_comment_result=None):
     if not session_id:
         return
@@ -5028,8 +5278,12 @@ def handle_feedback_submission(body):
     if ticket_key:
         comment_body = feedback_comment_text(session_id, rating, feedback_text, user, channel)
         try:
-            add_jira_issue_comment(ticket_key, comment_body)
-            comment_result = {"ok": True, "ticket_key": ticket_key}
+            public_comment = feedback_comment_is_public(metadata)
+            if public_comment:
+                add_jira_issue_comment(ticket_key, comment_body)
+            else:
+                add_jsm_request_comment(ticket_key, comment_body, public=False)
+            comment_result = {"ok": True, "ticket_key": ticket_key, "public": public_comment}
         except Exception as error:
             comment_result = {
                 "ok": False,
