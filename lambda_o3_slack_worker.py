@@ -23,6 +23,7 @@ scheduler = boto3.client("scheduler", region_name=AWS_REGION)
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 bedrock_runtime = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 bedrock_agent_runtime = boto3.client("bedrock-agent-runtime", region_name=AWS_REGION)
+secretsmanager = boto3.client("secretsmanager", region_name=AWS_REGION)
 
 BOT_ID = os.environ["BOT_ID"]
 BOT_ALIAS_ID = os.environ["BOT_ALIAS_ID"]
@@ -190,6 +191,19 @@ LIVE_AGENT_START_STATUS_NAMES = [
 LIVE_AGENT_BLOCK_REPLY_ON_START_TRANSITION_FAILURE = (
     os.environ.get("LIVE_AGENT_BLOCK_REPLY_ON_START_TRANSITION_FAILURE", "true").lower() == "true"
 )
+MS_GRAPH_FEEDBACK_SYNC_ENABLED = os.environ.get("MS_GRAPH_FEEDBACK_SYNC_ENABLED", "false").lower() == "true"
+MS_GRAPH_TENANT_ID = os.environ.get("MS_GRAPH_TENANT_ID", "").strip()
+MS_GRAPH_CLIENT_ID = os.environ.get("MS_GRAPH_CLIENT_ID", "").strip()
+MS_GRAPH_CLIENT_SECRET_ID = os.environ.get("MS_GRAPH_CLIENT_SECRET_ID", "").strip()
+MS_GRAPH_SHAREPOINT_SITE_ID = os.environ.get("MS_GRAPH_SHAREPOINT_SITE_ID", "").strip()
+MS_GRAPH_SHAREPOINT_FEEDBACK_LIST_ID = os.environ.get("MS_GRAPH_SHAREPOINT_FEEDBACK_LIST_ID", "").strip()
+MS_GRAPH_TIMEOUT_SECONDS = int(os.environ.get("MS_GRAPH_TIMEOUT_SECONDS", "10"))
+MS_GRAPH_MAX_ATTEMPTS = max(1, int(os.environ.get("MS_GRAPH_MAX_ATTEMPTS", "2")))
+MS_GRAPH_RETRY_DELAY_SECONDS = float(os.environ.get("MS_GRAPH_RETRY_DELAY_SECONDS", "1"))
+MS_GRAPH_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+_ms_graph_client_secret_cache = None
+_ms_graph_token_cache = None
 
 NEXT_ACTION_CREATE_JIRA_TICKET = "O3_CreateJiraTicket"
 NEXT_ACTION_CLAUDE_ASSISTANCE = "O3_ClaudeFurtherAssistance"
@@ -533,6 +547,232 @@ def add_jira_issue_comment(issue_key, body):
             return {"message": response_text}
 
     return {"ok": True}
+
+
+def get_ms_graph_client_secret():
+    global _ms_graph_client_secret_cache
+
+    if _ms_graph_client_secret_cache:
+        return _ms_graph_client_secret_cache
+
+    if not MS_GRAPH_CLIENT_SECRET_ID:
+        raise ValueError("Missing MS_GRAPH_CLIENT_SECRET_ID")
+
+    response = secretsmanager.get_secret_value(SecretId=MS_GRAPH_CLIENT_SECRET_ID)
+    secret_string = response.get("SecretString") or ""
+    if not secret_string:
+        raise ValueError("Microsoft Graph client secret must be stored as SecretString")
+
+    try:
+        secret_json = json.loads(secret_string)
+        secret_value = (
+            secret_json.get("client_secret")
+            or secret_json.get("clientSecret")
+            or secret_json.get("secret")
+            or secret_json.get("value")
+        ) if isinstance(secret_json, dict) else None
+    except ValueError:
+        secret_value = secret_string
+
+    secret_value = text_or_empty(secret_value)
+    if not secret_value:
+        raise ValueError("Microsoft Graph client secret is empty")
+
+    _ms_graph_client_secret_cache = secret_value
+    return secret_value
+
+
+def ms_graph_config_ready():
+    return all([
+        MS_GRAPH_TENANT_ID,
+        MS_GRAPH_CLIENT_ID,
+        MS_GRAPH_CLIENT_SECRET_ID,
+        MS_GRAPH_SHAREPOINT_SITE_ID,
+        MS_GRAPH_SHAREPOINT_FEEDBACK_LIST_ID,
+    ])
+
+
+def ms_graph_http_json(url, method="GET", headers=None, body=None):
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    request_headers = {"Accept": "application/json", **(headers or {})}
+    if data is not None:
+        request_headers["Content-Type"] = "application/json"
+
+    last_error = None
+    for attempt in range(1, MS_GRAPH_MAX_ATTEMPTS + 1):
+        request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=MS_GRAPH_TIMEOUT_SECONDS) as response:
+                response_text = response.read().decode("utf-8").strip()
+                return {
+                    "ok": 200 <= response.status < 300,
+                    "status_code": response.status,
+                    "body": json.loads(response_text) if response_text else None,
+                    "attempts": attempt,
+                }
+        except urllib.error.HTTPError as error:
+            retryable = error.code in MS_GRAPH_RETRYABLE_STATUS_CODES
+            try:
+                error_text = error.read().decode("utf-8").strip()
+            except Exception:
+                error_text = ""
+            last_error = {
+                "ok": False,
+                "status_code": error.code,
+                "error": error_text or error.reason,
+                "error_code": "ms_graph_http_error",
+                "retryable": retryable,
+                "attempts": attempt,
+            }
+            if not retryable or attempt >= MS_GRAPH_MAX_ATTEMPTS:
+                return last_error
+            retry_after = error.headers.get("Retry-After") if error.headers else None
+            try:
+                delay = float(retry_after) if retry_after is not None else MS_GRAPH_RETRY_DELAY_SECONDS
+            except ValueError:
+                delay = MS_GRAPH_RETRY_DELAY_SECONDS
+            time.sleep(max(0, delay))
+        except (urllib.error.URLError, TimeoutError) as error:
+            return {
+                "ok": False,
+                "status_code": None,
+                "error": str(error),
+                "error_code": "ms_graph_network_error",
+                "retryable": False,
+                "attempts": attempt,
+            }
+
+    return last_error or {"ok": False, "error": "Microsoft Graph request failed", "error_code": "ms_graph_request_failed"}
+
+
+def ms_graph_access_token():
+    global _ms_graph_token_cache
+
+    now = int(time.time())
+    if _ms_graph_token_cache and _ms_graph_token_cache.get("expires_at", 0) > now + 60:
+        return _ms_graph_token_cache["access_token"]
+
+    if not (MS_GRAPH_TENANT_ID and MS_GRAPH_CLIENT_ID):
+        raise ValueError("Missing Microsoft Graph tenant/client configuration")
+
+    token_url = f"https://login.microsoftonline.com/{urllib.parse.quote(MS_GRAPH_TENANT_ID, safe='')}/oauth2/v2.0/token"
+    form = urllib.parse.urlencode({
+        "client_id": MS_GRAPH_CLIENT_ID,
+        "client_secret": get_ms_graph_client_secret(),
+        "grant_type": "client_credentials",
+        "scope": "https://graph.microsoft.com/.default",
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        token_url,
+        data=form,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=MS_GRAPH_TIMEOUT_SECONDS) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        try:
+            error_text = error.read().decode("utf-8").strip()
+        except Exception:
+            error_text = ""
+        raise RuntimeError(f"Microsoft Graph token request failed: HTTP {error.code} {error_text}") from error
+
+    access_token = text_or_empty(body.get("access_token"))
+    if not access_token:
+        raise ValueError("Microsoft Graph token response did not include access_token")
+
+    _ms_graph_token_cache = {
+        "access_token": access_token,
+        "expires_at": now + int(body.get("expires_in") or 3600),
+    }
+    return access_token
+
+
+def feedback_source(metadata):
+    source = text_or_empty((metadata or {}).get("feedback_source") or (metadata or {}).get("source"))
+    if source:
+        return source
+    return "live_agent" if (metadata or {}).get("comment_public") is False else "summary"
+
+
+def sharepoint_feedback_fields(session_id, rating, feedback_text, user, channel, ticket_key, now_iso, metadata, comment_result):
+    return {
+        "Title": f"IVY feedback - {ticket_key or session_id or 'unknown'}",
+        "SubmittedAt": now_iso,
+        "Rating": int(rating),
+        "RatingStars": feedback_stars(rating),
+        "FeedbackText": feedback_text or "",
+        "SlackUser": user or "",
+        "SlackChannel": channel or "",
+        "SessionId": session_id or "",
+        "JiraTicketKey": ticket_key or "",
+        "CommentPublic": feedback_comment_is_public(metadata),
+        "FeedbackSource": feedback_source(metadata),
+        "JiraCommentStatus": "posted" if (comment_result or {}).get("ok") else "not_posted",
+        "DynamoStatus": "stored",
+    }
+
+
+def create_sharepoint_feedback_item(fields):
+    if not MS_GRAPH_FEEDBACK_SYNC_ENABLED:
+        return {"ok": False, "skipped": True, "status": "skipped", "reason": "graph_sync_disabled"}
+    if not ms_graph_config_ready():
+        return {"ok": False, "skipped": True, "status": "skipped", "reason": "graph_config_incomplete"}
+
+    token = ms_graph_access_token()
+    safe_site_id = urllib.parse.quote(MS_GRAPH_SHAREPOINT_SITE_ID, safe="")
+    safe_list_id = urllib.parse.quote(MS_GRAPH_SHAREPOINT_FEEDBACK_LIST_ID, safe="")
+    result = ms_graph_http_json(
+        f"https://graph.microsoft.com/v1.0/sites/{safe_site_id}/lists/{safe_list_id}/items",
+        method="POST",
+        headers={"Authorization": f"Bearer {token}"},
+        body={"fields": fields},
+    )
+    if not result.get("ok"):
+        return {
+            **result,
+            "status": "failed",
+            "error_code": result.get("error_code") or "sharepoint_feedback_write_failed",
+        }
+
+    body = result.get("body") or {}
+    return {
+        "ok": True,
+        "status": "posted",
+        "item_id": body.get("id"),
+        "web_url": body.get("webUrl"),
+        "status_code": result.get("status_code"),
+        "attempts": result.get("attempts"),
+    }
+
+
+def sync_feedback_to_sharepoint(session_id, rating, feedback_text, user, channel, ticket_key, now_iso, metadata, comment_result):
+    fields = sharepoint_feedback_fields(
+        session_id,
+        rating,
+        feedback_text,
+        user,
+        channel,
+        ticket_key,
+        now_iso,
+        metadata,
+        comment_result,
+    )
+    try:
+        result = create_sharepoint_feedback_item(fields)
+        return {**result, "fields": fields}
+    except Exception as error:
+        return {
+            "ok": False,
+            "status": "failed",
+            "error": str(error),
+            "error_code": "sharepoint_feedback_sync_exception",
+            "fields": fields,
+        }
 
 
 def jira_api_request(method, path, payload=None):
@@ -5226,10 +5466,13 @@ def feedback_comment_is_public(metadata):
     return str(value).strip().lower() not in {"false", "0", "no", "private", "internal"}
 
 
-def update_feedback_session(session_id, rating, feedback_text, user, channel, ticket_key, now_iso, jira_comment_result=None):
+def update_feedback_session(session_id, rating, feedback_text, user, channel, ticket_key, now_iso, jira_comment_result=None, sharepoint_result=None):
     if not session_id:
         return
 
+    sharepoint_status = (sharepoint_result or {}).get("status") or (
+        "posted" if (sharepoint_result or {}).get("ok") else "failed"
+    )
     sessions_table.update_item(
         Key={"session_id": session_id},
         UpdateExpression="""
@@ -5242,6 +5485,10 @@ def update_feedback_session(session_id, rating, feedback_text, user, channel, ti
                 feedback_submitted_at = :now,
                 feedback_jira_ticket_key = :ticket_key,
                 feedback_jira_comment_status = :comment_status,
+                feedback_sharepoint_sync_status = :sharepoint_status,
+                feedback_sharepoint_item_id = :sharepoint_item_id,
+                feedback_sharepoint_error = :sharepoint_error,
+                feedback_sharepoint_synced_at = :sharepoint_synced_at,
                 updated_at = :now,
                 #ttl = :ttl
         """,
@@ -5255,6 +5502,10 @@ def update_feedback_session(session_id, rating, feedback_text, user, channel, ti
             ":now": now_iso,
             ":ticket_key": ticket_key or "",
             ":comment_status": "posted" if (jira_comment_result or {}).get("ok") else "not_posted",
+            ":sharepoint_status": sharepoint_status,
+            ":sharepoint_item_id": (sharepoint_result or {}).get("item_id") or "",
+            ":sharepoint_error": (sharepoint_result or {}).get("error") or (sharepoint_result or {}).get("reason") or "",
+            ":sharepoint_synced_at": now_iso if (sharepoint_result or {}).get("ok") else "",
             ":ttl": ttl_epoch(),
         },
     )
@@ -5291,6 +5542,28 @@ def handle_feedback_submission(body):
                 "error": str(error),
             }
 
+    sharepoint_result = sync_feedback_to_sharepoint(
+        session_id,
+        rating,
+        feedback_text,
+        user,
+        channel,
+        ticket_key,
+        now_iso,
+        metadata,
+        comment_result,
+    )
+    if not sharepoint_result.get("ok") and not sharepoint_result.get("skipped"):
+        log_json({
+            "level": "ERROR",
+            "message": "feedback_sharepoint_sync_failed",
+            "session_id": session_id,
+            "ticket_key": ticket_key,
+            "status": sharepoint_result.get("status"),
+            "error": sharepoint_result.get("error"),
+            "error_code": sharepoint_result.get("error_code"),
+        })
+
     update_feedback_session(
         session_id,
         rating,
@@ -5300,15 +5573,11 @@ def handle_feedback_submission(body):
         ticket_key,
         now_iso,
         jira_comment_result=comment_result,
+        sharepoint_result=sharepoint_result,
     )
 
     try:
-        send_slack_message(
-            channel,
-            "Thanks for the feedback. It has been added to the follow-up ticket."
-            if comment_result.get("ok")
-            else "Thanks for the feedback. I saved it, but could not add it to the follow-up ticket.",
-        )
+        send_slack_message(channel, "Thanks for the feedback.")
     except Exception as error:
         log_json({
             "level": "WARN",
@@ -5324,6 +5593,7 @@ def handle_feedback_submission(body):
         "rating": rating,
         "ticket_key": ticket_key,
         "jira_comment_ok": comment_result.get("ok"),
+        "sharepoint_sync_status": sharepoint_result.get("status"),
         "error": comment_result.get("error"),
     })
     return {
@@ -5331,6 +5601,7 @@ def handle_feedback_submission(body):
         "session_id": session_id,
         "ticket_key": ticket_key,
         "comment_result": comment_result,
+        "sharepoint_result": sharepoint_result,
     }
 
 
