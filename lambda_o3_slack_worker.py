@@ -4619,25 +4619,44 @@ def find_live_agent_support_bridge(channel, thread_ts):
     if not (support_bridge_enabled() and channel and thread_ts):
         return None
 
-    response = sessions_table.scan(
-        FilterExpression=(
-            Attr("pointer_type").eq("live_agent_ticket")
-            & Attr("support_channel").eq(channel)
-            & Attr("support_thread_ts").eq(thread_ts)
-            & Attr("bridge_status").eq("active")
-        ),
-        Limit=1,
+    filter_expression = (
+        Attr("pointer_type").eq("live_agent_ticket")
+        & Attr("support_channel").eq(channel)
+        & Attr("support_thread_ts").eq(thread_ts)
+        & Attr("bridge_status").eq("active")
     )
-    items = response.get("Items") or []
-    return items[0] if items else None
+    scan_kwargs = {
+        "FilterExpression": filter_expression,
+        "Limit": 100,
+    }
+
+    while True:
+        response = sessions_table.scan(**scan_kwargs)
+        items = response.get("Items") or []
+        if items:
+            return items[0]
+
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            return None
+
+        scan_kwargs["ExclusiveStartKey"] = last_key
 
 
 def find_live_agent_support_bridge_for_event(channel, *ts_values):
-    for ts_value in ts_values:
-        pointer = find_live_agent_support_bridge(channel, text_or_empty(ts_value))
+    for ts_value in dict.fromkeys(text_or_empty(ts_value) for ts_value in ts_values):
+        pointer = find_live_agent_support_bridge(channel, ts_value)
         if pointer:
             return pointer
     return None
+
+
+def is_live_agent_support_channel_message(channel, is_interactive_action=False):
+    return (
+        support_bridge_enabled()
+        and channel == LIVE_AGENT_SUPPORT_CHANNEL_ID
+        and not is_interactive_action
+    )
 
 
 def is_live_agent_support_control_action(action_id):
@@ -5142,6 +5161,7 @@ def process_record(record):
         channel,
         body.get("thread_ts"),
         body.get("message_ts"),
+        body.get("ts"),
     )
     if support_bridge and is_interactive_action and is_live_agent_support_control_action(action_id):
         maybe_send_ephemeral(
@@ -5175,11 +5195,7 @@ def process_record(record):
         handle_live_agent_support_thread_reply(support_bridge, body, text)
         return
 
-    if (
-        support_bridge_enabled()
-        and channel == LIVE_AGENT_SUPPORT_CHANNEL_ID
-        and not is_interactive_action
-    ):
+    if is_live_agent_support_channel_message(channel, is_interactive_action):
         log_json({
             "level": "WARN",
             "message": "live_agent_support_thread_bridge_not_found",
@@ -5191,6 +5207,7 @@ def process_record(record):
             "has_text": bool(text),
             "is_bot_message": is_bot_message,
         })
+        return
 
     existing_session = get_session_item(session_id)
     if (

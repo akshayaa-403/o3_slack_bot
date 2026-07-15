@@ -319,6 +319,90 @@ Optional:
 - `JIRA_CONFIRMATION_REPLY`, default confirmation prompt for imported action intents.
 - `CREATE_JIRA_TICKET_FUNCTION`, `IMAGE_REK_FUNCTION`, `LIVE_AGENT_FUNCTION`, `ESCALATION_FUNCTION`, and `LLM_FALLBACK_FUNCTION` are reserved for later phases.
 
+### Live Agent Lambda
+
+File: `lambda_o3_live_agent.py`
+
+Canonical handoff and callback Slack context:
+
+```json
+{
+  "session_id": "...",
+  "session_root_ts": "...",
+  "slack_channel": "...",
+  "slack_thread_ts": "...",
+  "slack_user": "...",
+  "slack": {
+    "channelId": "...",
+    "threadTs": "...",
+    "userId": "..."
+  }
+}
+```
+
+Jira Automation Send Web Request should pass the flattened canonical fields (`session_id`, `session_root_ts`, `slack_channel`, `slack_thread_ts`, `slack_user`) back to `o3_live_agent`; no Jira-side field-name translation is required.
+
+Optional:
+
+- `AWS_REGION`, default `ap-southeast-2`
+- `DYNAMODB_TABLE` / `SESSION_TABLE`, default `o3_slack_sessions`
+- `LIVE_AGENT_WEBHOOK_URL` / `AUTOMATION_WEBHOOK_URL`, required for handoff creation
+- `LIVE_AGENT_CALLBACK_SECRET`, optional callback secret header gate
+- `SLACK_BOT_TOKEN`, required for Slack callback notifications
+- `JSM_ONCALL_CACHE_TABLE`, default `O3_JSMOps_Oncall`
+- `ONCALL_USER_TABLE`, legacy alias for `O3_JSMOps_Oncall`
+- `ONCALL_CACHE_KEY`, default `current`
+- `ONCALL_USER_FUNCTION` / `JSM_ONCALL_USER_FUNCTION`, optional helper Lambda for resolving a missing ticket assignee
+- `CHAT_LOCKS_TABLE`, default `O3_Lambda_Agent_Chat_Locks`
+- `AGENT_CHAT_LOCK_TABLE`, legacy live-agent env name, default `O3_Lambda_Agent_Chat_Locks`
+- `ENABLE_LIVE_AGENT_CAPACITY`, default `false`
+- `MAX_ACTIVE_CHATS_PER_AGENT`, default `5`
+- `LIVE_AGENT_MAX_ACTIVE_CHATS`, legacy live-agent env name, default `5`
+- `CHAT_LOCK_TTL_HOURS`, default `24`
+- `LIVE_AGENT_QUEUE_NAME`, default `live_agent`
+- `LIVE_AGENT_BUSY_REPLY`, default busy queue Slack message
+
+Capacity tables:
+
+- `O3_JSMOps_Oncall` uses composite key `PK` / `SK`.
+- Current on-call cache item uses `PK=SCHEDULE#live_agent`, `SK=CURRENT`.
+- `O3_Lambda_Agent_Chat_Locks` uses composite key `PK` / `SK`.
+- Lock table item families:
+  - `AGENT#<jira_account_id>` / `COUNTER`
+  - `AGENT#<jira_account_id>` / `LOCK#<ticket_key>`
+  - `TICKET#<ticket_key>` / `LOCK`
+  - `QUEUE#live_agent` / `WAITING#<epoch_ms>#<ticket_key>`
+
+IAM:
+
+- Live Agent Lambda execution role needs `dynamodb:GetItem`, `dynamodb:PutItem`, `dynamodb:UpdateItem`, and `dynamodb:Scan` on `O3_Lambda_Agent_Chat_Locks`.
+- Live Agent Lambda execution role needs `dynamodb:GetItem` and `dynamodb:Scan` on `O3_JSMOps_Oncall`.
+- Existing `o3_slack_sessions` permissions remain required for callback pointer/session updates.
+
+### JSM On-call User Lambda
+
+File: `lambda_o3_jsm_oncall_user.py`
+
+Required:
+
+- `JSM_ONCALL_CACHE_TABLE`, default `O3_JSMOps_Oncall`
+- Jira credentials through direct `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN`, or compatible `JIRA_SECRET_ID`
+
+Optional:
+
+- `AWS_REGION`, default `ap-southeast-2`
+- `OPSGENIE_API_KEY`, optional
+- `OPSGENIE_SCHEDULE_ID`, optional
+- `OPSGENIE_SCHEDULE_NAME`, default `live agent`
+- `OPSGENIE_JIRA_ACCOUNT_MAP`, optional JSON mapping from Opsgenie email/name to Jira account ID or user object
+- `ONCALL_CACHE_TTL_SECONDS`, default `900`
+- `JIRA_TIMEOUT_SECONDS`, default `15`
+
+IAM:
+
+- On-call Lambda execution role needs `dynamodb:PutItem` on `O3_JSMOps_Oncall`.
+- If `JIRA_SECRET_ID` is used, it needs `secretsmanager:GetSecretValue` for that secret.
+
 ### CreateJiraTicket Lambda
 
 Required:
@@ -531,6 +615,8 @@ Implemented from diagram:
 - `Slack image upload -> O3_slack_queue -> O3_slack_node_handler -> O3_Image_rek`
 - `O3_Image_rek -> Lex -> Bedrock Knowledge Base -> Gemini fallback`
 - `O3_Image_rek -> O3-image` optional S3 storage through `IMAGE_BUCKET`
+- `O3_live_agent -> O3_JSMOps_Oncall` for current on-call user fallback
+- `O3_live_agent -> O3_Lambda_Agent_Chat_Locks` for active chat capacity and waiting queue
 
 Not implemented yet:
 
@@ -539,7 +625,6 @@ Not implemented yet:
 - `O3_Image_rek -> O3-image-internal-db`
 - `O3_lambda_router -> O3_live_agent`
 - Full Atlassian Forge `rovo:agent` / `action` integration
-- live-agent/on-call tables and locks
 
 ## Testing Notes
 
@@ -649,6 +734,18 @@ Manual image test:
 - Temporarily force Bedrock KB no-answer and confirm Gemini answers with `response_source=image_gemini`.
 - Confirm DynamoDB stores `image_resolution_source=lex|bedrock_knowledge_base|gemini`, `image_status=completed|failed`, `image_files`, and `image_summary` or image error metadata.
 
+Manual live-agent capacity test:
+
+- Deploy `lambda_o3_live_agent.py` and `lambda_o3_jsm_oncall_user.py`.
+- Create `O3_JSMOps_Oncall` with partition key `PK` and sort key `SK`, both strings.
+- Create `O3_Lambda_Agent_Chat_Locks` with partition key `PK` and sort key `SK`, both strings.
+- Set `MAX_ACTIVE_CHATS_PER_AGENT=5`.
+- Trigger or seed the on-call helper so `oncall_key=current` exists for the current responder.
+- Create 5 live-agent tickets assigned to the same responder and confirm 5 active `ticket_lock` records plus 5 active `agent_slot` records.
+- Create a 6th ticket and confirm it gets `lock_status=waiting`, Slack receives `LIVE_AGENT_BUSY_REPLY`, and normal ticket-created notification is not sent for that callback.
+- Resolve one active ticket and confirm its lock/slot become `released`, the oldest waiting ticket becomes `active`, and Slack receives the promotion notice.
+- Confirm existing ticket-created callback, `live_agent_ticket:IVY-xx` pointer, status update callback, public comment callback, and resolved/closed Slack notifications still work.
+
 ## Next Work
 
 Planned next phase: deploy and verify the ImageRek -> Lex -> Bedrock KB -> Gemini path in AWS, then add internal image DB persistence.
@@ -672,6 +769,14 @@ Jira deployment checks:
 - Keep image internal DB persistence, live-agent handoff, and escalation as later phases.
 
 ## Change Log
+
+### 2026-07-08
+
+- Added live-agent capacity locking in `lambda_o3_live_agent.py` using `O3_Lambda_Agent_Chat_Locks`.
+- Added queued live-agent handling when the current responder is at `LIVE_AGENT_MAX_ACTIVE_CHATS`.
+- Added active lock release and oldest waiting-ticket promotion on resolved/closed JSM status callbacks.
+- Added `lambda_o3_jsm_oncall_user.py` to cache the current JSM on-call user in `O3_JSMOps_Oncall`.
+- Added unit tests for live-agent capacity helpers.
 
 ### 2026-07-06
 
