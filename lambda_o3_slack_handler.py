@@ -22,10 +22,15 @@ VERIFY_SLACK_SIGNATURE = os.environ.get("VERIFY_SLACK_SIGNATURE", "false").lower
 DEDUP_TABLE = os.environ.get("DEDUP_TABLE", "O3_EventDedup2")
 DEDUP_TTL_SECONDS = int(os.environ.get("DEDUP_TTL_SECONDS", "172800"))
 SLACK_SIGNATURE_TOLERANCE_SECONDS = int(os.environ.get("SLACK_SIGNATURE_TOLERANCE_SECONDS", "300"))
+ENABLE_FEEDBACK_RATING = os.environ.get("ENABLE_FEEDBACK_RATING", "true").lower() == "true"
+ENABLE_FEEDBACK_FORM = os.environ.get("ENABLE_FEEDBACK_FORM", "true").lower() == "true"
+LIVE_AGENT_SUPPORT_CHANNEL_ID = os.environ.get("LIVE_AGENT_SUPPORT_CHANNEL_ID", "").strip()
 
 dedup_table = dynamodb.Table(DEDUP_TABLE)
 ACTION_ID_FEEDBACK_RATING = "ivy_feedback_rating"
+ACTION_ID_LIVE_AGENT_REPLY = "ivy_live_agent_reply"
 CALLBACK_ID_FEEDBACK_FORM = "ivy_feedback_form"
+CALLBACK_ID_LIVE_AGENT_REPLY = "ivy_live_agent_reply_form"
 
 
 def log_json(data):
@@ -117,6 +122,13 @@ def message_mentions_bot(slack_event):
     return slack_event.get("type") == "app_mention"
 
 
+def is_live_agent_support_channel(slack_event):
+    return bool(
+        LIVE_AGENT_SUPPORT_CHANNEL_ID
+        and slack_event.get("channel") == LIVE_AGENT_SUPPORT_CHANNEL_ID
+    )
+
+
 def clean_slack_text(text):
     value = (text or "").strip()
 
@@ -206,6 +218,32 @@ def slack_api(method, payload):
     return result
 
 
+def maybe_send_ephemeral(channel, user, text, thread_ts=None):
+    if not channel or not user:
+        return None
+
+    payload = {
+        "channel": channel,
+        "user": user,
+        "text": text,
+    }
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+
+    try:
+        return slack_api("chat.postEphemeral", payload)
+    except Exception as error:
+        log_json({
+            "level": "WARN",
+            "message": "ephemeral_processing_message_failed",
+            "channel": channel,
+            "user": user,
+            "thread_ts": thread_ts,
+            "error": str(error),
+        })
+        return None
+
+
 def feedback_stars(rating):
     rating = max(1, min(5, int(rating or 1)))
     return "★" * rating + "☆" * (5 - rating)
@@ -270,6 +308,67 @@ def open_feedback_modal(payload, action):
     )
 
 
+def support_reply_metadata(payload, action):
+    user = payload.get("user", {}) or {}
+    channel = payload.get("channel", {}) or {}
+    message = payload.get("message", {}) or {}
+    container = payload.get("container", {}) or {}
+    action_payload = parse_action_value(action.get("value"))
+    return {
+        **action_payload,
+        "user": user.get("id"),
+        "channel": channel.get("id"),
+        "message_ts": container.get("message_ts") or message.get("ts"),
+        "thread_ts": message.get("thread_ts") or container.get("thread_ts") or container.get("message_ts") or message.get("ts"),
+    }
+
+
+def open_live_agent_reply_modal(payload, action):
+    metadata = support_reply_metadata(payload, action)
+    ticket_key = metadata.get("ticket_key") or "live-agent request"
+    modal = {
+        "type": "modal",
+        "callback_id": CALLBACK_ID_LIVE_AGENT_REPLY,
+        "private_metadata": json.dumps(metadata, ensure_ascii=True, separators=(",", ":")),
+        "title": {"type": "plain_text", "text": "Reply to customer"},
+        "submit": {"type": "plain_text", "text": "Send"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"Ticket: *{ticket_key}*",
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "live_agent_reply",
+                "label": {
+                    "type": "plain_text",
+                    "text": "Message",
+                },
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "reply_text",
+                    "multiline": True,
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "Write the message to send to the requester",
+                    },
+                },
+            },
+        ],
+    }
+    return slack_api(
+        "views.open",
+        {
+            "trigger_id": payload.get("trigger_id"),
+            "view": modal,
+        },
+    )
+
+
 def extract_feedback_text(view):
     state_values = ((view or {}).get("state") or {}).get("values") or {}
     for block in state_values.values():
@@ -279,6 +378,13 @@ def extract_feedback_text(view):
             if isinstance(action, dict) and "value" in action:
                 return action.get("value") or ""
     return ""
+
+
+def extract_live_agent_reply_text(view):
+    state_values = ((view or {}).get("state") or {}).get("values") or {}
+    reply_block = state_values.get("live_agent_reply") or {}
+    reply_action = reply_block.get("reply_text") or {}
+    return reply_action.get("value") or ""
 
 
 def enqueue_feedback_submission(payload):
@@ -321,6 +427,55 @@ def enqueue_feedback_submission(payload):
             "feedback_rating": metadata.get("rating"),
             "feedback_text": extract_feedback_text(view),
             "feedback_metadata": metadata,
+        }),
+    )
+    return "OK"
+
+
+def enqueue_live_agent_reply_submission(payload):
+    view = payload.get("view") or {}
+    metadata = parse_action_value(view.get("private_metadata"))
+    user = payload.get("user", {}) or {}
+    reply_text = extract_live_agent_reply_text(view).strip()
+    event_id = "live-agent-reply-" + hashlib.sha256(
+        "|".join([
+            metadata.get("ticket_key") or "",
+            user.get("id") or "",
+            view.get("id") or "",
+            reply_text,
+        ]).encode("utf-8")
+    ).hexdigest()[:32]
+    now = int(time.time())
+
+    try:
+        dedup_table.put_item(
+            Item={
+                "event_id": event_id,
+                "event_time": now,
+                "created_at": now,
+                "ttl": now + DEDUP_TTL_SECONDS,
+            },
+            ConditionExpression="attribute_not_exists(event_id)",
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return "duplicate ignored"
+        raise
+
+    sqs.send_message(
+        QueueUrl=QUEUE_URL,
+        MessageBody=json.dumps({
+            "event_id": event_id,
+            "event_type": "live_agent_reply_submission",
+            "routing_reason": "live_agent_reply_submission",
+            "channel": metadata.get("channel"),
+            "user": user.get("id") or metadata.get("user"),
+            "text": reply_text,
+            "raw_text": reply_text,
+            "ts": metadata.get("message_ts"),
+            "thread_ts": metadata.get("thread_ts"),
+            "message_ts": metadata.get("message_ts"),
+            "ticket_key": metadata.get("ticket_key"),
         }),
     )
     return "OK"
@@ -436,6 +591,9 @@ def should_process_slack_event(slack_event):
     if is_direct_message(slack_event):
         return True, "direct_message"
 
+    if is_live_agent_support_channel(slack_event):
+        return True, "live_agent_support_channel"
+
     if message_mentions_bot(slack_event):
         return True, "bot_mentioned"
 
@@ -455,7 +613,18 @@ def lambda_handler(event, context):
 
     if interactive_payload:
         if interactive_payload.get("type") == "view_submission":
-            enqueue_feedback_submission(interactive_payload)
+            callback_id = (interactive_payload.get("view") or {}).get("callback_id")
+            if callback_id == CALLBACK_ID_LIVE_AGENT_REPLY:
+                metadata = parse_action_value((interactive_payload.get("view") or {}).get("private_metadata"))
+                maybe_send_ephemeral(
+                    metadata.get("channel"),
+                    (interactive_payload.get("user") or {}).get("id") or metadata.get("user"),
+                    "Sending reply...",
+                    metadata.get("thread_ts") or metadata.get("message_ts"),
+                )
+                enqueue_live_agent_reply_submission(interactive_payload)
+            elif ENABLE_FEEDBACK_FORM:
+                enqueue_feedback_submission(interactive_payload)
             return {
                 "statusCode": 200,
                 "body": "",
@@ -464,6 +633,12 @@ def lambda_handler(event, context):
         actions = interactive_payload.get("actions") or []
         action = actions[0] if actions else {}
         if str(action.get("action_id") or "").startswith(ACTION_ID_FEEDBACK_RATING):
+            if not ENABLE_FEEDBACK_RATING:
+                return {
+                    "statusCode": 200,
+                    "body": "",
+                }
+
             try:
                 open_feedback_modal(interactive_payload, action)
                 return {
@@ -479,6 +654,24 @@ def lambda_handler(event, context):
                 return {
                     "statusCode": 200,
                     "body": "feedback modal failed",
+                }
+
+        if action.get("action_id") == ACTION_ID_LIVE_AGENT_REPLY:
+            try:
+                open_live_agent_reply_modal(interactive_payload, action)
+                return {
+                    "statusCode": 200,
+                    "body": "OK",
+                }
+            except Exception as error:
+                log_json({
+                    "level": "ERROR",
+                    "message": "live_agent_reply_modal_open_failed",
+                    "error": str(error),
+                })
+                return {
+                    "statusCode": 200,
+                    "body": "live agent reply modal failed",
                 }
 
         result = enqueue_interactive_action(interactive_payload)
@@ -542,6 +735,21 @@ def lambda_handler(event, context):
             "statusCode": 200,
             "body": routing_reason
         }
+
+    if is_live_agent_support_channel(slack_event):
+        log_json({
+            "level": "INFO",
+            "message": "live_agent_support_channel_event_accepted",
+            "event_id": event_id,
+            "channel": slack_event.get("channel"),
+            "event_type": event_type,
+            "channel_type": channel_type,
+            "subtype": slack_event.get("subtype"),
+            "thread_ts": slack_event.get("thread_ts"),
+            "ts": slack_event.get("ts"),
+            "user": slack_event.get("user"),
+            "has_text": bool((slack_event.get("text") or "").strip()),
+        })
 
     # Deduplicate accepted DM retry events before sending to SQS.
     if event_id:

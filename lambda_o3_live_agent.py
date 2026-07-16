@@ -48,6 +48,39 @@ LIVE_AGENT_BUSY_REPLY = os.environ.get(
     "LIVE_AGENT_BUSY_REPLY",
     "All live agents are busy right now. You are in the queue and support will pick this up as soon as someone is available."
 )
+LIVE_AGENT_SUPPORT_MODE = os.environ.get("LIVE_AGENT_SUPPORT_MODE", "").strip().lower()
+LIVE_AGENT_SUPPORT_CHANNEL_ID = os.environ.get("LIVE_AGENT_SUPPORT_CHANNEL_ID", "").strip()
+try:
+    LIVE_AGENT_AGENT_SLACK_MAP = json.loads(os.environ.get("LIVE_AGENT_AGENT_SLACK_MAP", "{}") or "{}")
+    if not isinstance(LIVE_AGENT_AGENT_SLACK_MAP, dict):
+        LIVE_AGENT_AGENT_SLACK_MAP = {}
+except ValueError:
+    LIVE_AGENT_AGENT_SLACK_MAP = {}
+
+ACTION_ID_LIVE_AGENT_RESOLVE = "ivy_live_agent_resolve"
+ACTION_ID_LIVE_AGENT_CANCEL = "ivy_live_agent_cancel"
+ACTION_ID_LIVE_AGENT_REASSIGN = "ivy_live_agent_reassign"
+ACTION_ID_LIVE_AGENT_REPLY = "ivy_live_agent_reply"
+ACTION_ID_FEEDBACK_RATING = "ivy_feedback_rating"
+LIVE_AGENT_RESOLVE_STATUS_NAMES = [
+    name.strip()
+    for name in os.environ.get("LIVE_AGENT_RESOLVE_STATUS_NAMES", "Resolved").split(",")
+    if name.strip()
+]
+LIVE_AGENT_CANCEL_STATUS_NAMES = [
+    name.strip()
+    for name in os.environ.get("LIVE_AGENT_CANCEL_STATUS_NAMES", "Cancelled,Canceled").split(",")
+    if name.strip()
+]
+LIVE_AGENT_RESOLUTION_TRANSCRIPT_LIMIT = max(
+    1,
+    int(os.environ.get("LIVE_AGENT_RESOLUTION_TRANSCRIPT_LIMIT", "120")),
+)
+LIVE_AGENT_RESOLUTION_COMMENT_TEXT_LIMIT = max(
+    1000,
+    int(os.environ.get("LIVE_AGENT_RESOLUTION_COMMENT_TEXT_LIMIT", "30000")),
+)
+LIVE_AGENT_RESOLUTION_COMMENT_MARKER = "[IVY_INTERNAL_RESOLUTION_SUMMARY]"
 
 SUCCESS_REPLY = os.environ.get(
     "LIVE_AGENT_SUCCESS_REPLY",
@@ -392,7 +425,10 @@ def normalize_live_agent_status(status):
     if any(marker in normalized for marker in ("resolved", "done", "closed", "complete")):
         return "resolved"
 
-    if any(marker in normalized for marker in ("failed", "cancelled", "canceled")):
+    if any(marker in normalized for marker in ("cancelled", "canceled")):
+        return "cancelled"
+
+    if "failed" in normalized:
         return "failed"
 
     if any(marker in normalized for marker in ("in progress", "open", "to do", "triage")):
@@ -485,6 +521,234 @@ def live_agent_queue_assigned_reply(ticket_key, agent_name):
         return f"✅ A live agent is now available. {agent_text} has been assigned to {ticket_key}."
 
     return f"✅ A live agent is now available. {agent_text} has been assigned to your request."
+
+
+def live_agent_slack_console_enabled():
+    return LIVE_AGENT_SUPPORT_MODE == "slack_console" and bool(LIVE_AGENT_SUPPORT_CHANNEL_ID)
+
+
+def slack_user_mention(user_id):
+    user_id = text_or_empty(user_id)
+    return f"<@{user_id}>" if user_id else "Unassigned"
+
+
+def slack_mrkdwn(value, limit=2900):
+    text = text_or_empty(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit - 3].rstrip() + "..."
+
+
+def live_agent_issue_title(callback):
+    title = first_text(
+        callback.get("user_request"),
+        callback.get("description"),
+        callback.get("conversation_summary"),
+        callback.get("ticket_key"),
+        "Live-agent request",
+    )
+    title = " ".join(title.split())
+    return slack_mrkdwn(title, 140)
+
+
+def live_agent_support_action_value(action, ticket_key):
+    return json.dumps(
+        {
+            "action": action,
+            "ticket_key": ticket_key or "",
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def resolve_agent_slack_user_id(callback, assignment=None):
+    assignment = assignment or {}
+    agent = assignment.get("agent") if isinstance(assignment.get("agent"), dict) else {}
+    candidates = [
+        callback.get("assigned_agent_slack_user_id"),
+        callback.get("assignee_slack_user_id"),
+        assignment.get("assigned_agent_slack_user_id"),
+        agent.get("slack_user_id"),
+    ]
+    for value in candidates:
+        value = text_or_empty(value)
+        if value:
+            return value
+
+    lookup_keys = [
+        callback.get("assignee_account_id"),
+        callback.get("assignee_email"),
+        assignment.get("assigned_jira_account_id"),
+        assignment.get("assigned_agent_id"),
+        assignment.get("assigned_agent_name"),
+        agent.get("jira_account_id"),
+        agent.get("agent_id"),
+        agent.get("email"),
+        agent.get("display_name"),
+    ]
+    for key in lookup_keys:
+        value = LIVE_AGENT_AGENT_SLACK_MAP.get(text_or_empty(key))
+        if text_or_empty(value):
+            return text_or_empty(value)
+
+    return ""
+
+
+def live_agent_support_thread_text(callback, assignment, assigned_slack_user_id):
+    ticket_key = callback.get("ticket_key") or "live-agent request"
+    assignment_status = text_or_empty(assignment.get("assignment_status")) or "UNKNOWN"
+    parts = [
+        f"*{live_agent_issue_title(callback)}*",
+        f"*Ticket:* {ticket_key}",
+        f"*Status:* {assignment_status.title()}",
+        f"*Assigned agent:* {slack_user_mention(assigned_slack_user_id)}",
+    ]
+    if callback.get("ticket_url"):
+        parts.append(f"*JSM ticket:* {callback['ticket_url']}")
+    if callback.get("slack_user"):
+        parts.append(f"*Requester:* <@{callback['slack_user']}>")
+    if callback.get("user_request"):
+        parts.append(f"*User request:*\n{callback['user_request']}")
+    elif callback.get("conversation_summary"):
+        parts.append(f"*Summary:*\n{callback['conversation_summary']}")
+    parts.append("Reply in this thread to message the requester. Use Reply to customer if thread events are unavailable.")
+    return "\n\n".join(parts)
+
+
+def live_agent_support_thread_blocks(callback, assignment, assigned_slack_user_id):
+    ticket_key = callback.get("ticket_key") or ""
+    assignment_status = text_or_empty(assignment.get("assignment_status")) or "UNKNOWN"
+    request_text = first_text(callback.get("user_request"), callback.get("conversation_summary"))
+    context_items = [
+        f"*Ticket:*\n{ticket_key or '-'}",
+        f"*Status:*\n{assignment_status.title()}",
+        f"*Assigned:*\n{slack_user_mention(assigned_slack_user_id)}",
+    ]
+    if callback.get("slack_user"):
+        context_items.append(f"*Requester:*\n<@{callback['slack_user']}>")
+
+    elements = [
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Reply to customer"},
+            "style": "primary",
+            "action_id": ACTION_ID_LIVE_AGENT_REPLY,
+            "value": live_agent_support_action_value("reply", ticket_key),
+        },
+    ]
+    if callback.get("ticket_url"):
+        elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Open JSM ticket"},
+            "url": callback["ticket_url"],
+            "action_id": "ivy_live_agent_open_ticket",
+        })
+    elements.extend([
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Resolve"},
+            "action_id": ACTION_ID_LIVE_AGENT_RESOLVE,
+            "value": live_agent_support_action_value("resolve", ticket_key),
+        },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Cancel"},
+            "style": "danger",
+            "action_id": ACTION_ID_LIVE_AGENT_CANCEL,
+            "value": live_agent_support_action_value("cancel", ticket_key),
+        },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Reassign"},
+            "action_id": ACTION_ID_LIVE_AGENT_REASSIGN,
+            "value": live_agent_support_action_value("reassign", ticket_key),
+        },
+    ])
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": live_agent_issue_title(callback)},
+        },
+        {
+            "type": "section",
+            "fields": [{"type": "mrkdwn", "text": item} for item in context_items],
+        },
+    ]
+    if request_text:
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*User request:*\n{slack_mrkdwn(request_text, 1800)}"},
+        })
+    blocks.extend([
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "Reply in this thread to message the requester. Use Reply to customer if thread events are unavailable.",
+                }
+            ],
+        },
+        {
+            "type": "actions",
+            "block_id": "ivy_live_agent_support_actions",
+            "elements": elements,
+        },
+    ])
+    return blocks
+
+
+def mark_live_agent_support_thread(pointer_session_id, target_session_id, support_result):
+    if not (session_table and pointer_session_id and support_result.get("ts")):
+        return
+
+    now_iso = utc_now_iso()
+    values = {
+        ":support_channel": LIVE_AGENT_SUPPORT_CHANNEL_ID,
+        ":support_thread_ts": support_result["ts"],
+        ":assigned_slack_user": support_result.get("assigned_slack_user_id") or "",
+        ":bridge_status": "active",
+        ":now": now_iso,
+        ":ttl": ttl_epoch(),
+    }
+    expression = """
+        SET
+            support_channel = :support_channel,
+            support_thread_ts = :support_thread_ts,
+            assigned_agent_slack_user_id = :assigned_slack_user,
+            bridge_status = :bridge_status,
+            support_thread_created_at = :now,
+            updated_at = :now,
+            #ttl = :ttl
+    """
+    names = {"#ttl": "ttl"}
+
+    for session_id in [pointer_session_id, target_session_id]:
+        if not session_id:
+            continue
+        session_table.update_item(
+            Key={"session_id": session_id},
+            UpdateExpression=expression,
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+        )
+
+
+def post_live_agent_support_thread(callback, assignment):
+    if not live_agent_slack_console_enabled():
+        return {"attempted": False, "reason": "slack_console_disabled"}
+
+    assigned_slack_user_id = resolve_agent_slack_user_id(callback, assignment)
+    text = live_agent_support_thread_text(callback, assignment, assigned_slack_user_id)
+    blocks = live_agent_support_thread_blocks(callback, assignment, assigned_slack_user_id)
+    result = post_slack_message(LIVE_AGENT_SUPPORT_CHANNEL_ID, text, blocks=blocks)
+    return {
+        "attempted": True,
+        "ts": result.get("ts"),
+        "assigned_slack_user_id": assigned_slack_user_id,
+    }
 
 
 def agent_key_from_user(user):
@@ -1379,7 +1643,7 @@ def mark_slack_confirmation(pointer_session_id, status, result=None, error=None)
     )
 
 
-def post_slack_message(channel, text, thread_ts=""):
+def post_slack_message(channel, text, thread_ts="", blocks=None):
     if not (SLACK_BOT_TOKEN and channel):
         return {
             "attempted": False
@@ -1392,6 +1656,8 @@ def post_slack_message(channel, text, thread_ts=""):
 
     if thread_ts:
         message["thread_ts"] = thread_ts
+    if blocks:
+        message["blocks"] = blocks
 
     request = urllib.request.Request(
         "https://slack.com/api/chat.postMessage",
@@ -1532,6 +1798,22 @@ def is_echo_loop_comment(callback):
     )
 
 
+def is_internal_resolution_summary_comment(callback):
+    comment_body = text_or_empty(callback.get("comment_body"))
+    if comment_body.startswith(LIVE_AGENT_RESOLUTION_COMMENT_MARKER):
+        return True
+
+    raw = callback.get("raw_callback")
+    if isinstance(raw, dict):
+        comment = raw.get("comment") if isinstance(raw.get("comment"), dict) else {}
+        if comment.get("public") is False:
+            return True
+        if raw.get("public") is False:
+            return True
+
+    return False
+
+
 def live_agent_event_marker_id(callback):
     if callback.get("comment_body") or callback.get("comment_id"):
         marker_payload = {
@@ -1610,6 +1892,16 @@ def get_live_agent_ticket_pointer(ticket_key):
     return response.get("Item")
 
 
+def get_session_item(session_id):
+    session_id = text_or_empty(session_id)
+    if not (session_table and session_id):
+        return {}
+
+    response = session_table.get_item(Key={"session_id": session_id})
+    item = response.get("Item")
+    return item if isinstance(item, dict) else {}
+
+
 def live_agent_status_message(ticket_key, ticket_status, live_agent_status):
     status_text = display_status(ticket_status, live_agent_status)
 
@@ -1625,7 +1917,102 @@ def live_agent_status_message(ticket_key, ticket_status, live_agent_status):
     if live_agent_status == "resolved":
         return f"✅ Live agent request {ticket_key} is now Resolved."
 
+    if live_agent_status == "cancelled":
+        return f"🚫 Live agent request {ticket_key} is now Cancelled."
+
     return f"ℹ️ Live agent update for {ticket_key}: status changed to {status_text}."
+
+
+def live_agent_feedback_action_value(pointer, rating):
+    return json.dumps(
+        {
+            "action": "feedback_rating",
+            "session_id": text_or_empty(pointer.get("target_session_id")),
+            "rating": rating,
+            "summary_jira_ticket_key": text_or_empty(pointer.get("ticket_key")),
+            "summary_jira_ticket_url": text_or_empty(pointer.get("ticket_url")),
+            "comment_public": False,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def live_agent_customer_resolution_summary(pointer):
+    pointer = pointer if isinstance(pointer, dict) else {}
+    conversation = live_agent_resolution_conversation(pointer)
+    user_messages = [entry for entry in conversation if entry["sender"] == "User"]
+    agent_messages = [entry for entry in conversation if entry["sender"] == "Agent"]
+    original_request = compact_text(
+        first_text(pointer.get("user_request"), user_messages[0]["text"] if user_messages else ""),
+        350,
+    )
+    final_agent_reply = compact_text(agent_messages[-1]["text"], 350) if agent_messages else ""
+
+    if original_request and final_agent_reply:
+        return f"Summary: Support handled your request about \"{original_request}\" and marked it resolved after replying: \"{final_agent_reply}\""
+    if original_request:
+        return f"Summary: Support handled your request about \"{original_request}\" and marked it resolved."
+    if final_agent_reply:
+        return f"Summary: Support marked the request resolved after replying: \"{final_agent_reply}\""
+    return "Summary: Support marked this live-agent request resolved."
+
+
+def live_agent_resolution_feedback_blocks(pointer, ticket_key):
+    summary_text = live_agent_customer_resolution_summary(pointer)
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"✅ Live agent request *{ticket_key}* is now resolved.",
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": summary_text,
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "How was the support experience?",
+            },
+        },
+        {
+            "type": "actions",
+            "block_id": "ivy_live_agent_feedback",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": " ".join([":star:"] * rating),
+                        "emoji": True,
+                    },
+                    "action_id": f"{ACTION_ID_FEEDBACK_RATING}_{rating}",
+                    "value": live_agent_feedback_action_value(pointer, rating),
+                }
+                for rating in (1, 2, 3, 4, 5)
+            ],
+        },
+    ]
+
+
+def suppress_duplicate_terminal_status_slack(pointer, callback):
+    if not isinstance(pointer, dict) or not isinstance(callback, dict):
+        return False
+
+    live_agent_status = text_or_empty(callback.get("live_agent_status")).lower()
+    if live_agent_status not in {"resolved", "cancelled"}:
+        return False
+
+    existing_bridge_status = text_or_empty(pointer.get("bridge_status")).lower()
+    existing_live_agent_status = text_or_empty(pointer.get("live_agent_status")).lower()
+    return live_agent_status in {existing_bridge_status, existing_live_agent_status}
 
 
 def update_status_pointer(pointer_session_id, callback):
@@ -1633,24 +2020,31 @@ def update_status_pointer(pointer_session_id, callback):
         return
 
     now_iso = utc_now_iso()
+    live_agent_status = callback.get("live_agent_status") or ""
+    bridge_status_expression = "bridge_status = :bridge_status," if live_agent_status in {"resolved", "cancelled"} else ""
+    expression_values = {
+        ":ticket_status": callback.get("ticket_status") or "",
+        ":live_agent_status": live_agent_status,
+        ":now": now_iso,
+        ":ttl": ttl_epoch(),
+    }
+    if live_agent_status in {"resolved", "cancelled"}:
+        expression_values[":bridge_status"] = live_agent_status
+
     session_table.update_item(
         Key={"session_id": pointer_session_id},
-        UpdateExpression="""
+        UpdateExpression=f"""
             SET
                 ticket_status = :ticket_status,
                 live_agent_status = :live_agent_status,
+                {bridge_status_expression}
                 live_agent_status_changed_at = :now,
                 live_agent_updated_at = :now,
                 updated_at = :now,
                 #ttl = :ttl
         """,
         ExpressionAttributeNames={"#ttl": "ttl"},
-        ExpressionAttributeValues={
-            ":ticket_status": callback.get("ticket_status") or "",
-            ":live_agent_status": callback.get("live_agent_status") or "",
-            ":now": now_iso,
-            ":ttl": ttl_epoch(),
-        },
+        ExpressionAttributeValues=expression_values,
     )
 
 
@@ -1675,14 +2069,18 @@ def update_status_target_session(target_session_id, callback):
             #ttl = :ttl
     """
 
-    if live_agent_status == "resolved":
+    if live_agent_status in {"resolved", "cancelled"}:
         update_expression += """,
             conversation_status = :conversation_closed,
             support_options_status = :support_resolved,
-            live_agent_resolved_at = :now
+            live_agent_resolved_at = :now,
+            bridge_status = :bridge_resolved
         """
         expression_values[":conversation_closed"] = "closed"
-        expression_values[":support_resolved"] = "live_agent_resolved"
+        expression_values[":support_resolved"] = (
+            "live_agent_cancelled" if live_agent_status == "cancelled" else "live_agent_resolved"
+        )
+        expression_values[":bridge_resolved"] = live_agent_status
 
     session_table.update_item(
         Key={"session_id": target_session_id},
@@ -1779,6 +2177,15 @@ def handle_live_agent_public_comment_added(event):
             "ticket_key": callback["ticket_key"],
         }
 
+    if is_internal_resolution_summary_comment(callback):
+        return {
+            "ok": True,
+            "ignored": True,
+            "reason": "internal_resolution_summary_comment",
+            "ticket_key": callback["ticket_key"],
+            "comment_id": callback.get("comment_id"),
+        }
+
     marker = create_live_agent_event_marker(callback, pointer_session_id)
     if not marker.get("created"):
         return {
@@ -1862,6 +2269,330 @@ def assign_jira_ticket(ticket_key, agent_account_id):
     if "status" not in result:
         result["status"] = result.get("status_code")
     return result
+
+
+def compact_text(value, limit):
+    text = text_or_empty(value)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def jira_adf_doc(text):
+    lines = str(text or "").splitlines() or [""]
+    content = []
+    for line in lines:
+        paragraph = {"type": "paragraph"}
+        if line:
+            paragraph["content"] = [{"type": "text", "text": line}]
+        content.append(paragraph)
+    return {"version": 1, "type": "doc", "content": content}
+
+
+def add_jira_issue_comment(ticket_key, text):
+    ticket_key = text_or_empty(ticket_key)
+    if not ticket_key:
+        return {"ok": False, "error": "Missing ticket key", "error_code": "missing_ticket_key"}
+
+    result = oncall_user_helper.jira_request(
+        "POST",
+        f"/rest/api/3/issue/{urllib.parse.quote(ticket_key, safe='')}/comment",
+        body={"body": jira_adf_doc(text)},
+    )
+    if not result.get("ok"):
+        return {
+            **result,
+            "error": result.get("error") or result.get("reason") or "Jira comment creation failed",
+            "error_code": result.get("error_code") or result.get("reason") or "jira_comment_creation_failed",
+        }
+
+    body = result.get("body") or {}
+    return {
+        "ok": True,
+        "ticket_key": ticket_key,
+        "comment_id": body.get("id"),
+        "status_code": result.get("status_code"),
+    }
+
+
+def add_jsm_internal_request_comment(ticket_key, text):
+    ticket_key = text_or_empty(ticket_key)
+    if not ticket_key:
+        return {"ok": False, "error": "Missing ticket key", "error_code": "missing_ticket_key"}
+
+    result = oncall_user_helper.jira_request(
+        "POST",
+        f"/rest/servicedeskapi/request/{urllib.parse.quote(ticket_key, safe='')}/comment",
+        body={"body": text_or_empty(text), "public": False},
+    )
+    if not result.get("ok"):
+        return {
+            **result,
+            "error": result.get("error") or result.get("reason") or "JSM internal comment creation failed",
+            "error_code": result.get("error_code") or result.get("reason") or "jsm_internal_comment_creation_failed",
+        }
+
+    body = result.get("body") or {}
+    return {
+        "ok": True,
+        "ticket_key": ticket_key,
+        "comment_id": body.get("id"),
+        "public": body.get("public"),
+        "status_code": result.get("status_code"),
+    }
+
+
+def session_message_entries(session_item):
+    if not isinstance(session_item, dict):
+        return []
+    messages = session_item.get("session_messages") or []
+    return messages if isinstance(messages, list) else []
+
+
+def live_agent_resolution_conversation(pointer):
+    pointer = pointer if isinstance(pointer, dict) else {}
+    try:
+        target_item = get_session_item(pointer.get("target_session_id"))
+    except Exception as error:
+        log_json({
+            "level": "WARN",
+            "message": "live_agent_resolution_target_session_lookup_failed",
+            "ticket_key": pointer.get("ticket_key"),
+            "target_session_id": pointer.get("target_session_id"),
+            "error": str(error),
+        })
+        target_item = {}
+    entries = []
+    seen = set()
+
+    for item in [target_item, pointer]:
+        for message in session_message_entries(item):
+            if not isinstance(message, dict):
+                continue
+            sender = text_or_empty(message.get("sender"))
+            if sender.lower() not in {"user", "agent"}:
+                continue
+            text = compact_text(message.get("text"), 4000)
+            if not text:
+                continue
+            ts = first_text(message.get("ts"), message.get("recorded_at"))
+            key = (sender.lower(), text, ts)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append({
+                "sender": "User" if sender.lower() == "user" else "Agent",
+                "text": text,
+                "ts": ts,
+            })
+
+    if not any(entry["sender"] == "User" for entry in entries):
+        user_request = compact_text(pointer.get("user_request"), 4000)
+        if user_request:
+            entries.insert(0, {"sender": "User", "text": user_request, "ts": ""})
+
+    return entries[-LIVE_AGENT_RESOLUTION_TRANSCRIPT_LIMIT:]
+
+
+def live_agent_resolution_summary_comment_text(pointer, callback, resolved_at):
+    pointer = pointer if isinstance(pointer, dict) else {}
+    callback = callback if isinstance(callback, dict) else {}
+    ticket_key = first_text(callback.get("ticket_key"), pointer.get("ticket_key"))
+    conversation = live_agent_resolution_conversation(pointer)
+    user_messages = [entry for entry in conversation if entry["sender"] == "User"]
+    agent_messages = [entry for entry in conversation if entry["sender"] == "Agent"]
+    original_request = compact_text(
+        first_text(pointer.get("user_request"), user_messages[0]["text"] if user_messages else ""),
+        1000,
+    )
+    final_agent_reply = compact_text(agent_messages[-1]["text"], 1000) if agent_messages else ""
+
+    lines = [
+        LIVE_AGENT_RESOLUTION_COMMENT_MARKER,
+        "IVY live-agent session summary",
+        f"Ticket: {ticket_key or '-'}",
+        f"Resolved by: {callback.get('action_user') or '-'}",
+        f"Resolved at: {resolved_at or utc_now_iso()}",
+        "",
+        "Summary:",
+        f"- Original request: {original_request or '-'}",
+        f"- User messages: {len(user_messages)}",
+        f"- Agent messages: {len(agent_messages)}",
+        f"- Final agent reply: {final_agent_reply or '-'}",
+        "",
+        "Conversation transcript:",
+    ]
+
+    if conversation:
+        for entry in conversation:
+            prefix = f"[{entry['ts']}] " if entry.get("ts") else ""
+            lines.append(f"{prefix}{entry['sender']}: {entry['text']}")
+    else:
+        lines.append("- No user/agent transcript was stored for this session.")
+
+    return compact_text("\n".join(lines), LIVE_AGENT_RESOLUTION_COMMENT_TEXT_LIMIT)
+
+
+def add_live_agent_resolution_summary_comment(pointer, callback, resolved_at=None):
+    ticket_key = first_text(
+        (callback or {}).get("ticket_key") if isinstance(callback, dict) else "",
+        (pointer or {}).get("ticket_key") if isinstance(pointer, dict) else "",
+    )
+    comment_text = live_agent_resolution_summary_comment_text(pointer, callback, resolved_at or utc_now_iso())
+    result = add_jsm_internal_request_comment(ticket_key, comment_text)
+    return {
+        **result,
+        "ticket_key": ticket_key,
+        "comment_text_length": len(comment_text),
+    }
+
+
+def normalize_status_name(value):
+    return text_or_empty(value).lower()
+
+
+def jira_issue_status(ticket_key):
+    ticket_key = text_or_empty(ticket_key)
+    if not ticket_key:
+        return {"ok": False, "error": "Missing ticket key", "error_code": "missing_ticket_key"}
+
+    result = oncall_user_helper.jira_request(
+        "GET",
+        f"/rest/api/3/issue/{urllib.parse.quote(ticket_key, safe='')}",
+        query={"fields": "status"},
+    )
+    if not result.get("ok"):
+        return {
+            **result,
+            "error": result.get("error") or result.get("reason") or "Jira issue status lookup failed",
+            "error_code": result.get("error_code") or result.get("reason") or "jira_issue_status_lookup_failed",
+        }
+
+    status_name = (
+        ((result.get("body") or {}).get("fields") or {}).get("status") or {}
+    ).get("name")
+    if not status_name:
+        return {
+            "ok": False,
+            "error": "Jira issue status missing from response",
+            "error_code": "missing_jira_issue_status",
+            "status_code": result.get("status_code"),
+        }
+
+    return {"ok": True, "ticket_status": status_name, "status_code": result.get("status_code")}
+
+
+def jira_issue_transitions(ticket_key):
+    ticket_key = text_or_empty(ticket_key)
+    if not ticket_key:
+        return {"ok": False, "error": "Missing ticket key", "error_code": "missing_ticket_key"}
+
+    result = oncall_user_helper.jira_request(
+        "GET",
+        f"/rest/api/3/issue/{urllib.parse.quote(ticket_key, safe='')}/transitions",
+    )
+    if not result.get("ok"):
+        return {
+            **result,
+            "error": result.get("error") or result.get("reason") or "Jira transition lookup failed",
+            "error_code": result.get("error_code") or result.get("reason") or "jira_transition_lookup_failed",
+        }
+
+    return {
+        "ok": True,
+        "transitions": (result.get("body") or {}).get("transitions") or [],
+        "status_code": result.get("status_code"),
+    }
+
+
+def transition_jira_issue_to_status(ticket_key, target_status_names, reason=None):
+    ticket_key = text_or_empty(ticket_key)
+    target_status_names = [name for name in (target_status_names or []) if text_or_empty(name)]
+    if not ticket_key:
+        return {"ok": False, "error": "Missing ticket key", "error_code": "missing_ticket_key"}
+    if not target_status_names:
+        return {"ok": False, "error": "Missing target status", "error_code": "missing_target_status"}
+
+    normalized_targets = {normalize_status_name(name) for name in target_status_names}
+    status_result = jira_issue_status(ticket_key)
+    if not status_result.get("ok"):
+        return status_result
+
+    current_status = status_result.get("ticket_status")
+    if normalize_status_name(current_status) in normalized_targets:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "already_in_target_status",
+            "ticket_key": ticket_key,
+            "ticket_status": current_status,
+            "target_status": current_status,
+        }
+
+    transitions_result = jira_issue_transitions(ticket_key)
+    if not transitions_result.get("ok"):
+        return transitions_result
+
+    matching_transition = None
+    for transition in transitions_result.get("transitions") or []:
+        to_status = ((transition.get("to") or {}).get("name") or "").strip()
+        if normalize_status_name(to_status) in normalized_targets:
+            matching_transition = transition
+            break
+
+    if not matching_transition:
+        return {
+            "ok": False,
+            "error": f"No Jira transition available to {', '.join(target_status_names)}.",
+            "error_code": "no_matching_jira_transition",
+            "ticket_key": ticket_key,
+            "ticket_status": current_status,
+            "target_status_names": target_status_names,
+            "available_transitions": [
+                {
+                    "id": transition.get("id"),
+                    "name": transition.get("name"),
+                    "to": ((transition.get("to") or {}).get("name") or ""),
+                }
+                for transition in transitions_result.get("transitions") or []
+            ],
+        }
+
+    result = oncall_user_helper.jira_request(
+        "POST",
+        f"/rest/api/3/issue/{urllib.parse.quote(ticket_key, safe='')}/transitions",
+        body={"transition": {"id": matching_transition.get("id")}},
+    )
+    if not result.get("ok"):
+        return {
+            **result,
+            "error": result.get("error") or result.get("reason") or "Jira transition failed",
+            "error_code": result.get("error_code") or result.get("reason") or "jira_transition_failed",
+            "ticket_key": ticket_key,
+            "ticket_status": current_status,
+            "target_status": (matching_transition.get("to") or {}).get("name"),
+            "transition_id": matching_transition.get("id"),
+            "transition_name": matching_transition.get("name"),
+        }
+
+    return {
+        "ok": True,
+        "ticket_key": ticket_key,
+        "previous_status": current_status,
+        "target_status": (matching_transition.get("to") or {}).get("name"),
+        "transition_id": matching_transition.get("id"),
+        "transition_name": matching_transition.get("name"),
+        "reason": reason,
+        "status_code": result.get("status_code"),
+    }
+
+
+def support_control_transition_failed_message(ticket_key, target_status_names, result):
+    error_text = result.get("error") or result.get("error_code") or "unknown Jira transition error"
+    return (
+        f"Could not update {ticket_key} to {', '.join(target_status_names)} in Jira. "
+        f"No local Slack state was changed. Reason: {error_text}"
+    )
 
 
 def drain_live_agent_queue():
@@ -2307,7 +3038,13 @@ def handle_live_agent_status_changed(event):
 
     slack_result = {"attempted": False}
     slack_channel = text_or_empty(pointer.get("slack_channel"))
-    if slack_channel:
+    if suppress_duplicate_terminal_status_slack(pointer, callback):
+        slack_result = {
+            "attempted": False,
+            "deduped": True,
+            "reason": "terminal_status_already_notified",
+        }
+    elif slack_channel:
         message = live_agent_status_message(
             callback["ticket_key"],
             callback.get("ticket_status"),
@@ -2405,6 +3142,342 @@ def handle_live_agent_status_changed(event):
         "lock_release": lock_release,
         "queue_drain": queue_drain,
         "slack": slack_result,
+    }
+
+
+def is_live_agent_support_control(event):
+    if not isinstance(event, dict):
+        return False
+    return text_or_empty(event.get("event_type")).lower() in {
+        "live_agent_support_resolve",
+        "live_agent_support_cancel",
+        "live_agent_support_reassign",
+    }
+
+
+def support_control_callback(event):
+    ticket_key = normalize_ticket_key(event)
+    return {
+        "event_type": text_or_empty(event.get("event_type")).lower(),
+        "ticket_key": ticket_key,
+        "ticket_status": first_text(event.get("ticket_status"), event.get("status")),
+        "live_agent_status": first_text(event.get("live_agent_status")),
+        "transition_to": first_text(event.get("transition_to"), event.get("action")),
+        "updated_at": first_text(event.get("event_id"), event.get("action_ts"), event.get("message_ts"), event.get("updated_at")),
+        "action_user": first_text(event.get("action_user"), event.get("user")),
+        "support_channel": first_text(event.get("support_channel"), event.get("channel")),
+        "support_thread_ts": first_text(event.get("support_thread_ts"), event.get("thread_ts"), event.get("message_ts")),
+        "raw_callback": event,
+    }
+
+
+def post_support_control_message(pointer, text):
+    support_channel = text_or_empty(pointer.get("support_channel"))
+    support_thread_ts = text_or_empty(pointer.get("support_thread_ts"))
+    if not (support_channel and support_thread_ts):
+        return {"attempted": False, "reason": "missing_support_thread"}
+    return post_slack_message(support_channel, text, support_thread_ts)
+
+
+def requester_control_thread_ts(pointer):
+    channel = text_or_empty(pointer.get("slack_channel"))
+    if channel.startswith("D"):
+        return ""
+    return text_or_empty(pointer.get("slack_thread_ts"))
+
+
+def notify_requester_from_control(pointer, text, blocks=None):
+    channel = text_or_empty(pointer.get("slack_channel"))
+    if not channel:
+        return {"attempted": False, "reason": "missing_slack_channel"}
+    return post_slack_message(channel, text, requester_control_thread_ts(pointer), blocks=blocks)
+
+
+def support_control_release_capacity(ticket_key, reason):
+    if ENABLE_CUSTOM_CAPACITY_DISPATCHER:
+        return capacity_dispatcher.release_capacity_for_ticket(ticket_key, reason)
+    return chat_locks.release_chat_lock(ticket_key, close_reason=reason)
+
+
+def support_control_queue_drain(release_result):
+    if not release_result.get("released"):
+        return {"drained": False, "reason": release_result.get("reason") or "capacity_not_released"}
+    if ENABLE_CUSTOM_CAPACITY_DISPATCHER:
+        promotion = capacity_dispatcher.promote_oldest_queued_ticket(notify=notify_promoted_ticket)
+        return {"drained": bool(promotion.get("promoted")), **promotion}
+    return drain_live_agent_queue()
+
+
+def update_support_assignment_fields(pointer, assignment):
+    if not session_table:
+        return ""
+
+    assigned_slack_user_id = resolve_agent_slack_user_id(pointer, assignment)
+    now_iso = utc_now_iso()
+    values = {
+        ":assignment_status": assignment.get("assignment_status") or "",
+        ":capacity_reserved": assignment.get("capacity_reserved") is True,
+        ":capacity_released": False,
+        ":assigned_agent_id": assignment.get("assigned_agent_id") or "",
+        ":assigned_agent_name": assignment.get("assigned_agent_name") or "",
+        ":assigned_jira_account_id": assignment.get("assigned_jira_account_id") or "",
+        ":assigned_slack_user_id": assigned_slack_user_id,
+        ":bridge_status": "active",
+        ":now": now_iso,
+        ":ttl": ttl_epoch(),
+    }
+    expression = """
+        SET
+            assignment_status = :assignment_status,
+            capacity_reserved = :capacity_reserved,
+            capacity_released = :capacity_released,
+            assigned_agent_id = :assigned_agent_id,
+            assigned_agent_name = :assigned_agent_name,
+            assigned_jira_account_id = :assigned_jira_account_id,
+            assigned_agent_slack_user_id = :assigned_slack_user_id,
+            bridge_status = :bridge_status,
+            live_agent_reassigned_at = :now,
+            updated_at = :now,
+            #ttl = :ttl
+    """
+    for session_id in dict.fromkeys([
+        f"live_agent_ticket:{pointer.get('ticket_key')}",
+        pointer.get("target_session_id"),
+    ]):
+        if not session_id:
+            continue
+        session_table.update_item(
+            Key={"session_id": session_id},
+            UpdateExpression=expression,
+            ExpressionAttributeNames={"#ttl": "ttl"},
+            ExpressionAttributeValues=values,
+        )
+    return assigned_slack_user_id
+
+
+def handle_live_agent_support_resolve(event):
+    callback = support_control_callback(event)
+    if not callback.get("ticket_key"):
+        return {"ok": False, "error": "Missing ticket_key", "error_code": "missing_ticket_key"}
+
+    pointer_session_id = f"live_agent_ticket:{callback['ticket_key']}"
+    pointer = get_live_agent_ticket_pointer(callback["ticket_key"])
+    if not pointer:
+        return {"ok": False, "error": "Missing live agent ticket pointer", "error_code": "missing_live_agent_ticket_pointer"}
+
+    transition_result = transition_jira_issue_to_status(
+        callback["ticket_key"],
+        LIVE_AGENT_RESOLVE_STATUS_NAMES,
+        reason="slack_support_resolve",
+    )
+    if not transition_result.get("ok"):
+        support_result = post_support_control_message(
+            pointer,
+            support_control_transition_failed_message(
+                callback["ticket_key"],
+                LIVE_AGENT_RESOLVE_STATUS_NAMES,
+                transition_result,
+            ),
+        )
+        return {
+            "ok": False,
+            "ticket_key": callback["ticket_key"],
+            "error": transition_result.get("error"),
+            "error_code": transition_result.get("error_code") or "jira_resolve_transition_failed",
+            "jira_transition": transition_result,
+            "support_slack": support_result,
+        }
+
+    marker = create_live_agent_event_marker({
+        **callback,
+        "ticket_status": transition_result.get("target_status") or "Resolved",
+        "live_agent_status": "resolved",
+        "transition_to": "support_resolve",
+    }, pointer_session_id)
+    if not marker.get("created"):
+        return {"ok": True, "duplicate": True, "ticket_key": callback["ticket_key"]}
+
+    status_callback = {
+        **callback,
+        "ticket_status": transition_result.get("target_status") or "Resolved",
+        "live_agent_status": "resolved",
+    }
+    resolution_summary_comment = add_live_agent_resolution_summary_comment(
+        pointer,
+        status_callback,
+        utc_now_iso(),
+    )
+    if not resolution_summary_comment.get("ok"):
+        log_json({
+            "level": "ERROR",
+            "message": "live_agent_resolution_summary_comment_failed",
+            "ticket_key": callback["ticket_key"],
+            "error": resolution_summary_comment.get("error"),
+            "error_code": resolution_summary_comment.get("error_code"),
+        })
+
+    update_status_pointer(pointer_session_id, status_callback)
+    if pointer.get("target_session_id"):
+        update_status_target_session(pointer["target_session_id"], status_callback)
+
+    release_result = support_control_release_capacity(callback["ticket_key"], "slack_support_resolve")
+    queue_drain = support_control_queue_drain(release_result)
+    summary_suffix = (
+        " Summary added to Jira."
+        if resolution_summary_comment.get("ok")
+        else " Jira summary comment could not be added; check Lambda logs."
+    )
+    support_result = post_support_control_message(
+        pointer,
+        f"✅ <@{callback.get('action_user')}> resolved {callback['ticket_key']}.{summary_suffix}",
+    )
+    requester_result = notify_requester_from_control(
+        pointer,
+        f"✅ Live agent request {callback['ticket_key']} is now resolved.",
+        blocks=live_agent_resolution_feedback_blocks(pointer, callback["ticket_key"]),
+    )
+    return {
+        "ok": True,
+        "event_type": callback["event_type"],
+        "ticket_key": callback["ticket_key"],
+        "bridge_status": "resolved",
+        "lock_release": release_result,
+        "queue_drain": queue_drain,
+        "support_slack": support_result,
+        "requester_slack": requester_result,
+        "jira_transition": transition_result,
+        "resolution_summary_comment": resolution_summary_comment,
+    }
+
+
+def handle_live_agent_support_cancel(event):
+    callback = support_control_callback(event)
+    if not callback.get("ticket_key"):
+        return {"ok": False, "error": "Missing ticket_key", "error_code": "missing_ticket_key"}
+
+    pointer_session_id = f"live_agent_ticket:{callback['ticket_key']}"
+    pointer = get_live_agent_ticket_pointer(callback["ticket_key"])
+    if not pointer:
+        return {"ok": False, "error": "Missing live agent ticket pointer", "error_code": "missing_live_agent_ticket_pointer"}
+
+    transition_result = transition_jira_issue_to_status(
+        callback["ticket_key"],
+        LIVE_AGENT_CANCEL_STATUS_NAMES,
+        reason="slack_support_cancel",
+    )
+    if not transition_result.get("ok"):
+        support_result = post_support_control_message(
+            pointer,
+            support_control_transition_failed_message(
+                callback["ticket_key"],
+                LIVE_AGENT_CANCEL_STATUS_NAMES,
+                transition_result,
+            ),
+        )
+        return {
+            "ok": False,
+            "ticket_key": callback["ticket_key"],
+            "error": transition_result.get("error"),
+            "error_code": transition_result.get("error_code") or "jira_cancel_transition_failed",
+            "jira_transition": transition_result,
+            "support_slack": support_result,
+        }
+
+    marker = create_live_agent_event_marker({
+        **callback,
+        "ticket_status": transition_result.get("target_status") or "Cancelled",
+        "live_agent_status": "cancelled",
+        "transition_to": "support_cancel",
+    }, pointer_session_id)
+    if not marker.get("created"):
+        return {"ok": True, "duplicate": True, "ticket_key": callback["ticket_key"]}
+
+    status_callback = {
+        **callback,
+        "ticket_status": transition_result.get("target_status") or "Cancelled",
+        "live_agent_status": "cancelled",
+    }
+    update_status_pointer(pointer_session_id, status_callback)
+    if pointer.get("target_session_id"):
+        update_status_target_session(pointer["target_session_id"], status_callback)
+
+    release_result = support_control_release_capacity(callback["ticket_key"], "slack_support_cancel")
+    queue_drain = support_control_queue_drain(release_result)
+    support_result = post_support_control_message(
+        pointer,
+        f"🚫 <@{callback.get('action_user')}> cancelled {callback['ticket_key']}.",
+    )
+    requester_result = notify_requester_from_control(
+        pointer,
+        f"🚫 Live agent request {callback['ticket_key']} has been cancelled.",
+    )
+    return {
+        "ok": True,
+        "event_type": callback["event_type"],
+        "ticket_key": callback["ticket_key"],
+        "bridge_status": "cancelled",
+        "lock_release": release_result,
+        "queue_drain": queue_drain,
+        "support_slack": support_result,
+        "requester_slack": requester_result,
+        "jira_transition": transition_result,
+    }
+
+
+def handle_live_agent_support_reassign(event):
+    callback = support_control_callback(event)
+    if not callback.get("ticket_key"):
+        return {"ok": False, "error": "Missing ticket_key", "error_code": "missing_ticket_key"}
+
+    pointer_session_id = f"live_agent_ticket:{callback['ticket_key']}"
+    pointer = get_live_agent_ticket_pointer(callback["ticket_key"])
+    if not pointer:
+        return {"ok": False, "error": "Missing live agent ticket pointer", "error_code": "missing_live_agent_ticket_pointer"}
+
+    marker = create_live_agent_event_marker({
+        **callback,
+        "ticket_status": "Reassign",
+        "live_agent_status": "reassigning",
+        "transition_to": "support_reassign",
+    }, pointer_session_id)
+    if not marker.get("created"):
+        return {"ok": True, "duplicate": True, "ticket_key": callback["ticket_key"]}
+
+    release_result = support_control_release_capacity(callback["ticket_key"], "slack_support_reassign")
+    assign_callback = {
+        "event_type": "live_agent_support_reassign",
+        "ticket_key": pointer.get("ticket_key"),
+        "ticket_url": pointer.get("ticket_url") or "",
+        "ticket_status": pointer.get("ticket_status") or "",
+        "session_id": pointer.get("target_session_id") or "",
+        "slack_channel": pointer.get("slack_channel") or "",
+        "slack_thread_ts": pointer.get("slack_thread_ts") or "",
+        "slack_user": pointer.get("slack_user") or "",
+        "user_request": pointer.get("user_request") or "",
+        "raw_callback": event,
+    }
+    assignment = (
+        capacity_assignment_for_ticket(assign_callback, {})
+        if ENABLE_CUSTOM_CAPACITY_DISPATCHER
+        else legacy_assignment_for_ticket(assign_callback)
+    )
+    assigned_slack_user_id = update_support_assignment_fields(pointer, assignment)
+    if assignment.get("assignment_status") == "ASSIGNED":
+        message = (
+            f"🔁 <@{callback.get('action_user')}> reassigned {callback['ticket_key']} "
+            f"to {slack_user_mention(assigned_slack_user_id)}."
+        )
+    else:
+        message = f"🔁 <@{callback.get('action_user')}> requested reassignment. No agent is available, so {callback['ticket_key']} is queued."
+    support_result = post_support_control_message(pointer, message)
+    return {
+        "ok": True,
+        "event_type": callback["event_type"],
+        "ticket_key": callback["ticket_key"],
+        "release": release_result,
+        "assignment": assignment,
+        "assigned_agent_slack_user_id": assigned_slack_user_id,
+        "support_slack": support_result,
     }
 
 
@@ -2526,6 +3599,28 @@ def handle_jsm_callback(event):
         else:
             slack_result = {"attempted": False, "deduped": True}
 
+    support_thread_result = {"attempted": False}
+    try:
+        support_thread_result = post_live_agent_support_thread(callback, assignment)
+        mark_live_agent_support_thread(
+            pointer_session_id,
+            callback.get("session_id"),
+            support_thread_result,
+        )
+    except Exception as error:
+        support_thread_result = {
+            "attempted": True,
+            "ok": False,
+            "error": str(error),
+        }
+        log_json({
+            "level": "ERROR",
+            "message": "live_agent_support_thread_post_failed",
+            "session_id": callback["session_id"],
+            "ticket_key": callback["ticket_key"],
+            "error": str(error),
+        })
+
     return {
         "ok": True,
         "session_id": callback["session_id"],
@@ -2566,6 +3661,7 @@ def handle_jsm_callback(event):
         "reply": reply,
         "message": reply,
         "slack": slack_result,
+        "support_thread": support_thread_result,
     }
 
 
@@ -2847,6 +3943,25 @@ def lambda_handler(event, context):
     })
 
     try:
+        if is_live_agent_support_control(effective_event):
+            event_type = text_or_empty(effective_event.get("event_type")).lower()
+            if event_type == "live_agent_support_resolve":
+                result = handle_live_agent_support_resolve(effective_event)
+            elif event_type == "live_agent_support_cancel":
+                result = handle_live_agent_support_cancel(effective_event)
+            else:
+                result = handle_live_agent_support_reassign(effective_event)
+            status_code = 200 if result.get("ok") else 400
+            log_json({
+                "level": "INFO" if result.get("ok") else "ERROR",
+                "message": "live_agent_support_control_completed",
+                "ok": result.get("ok"),
+                "event_type": event_type,
+                "ticket_key": result.get("ticket_key"),
+                "error_code": result.get("error_code"),
+            })
+            return api_response(status_code, result) if api_gateway_event else result
+
         if is_jsm_callback(effective_event):
             if api_gateway_event and not validate_callback_secret(event):
                 result = {

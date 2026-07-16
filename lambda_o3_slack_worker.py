@@ -5,6 +5,7 @@ import time
 import hashlib
 import base64
 import boto3
+import urllib.error
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -22,6 +23,7 @@ scheduler = boto3.client("scheduler", region_name=AWS_REGION)
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 bedrock_runtime = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 bedrock_agent_runtime = boto3.client("bedrock-agent-runtime", region_name=AWS_REGION)
+secretsmanager = boto3.client("secretsmanager", region_name=AWS_REGION)
 
 BOT_ID = os.environ["BOT_ID"]
 BOT_ALIAS_ID = os.environ["BOT_ALIAS_ID"]
@@ -53,7 +55,11 @@ CLAUDE_FAILURE_REPLY = os.environ.get(
 )
 CREATE_JIRA_TICKET_FUNCTION = os.environ.get("CREATE_JIRA_TICKET_FUNCTION")
 ENABLE_CREATE_JIRA_TICKET = os.environ.get("ENABLE_CREATE_JIRA_TICKET", "true").lower() == "true"
-ENABLE_CLOSE_SUMMARY = os.environ.get("ENABLE_CLOSE_SUMMARY", "true").lower() == "true"
+ENABLE_CLOSE_SUMMARY = (
+    os.environ.get("ENABLE_CLOSE_SUMMARY")
+    or os.environ.get("ENABLE_SUMMARIZATION")
+    or "true"
+).lower() == "true"
 ENABLE_ROVO_ENRICHMENT = os.environ.get("ENABLE_ROVO_ENRICHMENT", "false").lower() == "true"
 ROVO_ENRICHMENT_FUNCTION = os.environ.get("ROVO_ENRICHMENT_FUNCTION")
 LIVE_AGENT_FUNCTION = os.environ.get("LIVE_AGENT_FUNCTION")
@@ -87,6 +93,8 @@ SCREENSHOT_VECTOR_K = int(os.environ.get("SCREENSHOT_VECTOR_K", "1"))
 SCREENSHOT_EMBEDDING_MAX_BYTES = int(os.environ.get("SCREENSHOT_EMBEDDING_MAX_BYTES", "5000000"))
 BEDROCK_KNOWLEDGE_BASE_ID = os.environ.get("BEDROCK_KNOWLEDGE_BASE_ID")
 BEDROCK_KB_MODEL_ARN = os.environ.get("BEDROCK_KB_MODEL_ARN")
+ENABLE_BEDROCK_KB_ASSIST = os.environ.get("ENABLE_BEDROCK_KB_ASSIST", "true").lower() == "true"
+BEDROCK_KB_INTENT_NAME = os.environ.get("BEDROCK_KB_INTENT_NAME", "KBAtlassianAssist")
 BEDROCK_KB_NUMBER_OF_RESULTS = int(os.environ.get("BEDROCK_KB_NUMBER_OF_RESULTS", "5"))
 BEDROCK_KB_NO_ANSWER_MARKERS = [
     marker.strip().lower()
@@ -170,6 +178,32 @@ ATLASSIAN_DOMAIN = os.environ.get("ATLASSIAN_DOMAIN", "").rstrip("/")
 ATLASSIAN_EMAIL = os.environ.get("ATLASSIAN_EMAIL", "")
 ATLASSIAN_API_TOKEN = os.environ.get("ATLASSIAN_API_TOKEN", "")
 JSM_COMMENT_PUBLIC = os.environ.get("JSM_COMMENT_PUBLIC", "true").lower() == "true"
+LIVE_AGENT_SUPPORT_MODE = os.environ.get("LIVE_AGENT_SUPPORT_MODE", "").strip().lower()
+LIVE_AGENT_SUPPORT_CHANNEL_ID = os.environ.get("LIVE_AGENT_SUPPORT_CHANNEL_ID", "").strip()
+LIVE_AGENT_SYNC_AGENT_REPLIES_TO_JSM = (
+    os.environ.get("LIVE_AGENT_SYNC_AGENT_REPLIES_TO_JSM", "true").lower() == "true"
+)
+LIVE_AGENT_START_STATUS_NAMES = [
+    name.strip()
+    for name in os.environ.get("LIVE_AGENT_START_STATUS_NAMES", "In Progress").split(",")
+    if name.strip()
+]
+LIVE_AGENT_BLOCK_REPLY_ON_START_TRANSITION_FAILURE = (
+    os.environ.get("LIVE_AGENT_BLOCK_REPLY_ON_START_TRANSITION_FAILURE", "true").lower() == "true"
+)
+MS_GRAPH_FEEDBACK_SYNC_ENABLED = os.environ.get("MS_GRAPH_FEEDBACK_SYNC_ENABLED", "false").lower() == "true"
+MS_GRAPH_TENANT_ID = os.environ.get("MS_GRAPH_TENANT_ID", "").strip()
+MS_GRAPH_CLIENT_ID = os.environ.get("MS_GRAPH_CLIENT_ID", "").strip()
+MS_GRAPH_CLIENT_SECRET_ID = os.environ.get("MS_GRAPH_CLIENT_SECRET_ID", "").strip()
+MS_GRAPH_SHAREPOINT_SITE_ID = os.environ.get("MS_GRAPH_SHAREPOINT_SITE_ID", "").strip()
+MS_GRAPH_SHAREPOINT_FEEDBACK_LIST_ID = os.environ.get("MS_GRAPH_SHAREPOINT_FEEDBACK_LIST_ID", "").strip()
+MS_GRAPH_TIMEOUT_SECONDS = int(os.environ.get("MS_GRAPH_TIMEOUT_SECONDS", "10"))
+MS_GRAPH_MAX_ATTEMPTS = max(1, int(os.environ.get("MS_GRAPH_MAX_ATTEMPTS", "2")))
+MS_GRAPH_RETRY_DELAY_SECONDS = float(os.environ.get("MS_GRAPH_RETRY_DELAY_SECONDS", "1"))
+MS_GRAPH_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+_ms_graph_client_secret_cache = None
+_ms_graph_token_cache = None
 
 NEXT_ACTION_CREATE_JIRA_TICKET = "O3_CreateJiraTicket"
 NEXT_ACTION_CLAUDE_ASSISTANCE = "O3_ClaudeFurtherAssistance"
@@ -182,6 +216,10 @@ ACTION_ID_ASSISTANCE_SOLVED = "ivy_assistance_solved"
 ACTION_ID_ASSISTANCE_NEED_MORE_HELP = "ivy_assistance_need_more_help"
 ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET = "ivy_assistance_create_jira_ticket"
 ACTION_ID_LIVE_AGENT_SUPPORT = "ivy_live_agent_support"
+ACTION_ID_LIVE_AGENT_REPLY = "ivy_live_agent_reply"
+ACTION_ID_LIVE_AGENT_RESOLVE = "ivy_live_agent_resolve"
+ACTION_ID_LIVE_AGENT_CANCEL = "ivy_live_agent_cancel"
+ACTION_ID_LIVE_AGENT_REASSIGN = "ivy_live_agent_reassign"
 ACTION_ID_CREATE_JIRA_TICKET = "ivy_create_jira_ticket"
 ACTION_ID_CLOSE_AND_SUMMARIZE = "ivy_close_and_summarize"
 ACTION_ID_FEEDBACK_RATING = "ivy_feedback_rating"
@@ -321,6 +359,109 @@ def send_slack_message(channel, text, blocks=None, thread_ts=None):
     return result
 
 
+def update_slack_message(channel, ts, text, blocks=None):
+    payload = {
+        "channel": channel,
+        "ts": ts,
+        "text": text,
+    }
+    if blocks:
+        payload["blocks"] = blocks
+    else:
+        payload["blocks"] = []
+
+    return slack_api("chat.update", payload=payload)
+
+
+def send_slack_ephemeral(channel, user, text, thread_ts=None):
+    if not channel or not user:
+        return None
+
+    payload = {
+        "channel": channel,
+        "user": user,
+        "text": text,
+    }
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+
+    return slack_api("chat.postEphemeral", payload=payload)
+
+
+def post_processing_message(channel, text, thread_ts=None):
+    if not channel:
+        return None
+
+    try:
+        return send_slack_message(channel, text, thread_ts=thread_ts)
+    except Exception as error:
+        log_json({
+            "level": "WARN",
+            "message": "processing_message_post_failed",
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "error": str(error),
+        })
+        return None
+
+
+def update_processing_message(processing_message, text, blocks=None):
+    if not processing_message:
+        return None
+
+    channel = processing_message.get("channel")
+    ts = processing_message.get("ts")
+    if not channel or not ts:
+        return None
+
+    try:
+        return update_slack_message(channel, ts, text, blocks)
+    except Exception as error:
+        log_json({
+            "level": "WARN",
+            "message": "processing_message_update_failed",
+            "channel": channel,
+            "ts": ts,
+            "error": str(error),
+        })
+        return None
+
+
+def maybe_send_ephemeral(channel, user, text, thread_ts=None):
+    try:
+        return send_slack_ephemeral(channel, user, text, thread_ts)
+    except Exception as error:
+        log_json({
+            "level": "WARN",
+            "message": "ephemeral_processing_message_failed",
+            "channel": channel,
+            "user": user,
+            "thread_ts": thread_ts,
+            "error": str(error),
+        })
+        return None
+
+
+def interactive_processing_text(action_id):
+    if action_id in {ACTION_ID_CREATE_JIRA_TICKET, ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET}:
+        return "Creating Jira ticket..."
+    if action_id == ACTION_ID_LIVE_AGENT_SUPPORT:
+        return "Connecting you to a live agent..."
+    if action_id == ACTION_ID_CLOSE_AND_SUMMARIZE:
+        return "Closing and summarizing this session..."
+    return None
+
+
+def support_control_processing_text(action_id):
+    if action_id == ACTION_ID_LIVE_AGENT_RESOLVE:
+        return "Resolving..."
+    if action_id == ACTION_ID_LIVE_AGENT_CANCEL:
+        return "Cancelling..."
+    if action_id == ACTION_ID_LIVE_AGENT_REASSIGN:
+        return "Reassigning..."
+    return None
+
+
 def atlassian_auth_header():
     if not (ATLASSIAN_EMAIL and ATLASSIAN_API_TOKEN):
         raise ValueError("Missing ATLASSIAN_EMAIL or ATLASSIAN_API_TOKEN")
@@ -406,6 +547,416 @@ def add_jira_issue_comment(issue_key, body):
             return {"message": response_text}
 
     return {"ok": True}
+
+
+def get_ms_graph_client_secret():
+    global _ms_graph_client_secret_cache
+
+    if _ms_graph_client_secret_cache:
+        return _ms_graph_client_secret_cache
+
+    if not MS_GRAPH_CLIENT_SECRET_ID:
+        raise ValueError("Missing MS_GRAPH_CLIENT_SECRET_ID")
+
+    response = secretsmanager.get_secret_value(SecretId=MS_GRAPH_CLIENT_SECRET_ID)
+    secret_string = response.get("SecretString") or ""
+    if not secret_string:
+        raise ValueError("Microsoft Graph client secret must be stored as SecretString")
+
+    try:
+        secret_json = json.loads(secret_string)
+        secret_value = (
+            secret_json.get("client_secret")
+            or secret_json.get("clientSecret")
+            or secret_json.get("secret")
+            or secret_json.get("value")
+        ) if isinstance(secret_json, dict) else None
+    except ValueError:
+        secret_value = secret_string
+
+    secret_value = text_or_empty(secret_value)
+    if not secret_value:
+        raise ValueError("Microsoft Graph client secret is empty")
+
+    _ms_graph_client_secret_cache = secret_value
+    return secret_value
+
+
+def ms_graph_config_ready():
+    return all([
+        MS_GRAPH_TENANT_ID,
+        MS_GRAPH_CLIENT_ID,
+        MS_GRAPH_CLIENT_SECRET_ID,
+        MS_GRAPH_SHAREPOINT_SITE_ID,
+        MS_GRAPH_SHAREPOINT_FEEDBACK_LIST_ID,
+    ])
+
+
+def ms_graph_http_json(url, method="GET", headers=None, body=None):
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    request_headers = {"Accept": "application/json", **(headers or {})}
+    if data is not None:
+        request_headers["Content-Type"] = "application/json"
+
+    last_error = None
+    for attempt in range(1, MS_GRAPH_MAX_ATTEMPTS + 1):
+        request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=MS_GRAPH_TIMEOUT_SECONDS) as response:
+                response_text = response.read().decode("utf-8").strip()
+                return {
+                    "ok": 200 <= response.status < 300,
+                    "status_code": response.status,
+                    "body": json.loads(response_text) if response_text else None,
+                    "attempts": attempt,
+                }
+        except urllib.error.HTTPError as error:
+            retryable = error.code in MS_GRAPH_RETRYABLE_STATUS_CODES
+            try:
+                error_text = error.read().decode("utf-8").strip()
+            except Exception:
+                error_text = ""
+            last_error = {
+                "ok": False,
+                "status_code": error.code,
+                "error": error_text or error.reason,
+                "error_code": "ms_graph_http_error",
+                "retryable": retryable,
+                "attempts": attempt,
+            }
+            if not retryable or attempt >= MS_GRAPH_MAX_ATTEMPTS:
+                return last_error
+            retry_after = error.headers.get("Retry-After") if error.headers else None
+            try:
+                delay = float(retry_after) if retry_after is not None else MS_GRAPH_RETRY_DELAY_SECONDS
+            except ValueError:
+                delay = MS_GRAPH_RETRY_DELAY_SECONDS
+            time.sleep(max(0, delay))
+        except (urllib.error.URLError, TimeoutError) as error:
+            return {
+                "ok": False,
+                "status_code": None,
+                "error": str(error),
+                "error_code": "ms_graph_network_error",
+                "retryable": False,
+                "attempts": attempt,
+            }
+
+    return last_error or {"ok": False, "error": "Microsoft Graph request failed", "error_code": "ms_graph_request_failed"}
+
+
+def ms_graph_access_token():
+    global _ms_graph_token_cache
+
+    now = int(time.time())
+    if _ms_graph_token_cache and _ms_graph_token_cache.get("expires_at", 0) > now + 60:
+        return _ms_graph_token_cache["access_token"]
+
+    if not (MS_GRAPH_TENANT_ID and MS_GRAPH_CLIENT_ID):
+        raise ValueError("Missing Microsoft Graph tenant/client configuration")
+
+    token_url = f"https://login.microsoftonline.com/{urllib.parse.quote(MS_GRAPH_TENANT_ID, safe='')}/oauth2/v2.0/token"
+    form = urllib.parse.urlencode({
+        "client_id": MS_GRAPH_CLIENT_ID,
+        "client_secret": get_ms_graph_client_secret(),
+        "grant_type": "client_credentials",
+        "scope": "https://graph.microsoft.com/.default",
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        token_url,
+        data=form,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=MS_GRAPH_TIMEOUT_SECONDS) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        try:
+            error_text = error.read().decode("utf-8").strip()
+        except Exception:
+            error_text = ""
+        raise RuntimeError(f"Microsoft Graph token request failed: HTTP {error.code} {error_text}") from error
+
+    access_token = text_or_empty(body.get("access_token"))
+    if not access_token:
+        raise ValueError("Microsoft Graph token response did not include access_token")
+
+    _ms_graph_token_cache = {
+        "access_token": access_token,
+        "expires_at": now + int(body.get("expires_in") or 3600),
+    }
+    return access_token
+
+
+def feedback_source(metadata):
+    source = text_or_empty((metadata or {}).get("feedback_source") or (metadata or {}).get("source"))
+    if source:
+        return source
+    return "live_agent" if (metadata or {}).get("comment_public") is False else "summary"
+
+
+def sharepoint_feedback_fields(session_id, rating, feedback_text, user, channel, ticket_key, now_iso, metadata, comment_result):
+    return {
+        "Title": f"IVY feedback - {ticket_key or session_id or 'unknown'}",
+        "SubmittedAt": now_iso,
+        "Rating": int(rating),
+        "RatingStars": feedback_stars(rating),
+        "FeedbackText": feedback_text or "",
+        "SlackUser": user or "",
+        "SlackChannel": channel or "",
+        "SessionId": session_id or "",
+        "JiraTicketKey": ticket_key or "",
+        "CommentPublic": feedback_comment_is_public(metadata),
+        "FeedbackSource": feedback_source(metadata),
+        "JiraCommentStatus": "posted" if (comment_result or {}).get("ok") else "not_posted",
+        "DynamoStatus": "stored",
+    }
+
+
+def create_sharepoint_feedback_item(fields):
+    if not MS_GRAPH_FEEDBACK_SYNC_ENABLED:
+        return {"ok": False, "skipped": True, "status": "skipped", "reason": "graph_sync_disabled"}
+    if not ms_graph_config_ready():
+        return {"ok": False, "skipped": True, "status": "skipped", "reason": "graph_config_incomplete"}
+
+    token = ms_graph_access_token()
+    safe_site_id = urllib.parse.quote(MS_GRAPH_SHAREPOINT_SITE_ID, safe="")
+    safe_list_id = urllib.parse.quote(MS_GRAPH_SHAREPOINT_FEEDBACK_LIST_ID, safe="")
+    result = ms_graph_http_json(
+        f"https://graph.microsoft.com/v1.0/sites/{safe_site_id}/lists/{safe_list_id}/items",
+        method="POST",
+        headers={"Authorization": f"Bearer {token}"},
+        body={"fields": fields},
+    )
+    if not result.get("ok"):
+        return {
+            **result,
+            "status": "failed",
+            "error_code": result.get("error_code") or "sharepoint_feedback_write_failed",
+        }
+
+    body = result.get("body") or {}
+    return {
+        "ok": True,
+        "status": "posted",
+        "item_id": body.get("id"),
+        "web_url": body.get("webUrl"),
+        "status_code": result.get("status_code"),
+        "attempts": result.get("attempts"),
+    }
+
+
+def sync_feedback_to_sharepoint(session_id, rating, feedback_text, user, channel, ticket_key, now_iso, metadata, comment_result):
+    fields = sharepoint_feedback_fields(
+        session_id,
+        rating,
+        feedback_text,
+        user,
+        channel,
+        ticket_key,
+        now_iso,
+        metadata,
+        comment_result,
+    )
+    try:
+        result = create_sharepoint_feedback_item(fields)
+        return {**result, "fields": fields}
+    except Exception as error:
+        return {
+            "ok": False,
+            "status": "failed",
+            "error": str(error),
+            "error_code": "sharepoint_feedback_sync_exception",
+            "fields": fields,
+        }
+
+
+def jira_api_request(method, path, payload=None):
+    if not ATLASSIAN_DOMAIN:
+        return {"ok": False, "error": "Missing ATLASSIAN_DOMAIN", "error_code": "jira_configuration_error"}
+
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    try:
+        headers = {
+            "Authorization": atlassian_auth_header(),
+            "Accept": "application/json",
+        }
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+
+        request = urllib.request.Request(
+            f"{ATLASSIAN_DOMAIN}{path}",
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response_text = response.read().decode("utf-8").strip()
+            return {
+                "ok": 200 <= response.status < 300,
+                "status_code": response.status,
+                "body": json.loads(response_text) if response_text else {},
+            }
+    except urllib.error.HTTPError as error:
+        response_text = error.read().decode("utf-8", errors="replace")[:2000]
+        return {
+            "ok": False,
+            "status_code": error.code,
+            "error": response_text or str(error),
+            "error_code": "jira_http_error",
+        }
+    except (urllib.error.URLError, TimeoutError) as error:
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": str(error),
+            "error_code": "jira_network_error",
+        }
+    except Exception as error:
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": str(error),
+            "error_code": "jira_configuration_error",
+        }
+
+
+def normalize_status_name(value):
+    return text_or_empty(value).lower()
+
+
+def jira_issue_status(ticket_key):
+    safe_ticket_key = urllib.parse.quote(str(ticket_key), safe="")
+    result = jira_api_request("GET", f"/rest/api/3/issue/{safe_ticket_key}?fields=status")
+    if not result.get("ok"):
+        return {
+            **result,
+            "error_code": result.get("error_code") or "jira_issue_status_lookup_failed",
+        }
+
+    status_name = (
+        ((result.get("body") or {}).get("fields") or {}).get("status") or {}
+    ).get("name")
+    if not status_name:
+        return {
+            "ok": False,
+            "error": "Jira issue status missing from response",
+            "error_code": "missing_jira_issue_status",
+            "status_code": result.get("status_code"),
+        }
+
+    return {"ok": True, "ticket_status": status_name, "status_code": result.get("status_code")}
+
+
+def jira_issue_transitions(ticket_key):
+    safe_ticket_key = urllib.parse.quote(str(ticket_key), safe="")
+    result = jira_api_request("GET", f"/rest/api/3/issue/{safe_ticket_key}/transitions")
+    if not result.get("ok"):
+        return {
+            **result,
+            "error_code": result.get("error_code") or "jira_transition_lookup_failed",
+        }
+    return {
+        "ok": True,
+        "transitions": (result.get("body") or {}).get("transitions") or [],
+        "status_code": result.get("status_code"),
+    }
+
+
+def transition_jira_issue_to_status(ticket_key, target_status_names, reason=None):
+    ticket_key = text_or_empty(ticket_key)
+    target_status_names = [name for name in (target_status_names or []) if text_or_empty(name)]
+    if not ticket_key:
+        return {"ok": False, "error": "Missing ticket key", "error_code": "missing_ticket_key"}
+    if not target_status_names:
+        return {"ok": False, "error": "Missing target status", "error_code": "missing_target_status"}
+
+    normalized_targets = {normalize_status_name(name) for name in target_status_names}
+    status_result = jira_issue_status(ticket_key)
+    if not status_result.get("ok"):
+        return status_result
+
+    current_status = status_result.get("ticket_status")
+    if normalize_status_name(current_status) in normalized_targets:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "already_in_target_status",
+            "ticket_key": ticket_key,
+            "ticket_status": current_status,
+            "target_status": current_status,
+        }
+
+    transitions_result = jira_issue_transitions(ticket_key)
+    if not transitions_result.get("ok"):
+        return transitions_result
+
+    matching_transition = None
+    for transition in transitions_result.get("transitions") or []:
+        to_status = ((transition.get("to") or {}).get("name") or "").strip()
+        if normalize_status_name(to_status) in normalized_targets:
+            matching_transition = transition
+            break
+
+    if not matching_transition:
+        return {
+            "ok": False,
+            "error": f"No Jira transition available to {', '.join(target_status_names)}.",
+            "error_code": "no_matching_jira_transition",
+            "ticket_key": ticket_key,
+            "ticket_status": current_status,
+            "target_status_names": target_status_names,
+            "available_transitions": [
+                {
+                    "id": transition.get("id"),
+                    "name": transition.get("name"),
+                    "to": ((transition.get("to") or {}).get("name") or ""),
+                }
+                for transition in transitions_result.get("transitions") or []
+            ],
+        }
+
+    safe_ticket_key = urllib.parse.quote(ticket_key, safe="")
+    payload = {"transition": {"id": matching_transition.get("id")}}
+    result = jira_api_request("POST", f"/rest/api/3/issue/{safe_ticket_key}/transitions", payload)
+    if not result.get("ok"):
+        return {
+            **result,
+            "error_code": result.get("error_code") or "jira_transition_failed",
+            "ticket_key": ticket_key,
+            "ticket_status": current_status,
+            "target_status": (matching_transition.get("to") or {}).get("name"),
+            "transition_id": matching_transition.get("id"),
+            "transition_name": matching_transition.get("name"),
+        }
+
+    return {
+        "ok": True,
+        "ticket_key": ticket_key,
+        "previous_status": current_status,
+        "target_status": (matching_transition.get("to") or {}).get("name"),
+        "transition_id": matching_transition.get("id"),
+        "transition_name": matching_transition.get("name"),
+        "reason": reason,
+        "status_code": result.get("status_code"),
+    }
+
+
+def live_agent_start_transition_failure_text(ticket_key, transition_result):
+    error_text = (
+        transition_result.get("error")
+        or transition_result.get("error_code")
+        or "unknown Jira transition error"
+    )
+    return (
+        f"Could not send this reply to the requester because Jira did not transition "
+        f"{ticket_key or 'the ticket'} to {', '.join(LIVE_AGENT_START_STATUS_NAMES)}. "
+        f"Reason: {error_text}"
+    )
 
 
 def slack_api(method, params=None, payload=None, http_method=None):
@@ -1156,6 +1707,14 @@ def invoke_claude_fallback(payload):
 
 
 def invoke_create_jira_ticket(payload):
+    if not ENABLE_CREATE_JIRA_TICKET:
+        return {
+            "ok": False,
+            "skipped": True,
+            "error": "Jira ticket creation is disabled.",
+            "error_code": "jira_ticket_creation_disabled"
+        }
+
     if not CREATE_JIRA_TICKET_FUNCTION:
         return {
             "ok": False,
@@ -3946,6 +4505,15 @@ def handle_interactive_action(session_item, body, session_id):
     result = base_interactive_result(session_item)
 
     if action_id == ACTION_ID_CLOSE_AND_SUMMARIZE:
+        if not ENABLE_CLOSE_SUMMARY:
+            result.update({
+                "lex_state": "Ignored",
+                "response_source": "manual_close_summary_disabled",
+                "next_action": None,
+                "reply": "Conversation summarization is currently disabled.",
+            })
+            return result
+
         if session_item.get("conversation_status") == "summarizing" or session_item.get("summary_status") == "started":
             result.update({
                 "response_source": "manual_close_summary_duplicate",
@@ -4018,6 +4586,16 @@ def handle_interactive_action(session_item, body, session_id):
         return result
 
     if action_id == ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET:
+        if not ENABLE_CREATE_JIRA_TICKET:
+            result.update({
+                "lex_state": "Ignored",
+                "response_source": "jira_disabled",
+                "next_action": None,
+                "jira_status": None,
+                "reply": "Jira ticket creation is currently disabled."
+            })
+            return result
+
         if not (
             has_pending_assistance_confirmation(session_item)
             or has_pending_assistance_details(session_item)
@@ -4102,6 +4680,16 @@ def handle_interactive_action(session_item, body, session_id):
         return result
 
     if action_id == ACTION_ID_CREATE_JIRA_TICKET:
+        if not ENABLE_CREATE_JIRA_TICKET:
+            result.update({
+                "lex_state": "Ignored",
+                "response_source": "jira_disabled",
+                "next_action": None,
+                "jira_status": None,
+                "reply": "Jira ticket creation is currently disabled."
+            })
+            return result
+
         return handle_support_create_jira(session_item, body, session_id, now_iso)
 
     result.update({
@@ -4183,6 +4771,16 @@ def handle_jira_confirmation(session_item, body, session_id, text, raw_text):
         return {
             **base_result,
             "reply": JIRA_UNCLEAR_CONFIRMATION_REPLY,
+        }
+
+    if not ENABLE_CREATE_JIRA_TICKET:
+        return {
+            **base_result,
+            "lex_state": "Ignored",
+            "response_source": "jira_disabled",
+            "next_action": None,
+            "jira_status": None,
+            "reply": "Jira ticket creation is currently disabled.",
         }
 
     if not acquire_jira_creation_lock(
@@ -4435,7 +5033,309 @@ def update_live_agent_user_reply_pointer(ticket_key, text, now_iso):
     )
 
 
-def handle_live_agent_user_reply(session_id, session_item, body, channel, user, text, thread_ts, ts):
+def support_bridge_enabled():
+    return LIVE_AGENT_SUPPORT_MODE == "slack_console" and bool(LIVE_AGENT_SUPPORT_CHANNEL_ID)
+
+
+def requester_thread_ts(pointer):
+    channel = text_or_empty(pointer.get("slack_channel"))
+    if channel.startswith("D"):
+        return None
+    return text_or_empty(pointer.get("slack_thread_ts")) or None
+
+
+def find_live_agent_support_bridge(channel, thread_ts):
+    if not (support_bridge_enabled() and channel and thread_ts):
+        return None
+
+    filter_expression = (
+        Attr("pointer_type").eq("live_agent_ticket")
+        & Attr("support_channel").eq(channel)
+        & Attr("support_thread_ts").eq(thread_ts)
+        & Attr("bridge_status").eq("active")
+    )
+    scan_kwargs = {
+        "FilterExpression": filter_expression,
+        "Limit": 100,
+    }
+
+    while True:
+        response = sessions_table.scan(**scan_kwargs)
+        items = response.get("Items") or []
+        if items:
+            return items[0]
+
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            return None
+
+        scan_kwargs["ExclusiveStartKey"] = last_key
+
+
+def find_live_agent_support_bridge_for_event(channel, *ts_values):
+    for ts_value in dict.fromkeys(text_or_empty(ts_value) for ts_value in ts_values):
+        pointer = find_live_agent_support_bridge(channel, ts_value)
+        if pointer:
+            return pointer
+    return None
+
+
+def is_live_agent_support_channel_message(channel, is_interactive_action=False):
+    return (
+        support_bridge_enabled()
+        and channel == LIVE_AGENT_SUPPORT_CHANNEL_ID
+        and not is_interactive_action
+    )
+
+
+def is_live_agent_support_control_action(action_id):
+    return action_id in {ACTION_ID_LIVE_AGENT_RESOLVE, ACTION_ID_LIVE_AGENT_CANCEL, ACTION_ID_LIVE_AGENT_REASSIGN}
+
+
+def live_agent_support_control_event_type(action_id):
+    if action_id == ACTION_ID_LIVE_AGENT_RESOLVE:
+        return "live_agent_support_resolve"
+    if action_id == ACTION_ID_LIVE_AGENT_CANCEL:
+        return "live_agent_support_cancel"
+    return "live_agent_support_reassign"
+
+
+def invoke_live_agent_support_control(pointer, body, action_id):
+    if not LIVE_AGENT_FUNCTION:
+        raise ValueError("Missing LIVE_AGENT_FUNCTION for support control action")
+
+    payload = {
+        "source": "slack_support",
+        "event_type": live_agent_support_control_event_type(action_id),
+        "event_id": body.get("event_id"),
+        "action": body.get("action_value"),
+        "action_id": action_id,
+        "action_user": body.get("user"),
+        "action_ts": body.get("ts"),
+        "message_ts": body.get("message_ts") or body.get("thread_ts") or body.get("ts"),
+        "support_channel": body.get("channel"),
+        "support_thread_ts": pointer.get("support_thread_ts"),
+        "ticket_key": pointer.get("ticket_key"),
+        "session_id": pointer.get("target_session_id"),
+    }
+    response = lambda_client.invoke(
+        FunctionName=LIVE_AGENT_FUNCTION,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(payload).encode("utf-8"),
+    )
+    raw_payload = response.get("Payload").read().decode("utf-8") if response.get("Payload") else "{}"
+    parsed = json.loads(raw_payload or "{}")
+    if response.get("FunctionError"):
+        raise RuntimeError(parsed.get("error") or response.get("FunctionError"))
+    if isinstance(parsed, dict) and "body" in parsed:
+        try:
+            parsed_body = json.loads(parsed.get("body") or "{}")
+        except ValueError:
+            parsed_body = {"raw_body": parsed.get("body")}
+        return {**parsed, "parsed_body": parsed_body}
+    return parsed
+
+
+def live_agent_bridge_marker_id(direction, pointer, body, text):
+    source_id = body.get("event_id") or body.get("ts") or hashlib.sha256(
+        "|".join([
+            direction,
+            text_or_empty(pointer.get("ticket_key")),
+            text_or_empty(body.get("channel")),
+            text_or_empty(body.get("user")),
+            text_or_empty(text),
+        ]).encode("utf-8")
+    ).hexdigest()[:32]
+    return f"live_agent_bridge:{direction}:{source_id}"
+
+
+def acquire_live_agent_bridge_marker(direction, pointer, body, text, now_iso):
+    marker_session_id = live_agent_bridge_marker_id(direction, pointer, body, text)
+    try:
+        sessions_table.put_item(
+            Item={
+                "session_id": marker_session_id,
+                "record_type": "live_agent_bridge_marker",
+                "direction": direction,
+                "ticket_key": pointer.get("ticket_key") or "",
+                "source_event_id": body.get("event_id") or "",
+                "source_channel": body.get("channel") or "",
+                "source_ts": body.get("ts") or "",
+                "created_at": now_iso,
+                "ttl": ttl_epoch(),
+            },
+            ConditionExpression="attribute_not_exists(session_id)",
+        )
+        return {"acquired": True, "session_id": marker_session_id}
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return {"acquired": False, "session_id": marker_session_id}
+        raise
+
+
+def append_live_agent_bridge_message(pointer, sender, text, ts, now_iso):
+    entries = [transcript_entry(sender, text, ts)]
+    entries = [entry for entry in entries if entry]
+    if not entries:
+        return
+
+    for session_id in dict.fromkeys([pointer.get("session_id"), pointer.get("target_session_id")]):
+        if not session_id:
+            continue
+        sessions_table.update_item(
+            Key={"session_id": session_id},
+            UpdateExpression="""
+                SET
+                    last_live_agent_bridge_message = :text,
+                    last_live_agent_bridge_message_at = :now,
+                    live_agent_updated_at = :now,
+                    updated_at = :now,
+                    #ttl = :ttl,
+                    session_messages = list_append(if_not_exists(session_messages, :empty_list), :entries)
+            """,
+            ExpressionAttributeNames={"#ttl": "ttl"},
+            ExpressionAttributeValues={
+                ":text": truncate_text(text, 2000),
+                ":now": now_iso,
+                ":ttl": ttl_epoch(),
+                ":empty_list": [],
+                ":entries": entries,
+            },
+        )
+
+
+def agent_reply_to_user_text(pointer, agent_user, text):
+    agent_label = pointer.get("assignee_display_name") or "Support agent"
+    return f"{agent_label}: {text}"
+
+
+def agent_reply_to_jsm_comment(agent_user, text, support_channel, support_thread_ts):
+    return (
+        f"[From Slack] Agent {agent_user} replied:\n\n"
+        f"{text}\n\n"
+        f"Slack support channel: {support_channel}\n"
+        f"Slack support thread: {support_thread_ts}"
+    )
+
+
+def handle_live_agent_support_thread_reply(pointer, body, text):
+    now_iso = to_iso(datetime.now(timezone.utc))
+    marker = acquire_live_agent_bridge_marker("agent_to_user", pointer, body, text, now_iso)
+    if not marker.get("acquired"):
+        log_json({
+            "level": "INFO",
+            "message": "live_agent_support_reply_duplicate",
+            "ticket_key": pointer.get("ticket_key"),
+            "marker_session_id": marker.get("session_id"),
+        })
+        return {"ok": True, "duplicate": True, "ticket_key": pointer.get("ticket_key")}
+
+    requester_channel = text_or_empty(pointer.get("slack_channel"))
+    if not requester_channel:
+        return {"ok": False, "error": "missing_requester_channel", "ticket_key": pointer.get("ticket_key")}
+
+    start_transition_result = transition_jira_issue_to_status(
+        pointer.get("ticket_key"),
+        LIVE_AGENT_START_STATUS_NAMES,
+        reason="slack_agent_reply",
+    )
+    if (
+        not start_transition_result.get("ok")
+        and LIVE_AGENT_BLOCK_REPLY_ON_START_TRANSITION_FAILURE
+    ):
+        warning = live_agent_start_transition_failure_text(pointer.get("ticket_key"), start_transition_result)
+        try:
+            send_slack_message(
+                body.get("channel") or pointer.get("support_channel"),
+                warning,
+                thread_ts=body.get("thread_ts") or pointer.get("support_thread_ts"),
+            )
+        except Exception as error:
+            log_json({
+                "level": "ERROR",
+                "message": "live_agent_start_transition_warning_failed",
+                "ticket_key": pointer.get("ticket_key"),
+                "error": str(error),
+            })
+        log_json({
+            "level": "ERROR",
+            "message": "live_agent_support_reply_blocked_by_jira_transition",
+            "ticket_key": pointer.get("ticket_key"),
+            "error_code": start_transition_result.get("error_code"),
+            "transition_result": start_transition_result,
+        })
+        return {
+            "ok": False,
+            "blocked": True,
+            "ticket_key": pointer.get("ticket_key"),
+            "error": start_transition_result.get("error"),
+            "error_code": start_transition_result.get("error_code") or "jira_start_transition_failed",
+            "transition_result": start_transition_result,
+        }
+
+    send_slack_message(
+        requester_channel,
+        agent_reply_to_user_text(pointer, body.get("user"), text),
+        thread_ts=requester_thread_ts(pointer),
+    )
+
+    if LIVE_AGENT_SYNC_AGENT_REPLIES_TO_JSM and pointer.get("ticket_key"):
+        try:
+            add_jsm_request_comment(
+                pointer["ticket_key"],
+                agent_reply_to_jsm_comment(
+                    body.get("user"),
+                    text,
+                    body.get("channel"),
+                    body.get("thread_ts") or body.get("ts"),
+                ),
+                public=JSM_COMMENT_PUBLIC,
+            )
+        except Exception as error:
+            log_json({
+                "level": "ERROR",
+                "message": "live_agent_support_reply_jsm_sync_failed",
+                "ticket_key": pointer.get("ticket_key"),
+                "error": str(error),
+            })
+
+    append_live_agent_bridge_message(pointer, "Agent", text, body.get("ts"), now_iso)
+    log_json({
+        "level": "INFO",
+        "message": "live_agent_support_reply_forwarded",
+        "ticket_key": pointer.get("ticket_key"),
+        "requester_channel": requester_channel,
+        "support_channel": body.get("channel"),
+        "support_thread_ts": body.get("thread_ts"),
+        "jira_start_transition": start_transition_result,
+    })
+    return {"ok": True, "ticket_key": pointer.get("ticket_key"), "jira_start_transition": start_transition_result}
+
+
+def handle_live_agent_reply_submission(body):
+    ticket_key = text_or_empty(body.get("ticket_key"))
+    text = text_or_empty(body.get("text"))
+    if not ticket_key:
+        return {"ok": False, "error": "missing_ticket_key"}
+    if not text:
+        return {"ok": False, "error": "missing_reply_text", "ticket_key": ticket_key}
+
+    pointer = get_session_item(f"live_agent_ticket:{ticket_key}")
+    if not pointer:
+        return {"ok": False, "error": "missing_live_agent_ticket_pointer", "ticket_key": ticket_key}
+    if pointer.get("bridge_status") != "active":
+        return {"ok": False, "error": "inactive_live_agent_bridge", "ticket_key": ticket_key}
+
+    reply_body = {
+        **body,
+        "channel": body.get("channel") or pointer.get("support_channel"),
+        "thread_ts": body.get("thread_ts") or pointer.get("support_thread_ts"),
+        "ts": body.get("ts") or body.get("message_ts"),
+    }
+    return handle_live_agent_support_thread_reply(pointer, reply_body, text)
+
+
+def handle_live_agent_user_reply(session_id, session_item, body, channel, user, text, thread_ts, ts, processing_message=None):
     ticket_key = session_item.get("live_agent_ticket_key") or session_item.get("last_live_agent_ticket_key")
     event_id = body.get("event_id")
     now_iso = to_iso(datetime.now(timezone.utc))
@@ -4469,16 +5369,46 @@ def handle_live_agent_user_reply(session_id, session_item, body, channel, user, 
     comment_body = build_live_agent_slack_comment(user, text, channel, thread_ts, ts)
 
     try:
+        support_channel = text_or_empty(session_item.get("support_channel"))
+        support_thread_ts = text_or_empty(session_item.get("support_thread_ts"))
+        if support_bridge_enabled() and support_channel and support_thread_ts and session_item.get("bridge_status") == "active":
+            try:
+                send_slack_message(
+                    support_channel,
+                    f"Requester <@{user}> replied:\n\n{text}",
+                    thread_ts=support_thread_ts,
+                )
+            except Exception as error:
+                log_json({
+                    "level": "ERROR",
+                    "message": "live_agent_user_reply_support_thread_forward_failed",
+                    "session_id": session_id,
+                    "ticket_key": ticket_key,
+                    "error": str(error),
+                })
         add_jsm_request_comment(ticket_key, comment_body, public=JSM_COMMENT_PUBLIC)
         update_live_agent_user_reply_session(session_id, session_item, event_id, text, now_iso)
         update_live_agent_user_reply_pointer(ticket_key, text, now_iso)
+        append_live_agent_bridge_message(
+            {
+                "session_id": session_id,
+                "target_session_id": session_id,
+            },
+            "User",
+            text,
+            ts,
+            now_iso,
+        )
         update_live_agent_slack_comment_marker(marker["session_id"], "posted", now_iso)
     except Exception as e:
         update_live_agent_slack_comment_marker(marker["session_id"], "failed", now_iso, error=e)
         raise
 
     ack = f"Sent your reply to support on {ticket_key}."
-    send_slack_message(channel, ack, thread_ts=thread_ts)
+    if processing_message:
+        update_processing_message(processing_message, ack)
+    else:
+        send_slack_message(channel, ack, thread_ts=thread_ts)
 
     log_json({
         "level": "INFO",
@@ -4517,10 +5447,25 @@ def feedback_comment_text(session_id, rating, feedback_text, user, channel):
     return "\n".join(parts)
 
 
-def update_feedback_session(session_id, rating, feedback_text, user, channel, ticket_key, now_iso, jira_comment_result=None):
+def feedback_comment_is_public(metadata):
+    if not isinstance(metadata, dict):
+        return True
+
+    value = metadata.get("comment_public")
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return True
+    return str(value).strip().lower() not in {"false", "0", "no", "private", "internal"}
+
+
+def update_feedback_session(session_id, rating, feedback_text, user, channel, ticket_key, now_iso, jira_comment_result=None, sharepoint_result=None):
     if not session_id:
         return
 
+    sharepoint_status = (sharepoint_result or {}).get("status") or (
+        "posted" if (sharepoint_result or {}).get("ok") else "failed"
+    )
     sessions_table.update_item(
         Key={"session_id": session_id},
         UpdateExpression="""
@@ -4533,6 +5478,10 @@ def update_feedback_session(session_id, rating, feedback_text, user, channel, ti
                 feedback_submitted_at = :now,
                 feedback_jira_ticket_key = :ticket_key,
                 feedback_jira_comment_status = :comment_status,
+                feedback_sharepoint_sync_status = :sharepoint_status,
+                feedback_sharepoint_item_id = :sharepoint_item_id,
+                feedback_sharepoint_error = :sharepoint_error,
+                feedback_sharepoint_synced_at = :sharepoint_synced_at,
                 updated_at = :now,
                 #ttl = :ttl
         """,
@@ -4546,6 +5495,10 @@ def update_feedback_session(session_id, rating, feedback_text, user, channel, ti
             ":now": now_iso,
             ":ticket_key": ticket_key or "",
             ":comment_status": "posted" if (jira_comment_result or {}).get("ok") else "not_posted",
+            ":sharepoint_status": sharepoint_status,
+            ":sharepoint_item_id": (sharepoint_result or {}).get("item_id") or "",
+            ":sharepoint_error": (sharepoint_result or {}).get("error") or (sharepoint_result or {}).get("reason") or "",
+            ":sharepoint_synced_at": now_iso if (sharepoint_result or {}).get("ok") else "",
             ":ttl": ttl_epoch(),
         },
     )
@@ -4569,14 +5522,40 @@ def handle_feedback_submission(body):
     if ticket_key:
         comment_body = feedback_comment_text(session_id, rating, feedback_text, user, channel)
         try:
-            add_jira_issue_comment(ticket_key, comment_body)
-            comment_result = {"ok": True, "ticket_key": ticket_key}
+            public_comment = feedback_comment_is_public(metadata)
+            if public_comment:
+                add_jira_issue_comment(ticket_key, comment_body)
+            else:
+                add_jsm_request_comment(ticket_key, comment_body, public=False)
+            comment_result = {"ok": True, "ticket_key": ticket_key, "public": public_comment}
         except Exception as error:
             comment_result = {
                 "ok": False,
                 "ticket_key": ticket_key,
                 "error": str(error),
             }
+
+    sharepoint_result = sync_feedback_to_sharepoint(
+        session_id,
+        rating,
+        feedback_text,
+        user,
+        channel,
+        ticket_key,
+        now_iso,
+        metadata,
+        comment_result,
+    )
+    if not sharepoint_result.get("ok") and not sharepoint_result.get("skipped"):
+        log_json({
+            "level": "ERROR",
+            "message": "feedback_sharepoint_sync_failed",
+            "session_id": session_id,
+            "ticket_key": ticket_key,
+            "status": sharepoint_result.get("status"),
+            "error": sharepoint_result.get("error"),
+            "error_code": sharepoint_result.get("error_code"),
+        })
 
     update_feedback_session(
         session_id,
@@ -4587,15 +5566,11 @@ def handle_feedback_submission(body):
         ticket_key,
         now_iso,
         jira_comment_result=comment_result,
+        sharepoint_result=sharepoint_result,
     )
 
     try:
-        send_slack_message(
-            channel,
-            "Thanks for the feedback. It has been added to the follow-up ticket."
-            if comment_result.get("ok")
-            else "Thanks for the feedback. I saved it, but could not add it to the follow-up ticket.",
-        )
+        send_slack_message(channel, "Thanks for the feedback.")
     except Exception as error:
         log_json({
             "level": "WARN",
@@ -4611,6 +5586,7 @@ def handle_feedback_submission(body):
         "rating": rating,
         "ticket_key": ticket_key,
         "jira_comment_ok": comment_result.get("ok"),
+        "sharepoint_sync_status": sharepoint_result.get("status"),
         "error": comment_result.get("error"),
     })
     return {
@@ -4618,6 +5594,7 @@ def handle_feedback_submission(body):
         "session_id": session_id,
         "ticket_key": ticket_key,
         "comment_result": comment_result,
+        "sharepoint_result": sharepoint_result,
     }
 
 
@@ -4640,6 +5617,18 @@ def process_record(record):
     action_value = body.get("action_value")
     if event_type == "feedback_submission":
         handle_feedback_submission(body)
+        return
+
+    if event_type == "live_agent_reply_submission":
+        result = handle_live_agent_reply_submission(body)
+        log_json({
+            "level": "INFO" if result.get("ok") else "ERROR",
+            "message": "live_agent_reply_submission_processed",
+            "event_id": event_id,
+            "ticket_key": body.get("ticket_key"),
+            "ok": result.get("ok"),
+            "error": result.get("error"),
+        })
         return
 
     is_interactive_action = event_type == "interactive_action"
@@ -4680,6 +5669,63 @@ def process_record(record):
         "image_file_count": len(image_files),
         "action_id": action_id
     })
+
+    is_bot_message = bool(
+        body.get("bot_id")
+        or body.get("bot_user_id")
+        or body.get("subtype") in {"bot_message", "message_changed", "message_deleted"}
+    )
+    support_bridge = find_live_agent_support_bridge_for_event(
+        channel,
+        body.get("thread_ts"),
+        body.get("message_ts"),
+        body.get("ts"),
+    )
+    if support_bridge and is_interactive_action and is_live_agent_support_control_action(action_id):
+        maybe_send_ephemeral(
+            channel,
+            user,
+            support_control_processing_text(action_id) or "Processing...",
+            body.get("thread_ts") or body.get("message_ts") or body.get("ts"),
+        )
+        control_result = invoke_live_agent_support_control(support_bridge, body, action_id)
+        log_json({
+            "level": "INFO",
+            "message": "live_agent_support_control_forwarded",
+            "event_id": event_id,
+            "ticket_key": support_bridge.get("ticket_key"),
+            "action_id": action_id,
+            "result": control_result,
+        })
+        return
+
+    if support_bridge and not is_interactive_action:
+        if is_bot_message or not text:
+            log_json({
+                "level": "INFO",
+                "message": "live_agent_support_thread_message_ignored",
+                "event_id": event_id,
+                "ticket_key": support_bridge.get("ticket_key"),
+                "is_bot_message": is_bot_message,
+                "has_text": bool(text),
+            })
+            return
+        handle_live_agent_support_thread_reply(support_bridge, body, text)
+        return
+
+    if is_live_agent_support_channel_message(channel, is_interactive_action):
+        log_json({
+            "level": "WARN",
+            "message": "live_agent_support_thread_bridge_not_found",
+            "event_id": event_id,
+            "channel": channel,
+            "thread_ts": body.get("thread_ts"),
+            "message_ts": body.get("message_ts"),
+            "ts": body.get("ts"),
+            "has_text": bool(text),
+            "is_bot_message": is_bot_message,
+        })
+        return
 
     existing_session = get_session_item(session_id)
     if (
@@ -4769,11 +5815,6 @@ def process_record(record):
         })
         return
 
-    is_bot_message = bool(
-        body.get("bot_id")
-        or body.get("bot_user_id")
-        or body.get("subtype") in {"bot_message", "message_changed", "message_deleted"}
-    )
     if existing_session and not is_interactive_action and is_live_agent_dm_session_pending_or_active(existing_session):
         if is_bot_message or not text:
             log_json({
@@ -4800,6 +5841,11 @@ def process_record(record):
             })
             return
 
+        processing_message = post_processing_message(
+            channel,
+            "Sending your reply to support...",
+            thread_ts=thread_ts or session_thread_ts,
+        )
         handle_live_agent_user_reply(
             session_id,
             existing_session,
@@ -4809,6 +5855,7 @@ def process_record(record):
             text,
             thread_ts or session_thread_ts,
             ts,
+            processing_message=processing_message,
         )
         return
 
@@ -4891,6 +5938,29 @@ def process_record(record):
     assistance_details_handled = False
     manual_close_summary = False
     manual_close_timeout_token = None
+    processing_message = None
+
+    if is_interactive_action:
+        processing_text = interactive_processing_text(action_id)
+        if processing_text:
+            maybe_send_ephemeral(
+                channel,
+                user,
+                processing_text,
+                session_thread_ts or body.get("thread_ts") or body.get("message_ts") or body.get("ts"),
+            )
+    elif has_image:
+        processing_message = post_processing_message(
+            channel,
+            "Analyzing screenshot...",
+            thread_ts=session_thread_ts,
+        )
+    elif text:
+        processing_message = post_processing_message(
+            channel,
+            "IVY is checking...",
+            thread_ts=session_thread_ts,
+        )
 
     if is_interactive_action:
         interactive_action_handled = True
@@ -4985,6 +6055,11 @@ def process_record(record):
 
         if manual_close_summary:
             closed_at = datetime.now(timezone.utc).replace(microsecond=0)
+            processing_message = post_processing_message(
+                channel,
+                "Closing and summarizing this session...",
+                thread_ts=session_thread_ts,
+            )
 
             try:
                 mark_session_summarizing(
@@ -4996,7 +6071,8 @@ def process_record(record):
             except ClientError as e:
                 if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                     lex_reply = "That action is no longer active. Please send a new message."
-                    send_slack_message(channel, lex_reply, thread_ts=session_thread_ts)
+                    if not update_processing_message(processing_message, lex_reply):
+                        send_slack_message(channel, lex_reply, thread_ts=session_thread_ts)
                     log_json({
                         "level": "INFO",
                         "message": "manual_close_summary_ignored",
@@ -5017,6 +6093,8 @@ def process_record(record):
                 "closed_at": to_iso(closed_at),
                 "reason": "manual_close_summary",
                 "conversation_type": conversation_type,
+                "processing_channel": (processing_message or {}).get("channel"),
+                "processing_ts": (processing_message or {}).get("ts"),
             })
 
             log_json({
@@ -5031,11 +6109,13 @@ def process_record(record):
             })
 
             if not summarizer_result.get("ok"):
-                send_slack_message(
-                    channel,
-                    "I could not complete the summary/save step. This session has not been fully closed.",
-                    thread_ts=session_thread_ts
-                )
+                failure_text = "I could not complete the summary/save step. This session has not been fully closed."
+                if not update_processing_message(processing_message, failure_text):
+                    send_slack_message(
+                        channel,
+                        failure_text,
+                        thread_ts=session_thread_ts
+                    )
 
             log_json({
                 "level": "INFO",
@@ -5131,6 +6211,7 @@ def process_record(record):
         }
 
         if ENABLE_CLAUDE_FALLBACK:
+            update_processing_message(processing_message, "Thinking through this issue...")
             claude_result = invoke_claude_fallback(
                 build_assistance_claude_payload(
                     details_session,
@@ -5190,6 +6271,8 @@ def process_record(record):
 
     elif has_jira_confirmation_state(existing_session, text):
         jira_confirmation_handled = True
+        if classify_jira_confirmation(text) == "yes":
+            update_processing_message(processing_message, "Creating Jira ticket...")
         confirmation_result = handle_jira_confirmation(
             existing_session,
             body,
@@ -5242,6 +6325,7 @@ def process_record(record):
         })
 
     elif text:
+        update_processing_message(processing_message, "Checking IVY routing...")
         response = lex.recognize_text(
             botId=BOT_ID,
             botAliasId=BOT_ALIAS_ID,
@@ -5283,14 +6367,52 @@ def process_record(record):
             "jira_status": jira_status
         })
 
-    if (
-        AUTO_CLAUDE_FALLBACK_ENABLED
-        and not interactive_action_handled
+    should_try_fallback = (
+        not interactive_action_handled
         and not assistance_details_handled
         and not jira_confirmation_handled
         and response_source != "router"
         and should_use_claude_fallback(text, lex_intent, lex_state, lex_reply_empty)
+    )
+
+    if (
+        should_try_fallback
+        and ENABLE_BEDROCK_KB_ASSIST
     ):
+        update_processing_message(processing_message, "Searching knowledge base...")
+        kb_result = invoke_bedrock_knowledge_base(text)
+        if kb_result.get("ok"):
+            lex_intent = BEDROCK_KB_INTENT_NAME
+            lex_state = "Fulfilled"
+            lex_slots = {}
+            lex_reply = kb_result.get("reply") or ""
+            lex_reply_empty = not bool(lex_reply.strip())
+            response_source = "bedrock_knowledge_base"
+            should_try_fallback = False
+
+            log_json({
+                "level": "INFO",
+                "message": "bedrock_kb_assist_answered",
+                "event_id": event_id,
+                "session_id": session_id,
+                "intent": lex_intent,
+                "citation_count": len(kb_result.get("citations") or []),
+            })
+        else:
+            log_json({
+                "level": "INFO",
+                "message": "bedrock_kb_assist_no_answer",
+                "event_id": event_id,
+                "session_id": session_id,
+                "error_code": kb_result.get("error_code"),
+                "error": kb_result.get("error"),
+            })
+
+    if (
+        AUTO_CLAUDE_FALLBACK_ENABLED
+        and should_try_fallback
+    ):
+        update_processing_message(processing_message, "Thinking through this issue...")
         claude_fallback_attempted = True
         original_lex_reply = lex_reply
         claude_payload = {
@@ -6188,7 +7310,9 @@ def process_record(record):
         delete_timeout_schedule(session_id, "prompt")
         delete_timeout_schedule(session_id, "close")
 
-    slack_response = send_slack_message(channel, lex_reply, slack_blocks, thread_ts=session_thread_ts)
+    slack_response = update_processing_message(processing_message, lex_reply, slack_blocks)
+    if not slack_response:
+        slack_response = send_slack_message(channel, lex_reply, slack_blocks, thread_ts=session_thread_ts)
     if rovo_should_invoke and jira_ticket_key:
         store_rovo_slack_message_target(
             session_id,

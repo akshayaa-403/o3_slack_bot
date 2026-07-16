@@ -38,6 +38,7 @@ SCHEDULER_GROUP_NAME = os.environ.get("SCHEDULER_GROUP_NAME", "default")
 SCHEDULER_NAME_PREFIX = os.environ.get("SCHEDULER_NAME_PREFIX", "o3-slack-timeout")
 SEND_CLOSE_NOTIFICATION = os.environ.get("SEND_CLOSE_NOTIFICATION", "true").lower() == "true"
 SEND_FEEDBACK_PROMPT = os.environ.get("SEND_FEEDBACK_PROMPT", "true").lower() == "true"
+ENABLE_SUMMARIZATION = os.environ.get("ENABLE_SUMMARIZATION", "true").lower() == "true"
 ENABLE_AI_SUMMARY = os.environ.get("ENABLE_AI_SUMMARY", "true").lower() == "true"
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "amazon.nova-2-lite-v1:0")
 AI_SUMMARY_MAX_TOKENS = int(os.environ.get("AI_SUMMARY_MAX_TOKENS", "220"))
@@ -1025,7 +1026,24 @@ def final_close_message(webhook_response, summary, summary_jira_result=None):
 
 def send_close_notification(channel, text):
     # Send the final close message after audit persistence has succeeded.
-    if not SEND_CLOSE_NOTIFICATION or not channel:
+    if not channel:
+        return
+
+    processing_ts = text_or_empty(_CURRENT_EVENT.get("processing_ts")) if "_CURRENT_EVENT" in globals() else ""
+    processing_channel = text_or_empty(_CURRENT_EVENT.get("processing_channel")) if "_CURRENT_EVENT" in globals() else ""
+    if processing_ts and (not processing_channel or processing_channel == channel):
+        slack_api(
+            "chat.update",
+            payload={
+                "channel": channel,
+                "ts": processing_ts,
+                "text": text or CLOSE_NOTIFICATION_TEXT,
+                "blocks": [],
+            },
+        )
+        return
+
+    if not SEND_CLOSE_NOTIFICATION:
         return
 
     slack_api(
@@ -1104,6 +1122,20 @@ def notify_summary_failed(channel):
     if not channel:
         return
 
+    processing_ts = text_or_empty(_CURRENT_EVENT.get("processing_ts")) if "_CURRENT_EVENT" in globals() else ""
+    processing_channel = text_or_empty(_CURRENT_EVENT.get("processing_channel")) if "_CURRENT_EVENT" in globals() else ""
+    if processing_ts and (not processing_channel or processing_channel == channel):
+        slack_api(
+            "chat.update",
+            payload={
+                "channel": channel,
+                "ts": processing_ts,
+                "text": SUMMARY_SAVE_FAILED_TEXT,
+                "blocks": [],
+            },
+        )
+        return
+
     slack_api(
         "chat.postMessage",
         payload={
@@ -1118,6 +1150,8 @@ def lambda_handler(event, context):
     # builds summaries, delivers audit outputs, updates DynamoDB, and returns a
     # compact status object to the caller.
     session_id = event.get("session_id")
+    global _CURRENT_EVENT
+    _CURRENT_EVENT = event or {}
     timeout_token = event.get("timeout_token")
     started_at = datetime.now(timezone.utc).replace(microsecond=0)
     closed_at = parse_iso(event.get("closed_at")) or started_at
@@ -1128,6 +1162,20 @@ def lambda_handler(event, context):
         "session_id": session_id,
         "reason": event.get("reason"),
     })
+
+    if not ENABLE_SUMMARIZATION:
+        log_json({
+            "level": "INFO",
+            "message": "summary_ignored",
+            "session_id": session_id,
+            "reason": "summarization_disabled",
+        })
+        return {
+            "ok": False,
+            "ignored": True,
+            "reason": "summarization_disabled",
+            "session_id": session_id,
+        }
 
     try:
         # Ignore events for missing sessions rather than failing the Lambda.
