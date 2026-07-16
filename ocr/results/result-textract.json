@@ -1,6 +1,57 @@
 {
   "engine": "textract",
-  "available": false,
-  "reason": "no valid AWS credentials: ClientError",
-  "generated_at": "2026-07-15T04:16:35+00:00"
+  "kind": "cloud-api",
+  "description": "AWS Textract managed OCR; high-volume, handwriting, AWS-native.",
+  "available": true,
+  "reason": "ready (valid AWS credentials)",
+  "load_ms": 38.0,
+  "images": 5,
+  "images_ok": 0,
+  "mean_char_accuracy": null,
+  "mean_word_accuracy": null,
+  "mean_latency_ms": null,
+  "median_latency_ms": null,
+  "per_image": [
+    {
+      "image": "adam_login_mfa_error.png",
+      "ok": false,
+      "latency_ms": 336.7,
+      "predicted_text": "",
+      "accuracy": null,
+      "error": "An error occurred (SubscriptionRequiredException) when calling the DetectDocumentText operation: The AWS Access Key Id needs a subscription for the service"
+    },
+    {
+      "image": "vpn_connection_failed.png",
+      "ok": false,
+      "latency_ms": 342.5,
+      "predicted_text": "",
+      "accuracy": null,
+      "error": "An error occurred (SubscriptionRequiredException) when calling the DetectDocumentText operation: The AWS Access Key Id needs a subscription for the service"
+    },
+    {
+      "image": "pcq_access_denied.png",
+      "ok": false,
+      "latency_ms": 365.0,
+      "predicted_text": "",
+      "accuracy": null,
+      "error": "An error occurred (SubscriptionRequiredException) when calling the DetectDocumentText operation: The AWS Access Key Id needs a subscription for the service"
+    },
+    {
+      "image": "outlook_mailbox_full.png",
+      "ok": false,
+      "latency_ms": 334.8,
+      "predicted_text": "",
+      "accuracy": null,
+      "error": "An error occurred (SubscriptionRequiredException) when calling the DetectDocumentText operation: The AWS Access Key Id needs a subscription for the service"
+    },
+    {
+      "image": "unmatched_hr_timesheet_error.png",
+      "ok": false,
+      "latency_ms": 392.9,
+      "predicted_text": "",
+      "accuracy": null,
+      "error": "An error occurred (SubscriptionRequiredException) when calling the DetectDocumentText operation: The AWS Access Key Id needs a subscription for the service"
+    }
+  ],
+  "generated_at": "2026-07-15T11:42:19+00:00"
 }

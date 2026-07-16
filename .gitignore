@@ -18,6 +18,19 @@ ENV/
 *.pem
 *.key
 
+# AWS deploy scratch files (env files hold live secrets; policy/test files are ad hoc)
+handler-env.json
+worker-env.json
+handler-policy.json
+worker-policy.json
+trust-policy.json
+lex-version-spec.json
+lex-alias-settings.json
+aws-test-event.json
+test-sqs-message.json
+response.json
+slack-app-manifest.yaml
+
 # Test, coverage, and tooling caches
 .pytest_cache/
 .mypy_cache/

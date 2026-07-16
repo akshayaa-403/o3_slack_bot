@@ -4,18 +4,18 @@
   "description": "PaddleOCR (Baidu) detection+recognition; robust multi-language, CPU/GPU.",
   "available": true,
   "reason": "ready",
-  "load_ms": 10442.0,
+  "load_ms": 10594.4,
   "images": 5,
   "images_ok": 5,
   "mean_char_accuracy": 0.9894,
   "mean_word_accuracy": 0.9256,
-  "mean_latency_ms": 1190.0,
-  "median_latency_ms": 879.1,
+  "mean_latency_ms": 1075.0,
+  "median_latency_ms": 860.1,
   "per_image": [
     {
       "image": "adam_login_mfa_error.png",
       "ok": true,
-      "latency_ms": 1805.6,
+      "latency_ms": 1415.5,
       "predicted_text": "ADAM Portal\nUnable to sign in.\nError: ADAM portal shows blank page after MFA\nUser completed Microsoft Authenticator approval.\nBrowser: Chrome\nRequest: help me fix ADAM login issue.\nProject IVY image-flow test screenshot",
       "accuracy": {
         "cer": 0.0092,
@@ -30,7 +30,7 @@
     {
       "image": "vpn_connection_failed.png",
       "ok": true,
-      "latency_ms": 879.1,
+      "latency_ms": 860.1,
       "predicted_text": "GlobalProtect VPN\nConnection Failed\nError: VPN connection failed.\nThe network connection is unreachable\nGateway: gpcloudservice.com\nRequest: VPN not connecting.\nProject IVY image-flow test screenshot",
       "accuracy": {
         "cer": 0.0152,
@@ -45,7 +45,7 @@
     {
       "image": "pcq_access_denied.png",
       "ok": true,
-      "latency_ms": 845.4,
+      "latency_ms": 830.6,
       "predicted_text": "PCQ Access\nAccess Denied\nError: You do not have access to PCQ\nContact IT support to request access..\nUser needs PCQ application access..\nRequest: I need access to PCQ\nProject IVY image-flow test screenshot",
       "accuracy": {
         "cer": 0.0099,
@@ -60,7 +60,7 @@
     {
       "image": "outlook_mailbox_full.png",
       "ok": true,
-      "latency_ms": 793.4,
+      "latency_ms": 770.9,
       "predicted_text": "Microsoft Outlook.\nMailbox Full\nError: Your mailbox is full.\nYou cannot send or receive email.\nPlease reduce mailbox size.\nRequest: Outlook mailbox full issue\nProject IVY image-flow test screenshot",
       "accuracy": {
         "cer": 0.0103,
@@ -75,7 +75,7 @@
     {
       "image": "unmatched_hr_timesheet_error.png",
       "ok": true,
-      "latency_ms": 1626.6,
+      "latency_ms": 1497.8,
       "predicted_text": "TimeTrack Portal\nTimesheet submissjon failed.\nError: Timesheet period is locked for payroll processing\nEmployee: Test User\nWeek ending: 30 Jun 2026\nRequest: help me submit my locked timesheet\nProject IVY unmatched image-flow test screenshot",
       "accuracy": {
         "cer": 0.0084,
@@ -88,5 +88,5 @@
       "error": null
     }
   ],
-  "generated_at": "2026-07-14T10:48:48+00:00"
+  "generated_at": "2026-07-15T11:43:04+00:00"
 }
