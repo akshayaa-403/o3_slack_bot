@@ -5952,7 +5952,7 @@ def process_record(record):
     elif has_image:
         processing_message = post_processing_message(
             channel,
-            "Analyzing screenshot...",
+            "Analyzing image...",
             thread_ts=session_thread_ts,
         )
     elif text:

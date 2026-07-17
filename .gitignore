@@ -21,6 +21,17 @@ ENV/
 # AWS deploy scratch files (env files hold live secrets; policy/test files are ad hoc)
 handler-env.json
 worker-env.json
+ocr-env.json
+summarizer-env.json
+liveagent-env.json
+liveagent-summarizer-policy.json
+worker-invoke-newlambdas-policy.json
+claude-fallback-env.json
+bedrock-invoke-policy.json
+scheduler-trust-policy.json
+scheduler-invoke-policy.json
+scheduler-caller-policy.json
+timeout-env.json
 handler-policy.json
 worker-policy.json
 trust-policy.json
