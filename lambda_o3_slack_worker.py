@@ -699,7 +699,7 @@ def feedback_source(metadata):
     return "live_agent" if (metadata or {}).get("comment_public") is False else "summary"
 
 
-def sharepoint_feedback_fields(session_id, rating, feedback_text, user, channel, ticket_key, now_iso, metadata, comment_result):
+def sharepoint_feedback_fields(session_id, rating, feedback_text, user, user_name, channel, ticket_key, now_iso, metadata, comment_result):
     return {
         "Title": f"IVY feedback - {ticket_key or session_id or 'unknown'}",
         "SubmittedAt": now_iso,
@@ -707,6 +707,7 @@ def sharepoint_feedback_fields(session_id, rating, feedback_text, user, channel,
         "RatingStars": feedback_stars(rating),
         "FeedbackText": feedback_text or "",
         "SlackUser": user or "",
+        "SlackUserName": user_name or "",
         "SlackChannel": channel or "",
         "SessionId": session_id or "",
         "JiraTicketKey": ticket_key or "",
@@ -750,12 +751,13 @@ def create_sharepoint_feedback_item(fields):
     }
 
 
-def sync_feedback_to_sharepoint(session_id, rating, feedback_text, user, channel, ticket_key, now_iso, metadata, comment_result):
+def sync_feedback_to_sharepoint(session_id, rating, feedback_text, user, user_name, channel, ticket_key, now_iso, metadata, comment_result):
     fields = sharepoint_feedback_fields(
         session_id,
         rating,
         feedback_text,
         user,
+        user_name,
         channel,
         ticket_key,
         now_iso,
@@ -5466,7 +5468,7 @@ def feedback_comment_is_public(metadata):
     return str(value).strip().lower() not in {"false", "0", "no", "private", "internal"}
 
 
-def update_feedback_session(session_id, rating, feedback_text, user, channel, ticket_key, now_iso, jira_comment_result=None, sharepoint_result=None):
+def update_feedback_session(session_id, rating, feedback_text, user, user_name, channel, ticket_key, now_iso, jira_comment_result=None, sharepoint_result=None):
     if not session_id:
         return
 
@@ -5481,6 +5483,7 @@ def update_feedback_session(session_id, rating, feedback_text, user, channel, ti
                 feedback_stars = :stars,
                 feedback_text = :feedback_text,
                 feedback_user = :user,
+                feedback_user_name = :user_name,
                 feedback_channel = :channel,
                 feedback_submitted_at = :now,
                 feedback_jira_ticket_key = :ticket_key,
@@ -5498,6 +5501,7 @@ def update_feedback_session(session_id, rating, feedback_text, user, channel, ti
             ":stars": feedback_stars(rating),
             ":feedback_text": feedback_text or "",
             ":user": user or "",
+            ":user_name": user_name or "",
             ":channel": channel or "",
             ":now": now_iso,
             ":ticket_key": ticket_key or "",
@@ -5517,6 +5521,12 @@ def handle_feedback_submission(body):
     rating = int(metadata.get("rating") or body.get("feedback_rating") or 0)
     feedback_text = text_or_empty(body.get("feedback_text"))
     user = text_or_empty(body.get("user"))
+    user_name = text_or_empty(
+        body.get("user_name")
+        or metadata.get("user_name")
+        or metadata.get("username")
+        or metadata.get("name")
+    )
     channel = text_or_empty(body.get("channel"))
     now_iso = to_iso(datetime.now(timezone.utc))
     session_item = get_session_item(session_id) if session_id else {}
@@ -5547,6 +5557,7 @@ def handle_feedback_submission(body):
         rating,
         feedback_text,
         user,
+        user_name,
         channel,
         ticket_key,
         now_iso,
@@ -5569,6 +5580,7 @@ def handle_feedback_submission(body):
         rating,
         feedback_text,
         user,
+        user_name,
         channel,
         ticket_key,
         now_iso,
