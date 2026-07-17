@@ -70,3 +70,10 @@ temp/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Scratch notes, ad-hoc test events, and captured outputs
+kn.txt
+handler_out.json
+url_verify_event.json
+fixtures/scratch/
+response.json
