@@ -24,6 +24,7 @@ lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 bedrock_runtime = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 bedrock_agent_runtime = boto3.client("bedrock-agent-runtime", region_name=AWS_REGION)
 secretsmanager = boto3.client("secretsmanager", region_name=AWS_REGION)
+sqs_client = boto3.client("sqs", region_name=AWS_REGION)
 
 BOT_ID = os.environ["BOT_ID"]
 BOT_ALIAS_ID = os.environ["BOT_ALIAS_ID"]
@@ -62,6 +63,25 @@ ENABLE_CLOSE_SUMMARY = (
 ).lower() == "true"
 ENABLE_ROVO_ENRICHMENT = os.environ.get("ENABLE_ROVO_ENRICHMENT", "false").lower() == "true"
 ROVO_ENRICHMENT_FUNCTION = os.environ.get("ROVO_ENRICHMENT_FUNCTION")
+ENABLE_MCP_ASSIST = os.environ.get("ENABLE_MCP_ASSIST", "false").lower() == "true"
+MCP_ASSIST_FUNCTION_NAME = os.environ.get("MCP_ASSIST_FUNCTION_NAME")
+MCP_QUEUE_URL = os.environ.get("MCP_QUEUE_URL")
+MCP_ASSIST_PROGRESS_REPLY = os.environ.get(
+    "MCP_ASSIST_PROGRESS_REPLY",
+    "Searching approved Jira, Confluence, SharePoint, and Slack knowledge sources..."
+)
+MCP_ASSIST_DETAILS_PROMPT_TEXT = os.environ.get(
+    "MCP_ASSIST_DETAILS_PROMPT_TEXT",
+    "What should I search for in company knowledge? Send the exact issue, error, or topic."
+)
+MCP_ASSIST_NOT_CONFIGURED_REPLY = os.environ.get(
+    "MCP_ASSIST_NOT_CONFIGURED_REPLY",
+    "Company knowledge search is not configured yet."
+)
+MCP_ASSIST_FAILED_REPLY = os.environ.get(
+    "MCP_ASSIST_FAILED_REPLY",
+    "I could not start the company knowledge search right now."
+)
 LIVE_AGENT_FUNCTION = os.environ.get("LIVE_AGENT_FUNCTION")
 LIVE_AGENT_WEBHOOK_URL = os.environ.get("LIVE_AGENT_WEBHOOK_URL") or os.environ.get("AUTOMATION_WEBHOOK_URL")
 LIVE_AGENT_CONFIG_TABLE = os.environ.get("LIVE_AGENT_CONFIG_TABLE") or os.environ.get("CONFIG_TABLE")
@@ -209,12 +229,15 @@ NEXT_ACTION_CREATE_JIRA_TICKET = "O3_CreateJiraTicket"
 NEXT_ACTION_CLAUDE_ASSISTANCE = "O3_ClaudeFurtherAssistance"
 NEXT_ACTION_FINAL_SUPPORT_OPTIONS = "O3_FinalSupportOptions"
 NEXT_ACTION_LIVE_AGENT_SUPPORT = "O3_LiveAgentSupport"
+NEXT_ACTION_MCP_ASSIST = "O3_McpAssist"
 
 ACTION_ID_ASSISTANCE_YES = "ivy_assistance_yes"
 ACTION_ID_ASSISTANCE_NO = "ivy_assistance_no"
 ACTION_ID_ASSISTANCE_SOLVED = "ivy_assistance_solved"
 ACTION_ID_ASSISTANCE_NEED_MORE_HELP = "ivy_assistance_need_more_help"
 ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET = "ivy_assistance_create_jira_ticket"
+ACTION_ID_MCP_ASSIST = "o3_request_mcp_assist"
+ACTION_ID_CLAUDE_ASSIST = "o3_request_claude_assist"
 ACTION_ID_LIVE_AGENT_SUPPORT = "ivy_live_agent_support"
 ACTION_ID_LIVE_AGENT_REPLY = "ivy_live_agent_reply"
 ACTION_ID_LIVE_AGENT_RESOLVE = "ivy_live_agent_resolve"
@@ -445,6 +468,10 @@ def maybe_send_ephemeral(channel, user, text, thread_ts=None):
 def interactive_processing_text(action_id):
     if action_id in {ACTION_ID_CREATE_JIRA_TICKET, ACTION_ID_ASSISTANCE_CREATE_JIRA_TICKET}:
         return "Creating Jira ticket..."
+    if action_id == ACTION_ID_MCP_ASSIST:
+        return None
+    if action_id == ACTION_ID_CLAUDE_ASSIST:
+        return "Asking Claude..."
     if action_id == ACTION_ID_LIVE_AGENT_SUPPORT:
         return "Connecting you to a live agent..."
     if action_id == ACTION_ID_CLOSE_AND_SUMMARIZE:
@@ -1251,7 +1278,39 @@ def assistance_reply_text(lex_reply):
     return f"{(lex_reply or '').strip()}\n\n{LEX_ASSISTANCE_PROMPT_TEXT}"
 
 
+def mcp_assist_available():
+    return ENABLE_MCP_ASSIST and bool(MCP_QUEUE_URL or MCP_ASSIST_FUNCTION_NAME)
+
+
+def assistance_help_button():
+    if mcp_assist_available():
+        return {
+            "type": "button",
+            "text": {
+                "type": "plain_text",
+                "text": "Search company knowledge"
+            },
+            "action_id": ACTION_ID_MCP_ASSIST,
+            "value": action_button_value("mcp_assist")
+        }
+
+    return {
+        "type": "button",
+        "text": {
+            "type": "plain_text",
+            "text": "I need more help"
+        },
+        "action_id": ACTION_ID_ASSISTANCE_NEED_MORE_HELP,
+        "value": action_button_value("need_more_help")
+    }
+
+
 def assistance_blocks(lex_reply, session_id=None, session_root_ts=None):
+    help_button = assistance_help_button()
+    if isinstance(help_button.get("value"), str):
+        action = parse_action_value(help_button["value"]).get("action") or help_button["value"]
+        help_button["value"] = action_button_value(action, session_id, session_root_ts)
+
     return [
         {
             "type": "section",
@@ -1280,14 +1339,61 @@ def assistance_blocks(lex_reply, session_id=None, session_root_ts=None):
                     "action_id": ACTION_ID_CLOSE_AND_SUMMARIZE,
                     "value": action_button_value("close_and_summarize", session_id, session_root_ts)
                 },
+                help_button
+            ]
+        }
+    ]
+
+
+def mcp_followup_reply_text(reply):
+    return (reply or "").strip()
+
+
+def mcp_followup_blocks(reply, session_id=None, session_root_ts=None, citations=None):
+    text = (reply or "").strip()
+    citation_lines = []
+    for index, citation in enumerate(citations or [], start=1):
+        if not isinstance(citation, dict):
+            continue
+        title = text_or_empty(citation.get("title")) or text_or_empty(citation.get("source")) or f"Source {index}"
+        url = text_or_empty(citation.get("url"))
+        if url:
+            citation_lines.append(f"{index}. <{url}|{slack_mrkdwn(title, 180)}>")
+        else:
+            citation_lines.append(f"{index}. {slack_mrkdwn(title, 180)}")
+
+    if citation_lines:
+        text = "\n\n*Sources:*\n" + "\n".join(citation_lines) if not text else text + "\n\n*Sources:*\n" + "\n".join(citation_lines)
+
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": slack_mrkdwn(text or "Company knowledge search completed.")
+            }
+        },
+        {
+            "type": "actions",
+            "block_id": "ivy_mcp_followup_actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Resolved"
+                    },
+                    "action_id": ACTION_ID_CLOSE_AND_SUMMARIZE,
+                    "value": action_button_value("close_and_summarize", session_id, session_root_ts)
+                },
                 {
                     "type": "button",
                     "text": {
                         "type": "plain_text",
                         "text": "I need more help"
                     },
-                    "action_id": ACTION_ID_ASSISTANCE_NEED_MORE_HELP,
-                    "value": action_button_value("need_more_help", session_id, session_root_ts)
+                    "action_id": ACTION_ID_CLAUDE_ASSIST,
+                    "value": action_button_value("claude_assist", session_id, session_root_ts)
                 }
             ]
         }
@@ -1822,6 +1928,52 @@ def invoke_rovo_enrichment(payload):
         "error_code": "rovo_lambda_invoke_rejected",
         "status_code": status_code
     }
+
+
+def invoke_mcp_assist(payload):
+    if not mcp_assist_available():
+        return {
+            "ok": False,
+            "error": "missing_mcp_assist_configuration",
+            "error_code": "missing_mcp_assist_configuration",
+        }
+
+    try:
+        if MCP_QUEUE_URL:
+            message = {
+                "QueueUrl": MCP_QUEUE_URL,
+                "MessageBody": json.dumps(payload, default=str),
+            }
+            if MCP_QUEUE_URL.endswith(".fifo"):
+                message["MessageGroupId"] = payload.get("session_id") or "mcp-assist"
+            sqs_client.send_message(**message)
+            return {"ok": True, "target": "sqs", "queue_url": MCP_QUEUE_URL}
+
+        response = lambda_client.invoke(
+            FunctionName=MCP_ASSIST_FUNCTION_NAME,
+            InvocationType="Event",
+            Payload=json.dumps(payload, default=str).encode("utf-8")
+        )
+        status_code = response.get("StatusCode")
+        return {
+            "ok": bool(status_code and 200 <= int(status_code) < 300),
+            "target": "lambda",
+            "status_code": status_code,
+        }
+
+    except ClientError as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "mcp_assist_enqueue_failed",
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "mcp_assist_enqueue_failed",
+        }
 
 
 def invoke_summarizer(payload):
@@ -2872,6 +3024,13 @@ def has_pending_assistance_details(session_item):
     )
 
 
+def has_pending_mcp_query(session_item):
+    return (
+        session_item.get("next_action") == NEXT_ACTION_MCP_ASSIST
+        and session_item.get("assistance_status") == "awaiting_mcp_query"
+    )
+
+
 def has_pending_final_support_options(session_item):
     return (
         session_item.get("next_action") == NEXT_ACTION_FINAL_SUPPORT_OPTIONS
@@ -2890,6 +3049,9 @@ def session_waits_for_dm_text(session_item, text=None):
         return True
 
     if has_pending_assistance_details(session_item):
+        return True
+
+    if has_pending_mcp_query(session_item):
         return True
 
     if has_jira_confirmation_state(session_item, text or ""):
@@ -3316,6 +3478,48 @@ def mark_rovo_invoke_failed(session_id, error, error_code):
         })
 
 
+def mark_mcp_invoke_failed(session_id, request_id, error, error_code):
+    failed_at = to_iso(datetime.now(timezone.utc))
+    try:
+        sessions_table.update_item(
+            Key={"session_id": session_id},
+            UpdateExpression="""
+                SET
+                    workflow_state = :workflow_state,
+                    mcp_status = :status,
+                    mcp_errors = :errors,
+                    mcp_completed_at = :failed_at,
+                    next_action = :next_action,
+                    updated_at = :failed_at,
+                    last_updated_at = :failed_at
+            """,
+            ExpressionAttributeValues={
+                ":workflow_state": "MCP_ERROR",
+                ":status": "ERROR",
+                ":errors": [{
+                    "source": "mcp",
+                    "category": error_code or "mcp_assist_enqueue_failed",
+                    "message": error or "MCP assist enqueue failed",
+                }],
+                ":failed_at": failed_at,
+                ":next_action": NEXT_ACTION_CLAUDE_ASSISTANCE,
+                ":request_id": request_id or "",
+            },
+            ConditionExpression="attribute_not_exists(mcp_request_id) OR mcp_request_id = :request_id",
+        )
+
+    except Exception as e:
+        log_json({
+            "level": "ERROR",
+            "message": "mcp_invoke_failure_update_failed",
+            "session_id": session_id,
+            "request_id": request_id,
+            "error": str(e),
+            "original_error": error,
+            "original_error_code": error_code,
+        })
+
+
 def store_rovo_slack_message_target(session_id, slack_ts, slack_text):
     if not (session_id and slack_ts):
         return
@@ -3496,6 +3700,23 @@ def base_interactive_result(session_item):
         "live_agent_error_code": None,
         "manual_close_summary": False,
         "manual_close_timeout_token": None,
+        "workflow_state": None,
+        "state_version": None,
+        "mcp_status": None,
+        "mcp_request_id": None,
+        "mcp_attempt_count": None,
+        "mcp_answer": None,
+        "mcp_confidence": None,
+        "mcp_confidence_reasons": None,
+        "mcp_sources_queried": None,
+        "mcp_sources_used": None,
+        "mcp_citations": None,
+        "mcp_errors": None,
+        "mcp_requested_at": None,
+        "mcp_started_at": None,
+        "mcp_completed_at": None,
+        "mcp_latency_ms": None,
+        "mcp_should_invoke": False,
     }
 
 
@@ -3542,6 +3763,74 @@ def build_assistance_claude_payload(session_item, body, session_id, followup_tex
             "conversation_status": "active",
             "trigger": "lex_assistance_details"
         }
+    }
+
+
+def make_mcp_request_id(session_id, event_id, action_id):
+    raw = "|".join([session_id or "", event_id or "", action_id or ACTION_ID_MCP_ASSIST])
+    return "mcp-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def terminal_mcp_status(value):
+    return value in {"ANSWER", "NO_ANSWER", "AUTH_REQUIRED", "PARTIAL", "ERROR"}
+
+
+def has_terminal_mcp_state(session_item):
+    return (
+        terminal_mcp_status(session_item.get("mcp_status"))
+        or session_item.get("workflow_state") in {
+            "MCP_ANSWERED",
+            "MCP_NO_ANSWER",
+            "MCP_AUTH_REQUIRED",
+            "MCP_PARTIAL",
+            "MCP_ERROR",
+        }
+    )
+
+
+def build_mcp_assist_payload(session_item, body, session_id, request_id, channel, thread_ts, user):
+    original_question = (
+        session_item.get("mcp_query_text")
+        or session_item.get("support_original_text")
+        or session_item.get("assistance_original_text")
+        or session_item.get("last_user_text")
+        or body.get("text")
+        or ""
+    )
+    lex_reply = (
+        session_item.get("assistance_lex_reply")
+        or session_item.get("last_bot_reply")
+        or ""
+    )
+    transcript = request_summary_transcript(session_item, limit=12)
+    return {
+        "schema_version": "1.0",
+        "request_id": request_id,
+        "session_id": session_id,
+        "question": original_question,
+        "lex": {
+            "intent": session_item.get("assistance_lex_intent") or session_item.get("lex_intent"),
+            "state": session_item.get("assistance_lex_state") or session_item.get("lex_state"),
+            "slots": session_item.get("assistance_lex_slots") or session_item.get("lex_slots", {}),
+            "reply": lex_reply,
+        },
+        "slack": {
+            "channel_id": channel,
+            "thread_ts": thread_ts,
+            "user_id": user,
+            "message_ts": body.get("message_ts") or body.get("ts"),
+        },
+        "conversation": {
+            "thread_messages": transcript,
+            "conversation_type": body.get("conversation_type") or body.get("channel_type"),
+        },
+        "access_policy": {
+            "identity_mode": os.environ.get("MCP_IDENTITY_MODE", "mixed"),
+        },
+        "correlation": {
+            "event_id": body.get("event_id"),
+            "action_id": body.get("action_id"),
+        },
     }
 
 
@@ -4567,6 +4856,140 @@ def handle_interactive_action(session_item, body, session_id):
             "reply": LEX_ASSISTANCE_CLOSED_REPLY,
             "assistance_status": "closed",
             "assistance_closed_at": now_iso,
+        })
+        return result
+
+    if action_id == ACTION_ID_MCP_ASSIST:
+        if not (
+            has_pending_assistance_confirmation(session_item)
+            or session_item.get("next_action") in {NEXT_ACTION_CLAUDE_ASSISTANCE, NEXT_ACTION_MCP_ASSIST}
+            or session_item.get("response_source") == "lex"
+        ):
+            return result
+
+        request_id = session_item.get("mcp_request_id") or make_mcp_request_id(
+            session_id,
+            body.get("event_id"),
+            action_id,
+        )
+        original_text = session_item.get("assistance_original_text") or session_item.get("last_user_text")
+        raw_text = session_item.get("assistance_raw_text") or session_item.get("last_raw_user_text") or original_text
+        lex_reply = session_item.get("assistance_lex_reply") or session_item.get("last_bot_reply")
+
+        if not mcp_assist_available():
+            result.update({
+                "lex_state": "Failed",
+                "response_source": "mcp_assist_unconfigured",
+                "next_action": NEXT_ACTION_CLAUDE_ASSISTANCE,
+                "reply": mcp_followup_reply_text(MCP_ASSIST_NOT_CONFIGURED_REPLY),
+                "blocks": mcp_followup_blocks(
+                    MCP_ASSIST_NOT_CONFIGURED_REPLY,
+                    session_id,
+                    session_item.get("session_root_ts") or session_item.get("thread_ts"),
+                ),
+                "workflow_state": "MCP_ERROR",
+                "mcp_status": "ERROR",
+                "mcp_request_id": request_id,
+                "mcp_errors": [{"source": "mcp", "category": "missing_configuration"}],
+                "mcp_requested_at": now_iso,
+                "mcp_completed_at": now_iso,
+                "support_original_text": original_text,
+                "support_raw_text": raw_text,
+                "support_lex_intent": session_item.get("assistance_lex_intent") or session_item.get("lex_intent"),
+                "support_lex_state": session_item.get("assistance_lex_state") or session_item.get("lex_state"),
+                "support_lex_slots": session_item.get("assistance_lex_slots") or session_item.get("lex_slots", {}),
+                "support_lex_reply": lex_reply,
+            })
+            return result
+
+        result.update({
+            "lex_state": "InProgress",
+            "response_source": "mcp_assist_details_requested",
+            "next_action": NEXT_ACTION_MCP_ASSIST,
+            "reply": MCP_ASSIST_DETAILS_PROMPT_TEXT,
+            "workflow_state": "MCP_AWAITING_QUERY",
+            "mcp_status": "AWAITING_QUERY",
+            "mcp_request_id": request_id,
+            "mcp_requested_at": now_iso,
+            "mcp_should_invoke": False,
+            "assistance_status": "awaiting_mcp_query",
+            "assistance_original_text": original_text,
+            "assistance_raw_text": raw_text,
+            "assistance_lex_intent": session_item.get("assistance_lex_intent") or session_item.get("lex_intent"),
+            "assistance_lex_state": session_item.get("assistance_lex_state") or session_item.get("lex_state"),
+            "assistance_lex_slots": session_item.get("assistance_lex_slots") or session_item.get("lex_slots", {}),
+            "assistance_lex_reply": lex_reply,
+            "assistance_requested_at": session_item.get("assistance_requested_at") or now_iso,
+            "support_original_text": original_text,
+            "support_raw_text": raw_text,
+            "support_lex_intent": session_item.get("assistance_lex_intent") or session_item.get("lex_intent"),
+            "support_lex_state": session_item.get("assistance_lex_state") or session_item.get("lex_state"),
+            "support_lex_slots": session_item.get("assistance_lex_slots") or session_item.get("lex_slots", {}),
+            "support_lex_reply": lex_reply,
+            "support_requested_at": now_iso,
+        })
+        return result
+
+    if action_id == ACTION_ID_CLAUDE_ASSIST:
+        if not has_terminal_mcp_state(session_item):
+            return result
+
+        original_text = (
+            session_item.get("support_original_text")
+            or session_item.get("assistance_original_text")
+            or session_item.get("last_user_text")
+        )
+        raw_text = (
+            session_item.get("support_raw_text")
+            or session_item.get("assistance_raw_text")
+            or session_item.get("last_raw_user_text")
+            or original_text
+        )
+        result.update({
+            "lex_state": "InProgress",
+            "response_source": "assistance_details_requested",
+            "next_action": NEXT_ACTION_CLAUDE_ASSISTANCE,
+            "reply": LEX_ASSISTANCE_DETAILS_PROMPT_TEXT,
+            "assistance_status": "awaiting_details",
+            "assistance_original_text": original_text,
+            "assistance_raw_text": raw_text,
+            "assistance_lex_intent": session_item.get("assistance_lex_intent") or session_item.get("support_lex_intent") or session_item.get("lex_intent"),
+            "assistance_lex_state": session_item.get("assistance_lex_state") or session_item.get("support_lex_state") or session_item.get("lex_state"),
+            "assistance_lex_slots": session_item.get("assistance_lex_slots") or session_item.get("support_lex_slots") or session_item.get("lex_slots", {}),
+            "assistance_lex_reply": (
+                session_item.get("mcp_answer")
+                or session_item.get("assistance_lex_reply")
+                or session_item.get("support_lex_reply")
+                or session_item.get("last_bot_reply")
+            ),
+            "assistance_requested_at": session_item.get("assistance_requested_at") or now_iso,
+            "support_original_text": original_text,
+            "support_raw_text": raw_text,
+            "support_lex_intent": session_item.get("support_lex_intent") or session_item.get("assistance_lex_intent") or session_item.get("lex_intent"),
+            "support_lex_state": session_item.get("support_lex_state") or session_item.get("assistance_lex_state") or session_item.get("lex_state"),
+            "support_lex_slots": session_item.get("support_lex_slots") or session_item.get("assistance_lex_slots") or session_item.get("lex_slots", {}),
+            "support_lex_reply": (
+                session_item.get("mcp_answer")
+                or session_item.get("support_lex_reply")
+                or session_item.get("assistance_lex_reply")
+                or session_item.get("last_bot_reply")
+            ),
+            "support_requested_at": now_iso,
+            "workflow_state": session_item.get("workflow_state"),
+            "mcp_status": session_item.get("mcp_status"),
+            "mcp_request_id": session_item.get("mcp_request_id"),
+            "mcp_answer": session_item.get("mcp_answer"),
+            "mcp_confidence": session_item.get("mcp_confidence"),
+            "mcp_confidence_reasons": session_item.get("mcp_confidence_reasons"),
+            "mcp_sources_queried": session_item.get("mcp_sources_queried"),
+            "mcp_sources_used": session_item.get("mcp_sources_used"),
+            "mcp_citations": session_item.get("mcp_citations"),
+            "mcp_errors": session_item.get("mcp_errors"),
+            "mcp_requested_at": session_item.get("mcp_requested_at"),
+            "mcp_started_at": session_item.get("mcp_started_at"),
+            "mcp_completed_at": session_item.get("mcp_completed_at"),
+            "mcp_latency_ms": session_item.get("mcp_latency_ms"),
+            "claude_fallback_attempted": False,
         })
         return result
 
@@ -5958,6 +6381,23 @@ def process_record(record):
     manual_close_summary = False
     manual_close_timeout_token = None
     processing_message = None
+    workflow_state = None
+    state_version = None
+    mcp_status = None
+    mcp_request_id = None
+    mcp_attempt_count = None
+    mcp_answer = None
+    mcp_confidence = None
+    mcp_confidence_reasons = None
+    mcp_sources_queried = None
+    mcp_sources_used = None
+    mcp_citations = None
+    mcp_errors = None
+    mcp_requested_at = None
+    mcp_started_at = None
+    mcp_completed_at = None
+    mcp_latency_ms = None
+    mcp_should_invoke = False
 
     if is_interactive_action:
         processing_text = interactive_processing_text(action_id)
@@ -6058,6 +6498,23 @@ def process_record(record):
         live_agent_error_code = interactive_result.get("live_agent_error_code")
         manual_close_summary = interactive_result.get("manual_close_summary", False)
         manual_close_timeout_token = interactive_result.get("manual_close_timeout_token")
+        workflow_state = interactive_result.get("workflow_state")
+        state_version = interactive_result.get("state_version")
+        mcp_status = interactive_result.get("mcp_status")
+        mcp_request_id = interactive_result.get("mcp_request_id")
+        mcp_attempt_count = interactive_result.get("mcp_attempt_count")
+        mcp_answer = interactive_result.get("mcp_answer")
+        mcp_confidence = interactive_result.get("mcp_confidence")
+        mcp_confidence_reasons = interactive_result.get("mcp_confidence_reasons")
+        mcp_sources_queried = interactive_result.get("mcp_sources_queried")
+        mcp_sources_used = interactive_result.get("mcp_sources_used")
+        mcp_citations = interactive_result.get("mcp_citations")
+        mcp_errors = interactive_result.get("mcp_errors")
+        mcp_requested_at = interactive_result.get("mcp_requested_at")
+        mcp_started_at = interactive_result.get("mcp_started_at")
+        mcp_completed_at = interactive_result.get("mcp_completed_at")
+        mcp_latency_ms = interactive_result.get("mcp_latency_ms")
+        mcp_should_invoke = interactive_result.get("mcp_should_invoke", False)
 
         log_json({
             "level": "INFO",
@@ -6310,6 +6767,53 @@ def process_record(record):
             "image_match_fallback_reason": image_match_fallback_reason,
             "image_file_count": len(image_files),
             "error_code": image_error_code
+        })
+
+    elif has_pending_mcp_query(existing_session) and text:
+        assistance_details_handled = True
+        now_mcp = to_iso(datetime.now(timezone.utc))
+        request_id = make_mcp_request_id(session_id, event_id, ACTION_ID_MCP_ASSIST)
+        mcp_query_text = text
+        mcp_query_raw_text = raw_text
+        original_text = existing_session.get("assistance_original_text") or existing_session.get("last_user_text")
+
+        lex_intent = existing_session.get("assistance_lex_intent") or existing_session.get("lex_intent") or "McpAssist"
+        lex_state = "InProgress"
+        lex_slots = existing_session.get("assistance_lex_slots") or existing_session.get("lex_slots", {})
+        lex_session_attributes = {}
+        lex_reply = MCP_ASSIST_PROGRESS_REPLY
+        lex_reply_empty = False
+        response_source = "mcp_assist_queued"
+        next_action = NEXT_ACTION_MCP_ASSIST
+        workflow_state = "MCP_QUEUED"
+        mcp_status = "QUEUED"
+        mcp_request_id = request_id
+        mcp_attempt_count = int(existing_session.get("mcp_attempt_count") or 0) + 1
+        mcp_requested_at = now_mcp
+        mcp_should_invoke = True
+        assistance_status = "mcp_queued"
+        assistance_original_text = original_text
+        assistance_raw_text = existing_session.get("assistance_raw_text") or existing_session.get("last_raw_user_text") or original_text
+        assistance_lex_intent = existing_session.get("assistance_lex_intent") or existing_session.get("lex_intent")
+        assistance_lex_state = existing_session.get("assistance_lex_state") or existing_session.get("lex_state")
+        assistance_lex_slots = existing_session.get("assistance_lex_slots") or existing_session.get("lex_slots", {})
+        assistance_lex_reply = existing_session.get("assistance_lex_reply") or existing_session.get("last_bot_reply")
+        assistance_requested_at = existing_session.get("assistance_requested_at") or now_mcp
+        support_original_text_value = mcp_query_text
+        support_raw_text_value = mcp_query_raw_text
+        support_lex_intent = assistance_lex_intent
+        support_lex_state = assistance_lex_state
+        support_lex_slots = assistance_lex_slots
+        support_lex_reply = assistance_lex_reply
+        support_requested_at = now_mcp
+
+        log_json({
+            "level": "INFO",
+            "message": "mcp_query_received",
+            "event_id": event_id,
+            "session_id": session_id,
+            "mcp_request_id": mcp_request_id,
+            "query": mcp_query_text,
         })
 
     elif has_pending_assistance_details(existing_session) and text:
@@ -6646,7 +7150,7 @@ def process_record(record):
         conversation_status = "active"
     if jira_status in {"pending_confirmation", "creating"}:
         conversation_status = "active"
-    if assistance_status in {"pending_confirmation", "awaiting_details"}:
+    if assistance_status in {"pending_confirmation", "awaiting_details", "awaiting_mcp_query"}:
         conversation_status = "active"
     if support_options_status in {"pending", "creating_jira", "live_agent_creating", "live_agent_requested"}:
         conversation_status = "active"
@@ -6674,7 +7178,7 @@ def process_record(record):
         session_state = SESSION_STATE_WAITING_FOR_USER
     elif assistance_status == "pending_confirmation":
         session_state = SESSION_STATE_WAITING_FOR_USER
-    elif assistance_status == "awaiting_details" or support_options_status in {"pending", "creating_jira", "live_agent_creating"}:
+    elif assistance_status in {"awaiting_details", "awaiting_mcp_query"} or support_options_status in {"pending", "creating_jira", "live_agent_creating"}:
         session_state = SESSION_STATE_COLLECTING_DETAILS
     elif conversation_status == "closed":
         session_state = SESSION_STATE_CLOSED
@@ -6693,7 +7197,7 @@ def process_record(record):
         )
         jira_requested_at = jira_requested_at or updated_at
 
-    if assistance_status in {"pending_confirmation", "awaiting_details"}:
+    if assistance_status in {"pending_confirmation", "awaiting_details", "awaiting_mcp_query"}:
         assistance_requested_at = assistance_requested_at or updated_at
 
     if support_options_status == "pending":
@@ -7116,6 +7620,39 @@ def process_record(record):
         else:
             remove_attributes.append(attribute_name)
 
+    mcp_flow_attributes = {
+        "workflow_state": workflow_state,
+        "state_version": state_version,
+        "mcp_status": mcp_status,
+        "mcp_request_id": mcp_request_id,
+        "mcp_attempt_count": mcp_attempt_count,
+        "mcp_answer": mcp_answer,
+        "mcp_confidence": mcp_confidence,
+        "mcp_confidence_reasons": mcp_confidence_reasons,
+        "mcp_sources_queried": mcp_sources_queried,
+        "mcp_sources_used": mcp_sources_used,
+        "mcp_citations": mcp_citations,
+        "mcp_errors": mcp_errors,
+        "mcp_requested_at": mcp_requested_at,
+        "mcp_started_at": mcp_started_at,
+        "mcp_completed_at": mcp_completed_at,
+        "mcp_latency_ms": mcp_latency_ms,
+        "last_action_id": action_id if is_interactive_action else None,
+        "last_slack_event_id": event_id if is_interactive_action else None,
+        "last_updated_at": updated_at,
+    }
+
+    for attribute_name, attribute_value in mcp_flow_attributes.items():
+        if attribute_value is None:
+            continue
+
+        value_name = f":{attribute_name}"
+        update_expression += f"""
+            ,
+            {attribute_name} = {value_name}
+        """
+        expression_attribute_values[value_name] = attribute_value
+
     live_agent_ticket_attributes = {
         "live_agent_ticket_key": live_agent_ticket_key,
         "live_agent_ticket_url": live_agent_ticket_url,
@@ -7246,6 +7783,27 @@ def process_record(record):
 
         compact_optional_attributes = {
             "next_action": next_action,
+            "assistance_status": assistance_status,
+            "assistance_original_text": assistance_original_text,
+            "assistance_raw_text": assistance_raw_text,
+            "assistance_lex_intent": assistance_lex_intent,
+            "assistance_lex_state": assistance_lex_state,
+            "assistance_lex_slots": assistance_lex_slots,
+            "assistance_lex_reply": assistance_lex_reply,
+            "assistance_requested_at": assistance_requested_at,
+            "assistance_closed_at": assistance_closed_at,
+            "assistance_resolved_at": assistance_resolved_at,
+            "support_options_status": support_options_status,
+            "support_original_text": support_original_text_value,
+            "support_raw_text": support_raw_text_value,
+            "support_lex_intent": support_lex_intent,
+            "support_lex_state": support_lex_state,
+            "support_lex_slots": support_lex_slots,
+            "support_lex_reply": support_lex_reply,
+            "support_claude_reply": support_claude_reply,
+            "support_claude_error": support_claude_error,
+            "support_requested_at": support_requested_at,
+            "support_resolved_at": support_resolved_at,
             "jira_status": jira_status,
             "jira_intent_name": jira_intent_name,
             "jira_request_text": jira_request_text,
@@ -7278,6 +7836,25 @@ def process_record(record):
             "last_live_agent_ticket_url": last_live_agent_ticket_url,
             "live_agent_error": live_agent_error,
             "live_agent_error_code": live_agent_error_code,
+            "workflow_state": workflow_state,
+            "state_version": state_version,
+            "mcp_status": mcp_status,
+            "mcp_request_id": mcp_request_id,
+            "mcp_attempt_count": mcp_attempt_count,
+            "mcp_answer": mcp_answer,
+            "mcp_confidence": mcp_confidence,
+            "mcp_confidence_reasons": mcp_confidence_reasons,
+            "mcp_sources_queried": mcp_sources_queried,
+            "mcp_sources_used": mcp_sources_used,
+            "mcp_citations": mcp_citations,
+            "mcp_errors": mcp_errors,
+            "mcp_requested_at": mcp_requested_at,
+            "mcp_started_at": mcp_started_at,
+            "mcp_completed_at": mcp_completed_at,
+            "mcp_latency_ms": mcp_latency_ms,
+            "last_action_id": action_id if is_interactive_action else None,
+            "last_slack_event_id": event_id if is_interactive_action else None,
+            "last_updated_at": updated_at,
         }
 
         compact_remove_attributes = []
@@ -7324,6 +7901,46 @@ def process_record(record):
                 "live_agent_updated_at",
                 "last_live_agent_ticket_key",
                 "last_live_agent_ticket_url",
+                "assistance_status",
+                "assistance_original_text",
+                "assistance_raw_text",
+                "assistance_lex_intent",
+                "assistance_lex_state",
+                "assistance_lex_slots",
+                "assistance_lex_reply",
+                "assistance_requested_at",
+                "assistance_closed_at",
+                "assistance_resolved_at",
+                "support_options_status",
+                "support_original_text",
+                "support_raw_text",
+                "support_lex_intent",
+                "support_lex_state",
+                "support_lex_slots",
+                "support_lex_reply",
+                "support_claude_reply",
+                "support_claude_error",
+                "support_requested_at",
+                "support_resolved_at",
+                "workflow_state",
+                "state_version",
+                "mcp_status",
+                "mcp_request_id",
+                "mcp_attempt_count",
+                "mcp_answer",
+                "mcp_confidence",
+                "mcp_confidence_reasons",
+                "mcp_sources_queried",
+                "mcp_sources_used",
+                "mcp_citations",
+                "mcp_errors",
+                "mcp_requested_at",
+                "mcp_started_at",
+                "mcp_completed_at",
+                "mcp_latency_ms",
+                "last_action_id",
+                "last_slack_event_id",
+                "last_updated_at",
             }
         ]
         if compact_remove_attributes:
@@ -7365,6 +7982,70 @@ def process_record(record):
             upsert_active_dm_session(channel, user, session_id, session_root_ts, updated_at)
         else:
             delete_active_dm_session(channel, user)
+
+    if mcp_should_invoke:
+        mcp_payload = build_mcp_assist_payload(
+            {
+                **existing_session,
+                "assistance_original_text": assistance_original_text,
+                "assistance_raw_text": assistance_raw_text,
+                "assistance_lex_intent": assistance_lex_intent,
+                "assistance_lex_state": assistance_lex_state,
+                "assistance_lex_slots": assistance_lex_slots,
+                "assistance_lex_reply": assistance_lex_reply,
+                "mcp_query_text": support_original_text_value,
+                "last_user_text": support_original_text_value or assistance_original_text or existing_session.get("last_user_text"),
+                "last_raw_user_text": support_raw_text_value or assistance_raw_text or existing_session.get("last_raw_user_text"),
+                "last_bot_reply": assistance_lex_reply or existing_session.get("last_bot_reply"),
+                "session_messages": existing_session.get("session_messages") or [],
+            },
+            body,
+            session_id,
+            mcp_request_id,
+            channel,
+            session_thread_ts,
+            user,
+        )
+        mcp_invoke_result = invoke_mcp_assist(mcp_payload)
+        if mcp_invoke_result.get("ok"):
+            log_json({
+                "level": "INFO",
+                "message": "mcp_assist_invoked",
+                "event_id": event_id,
+                "session_id": session_id,
+                "mcp_request_id": mcp_request_id,
+                "target": mcp_invoke_result.get("target"),
+            })
+        else:
+            mark_mcp_invoke_failed(
+                session_id,
+                mcp_request_id,
+                mcp_invoke_result.get("error"),
+                mcp_invoke_result.get("error_code"),
+            )
+            response_source = "mcp_assist_failed"
+            workflow_state = "MCP_ERROR"
+            mcp_status = "ERROR"
+            mcp_errors = [{
+                "source": "mcp",
+                "category": mcp_invoke_result.get("error_code") or "mcp_assist_enqueue_failed",
+            }]
+            next_action = NEXT_ACTION_CLAUDE_ASSISTANCE
+            lex_reply = mcp_followup_reply_text(MCP_ASSIST_FAILED_REPLY)
+            slack_blocks = mcp_followup_blocks(
+                MCP_ASSIST_FAILED_REPLY,
+                session_id,
+                session_root_ts,
+            )
+            log_json({
+                "level": "ERROR",
+                "message": "mcp_assist_invoke_failed",
+                "event_id": event_id,
+                "session_id": session_id,
+                "mcp_request_id": mcp_request_id,
+                "error": mcp_invoke_result.get("error"),
+                "error_code": mcp_invoke_result.get("error_code"),
+            })
 
     if rovo_should_invoke:
         rovo_payload = build_rovo_payload(
@@ -7467,6 +8148,10 @@ def process_record(record):
         "rovo_status": rovo_status,
         "rovo_error": rovo_error,
         "rovo_error_code": rovo_error_code,
+        "workflow_state": workflow_state,
+        "mcp_status": mcp_status,
+        "mcp_request_id": mcp_request_id,
+        "mcp_error_count": len(mcp_errors or []),
         "image_status": image_status,
         "image_resolution_source": image_resolution_source,
         "image_match_issue_id": image_match_issue_id,
