@@ -292,6 +292,7 @@ def feedback_modal_metadata(payload, action):
     metadata = {
         **action_payload,
         "user": user.get("id"),
+        "user_name": user.get("username") or user.get("name") or "",
         "channel": channel.get("id"),
     }
     return metadata
@@ -460,6 +461,7 @@ def enqueue_feedback_submission(payload):
             "routing_reason": "feedback_submission",
             "channel": metadata.get("channel"),
             "user": user.get("id") or metadata.get("user"),
+            "user_name": metadata.get("user_name") or user.get("username") or user.get("name"),
             "feedback_rating": metadata.get("rating"),
             "feedback_text": extract_feedback_text(view),
             "feedback_metadata": metadata,
