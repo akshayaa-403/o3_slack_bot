@@ -63,6 +63,13 @@ MCP_SHAREPOINT_ALLOWED_DRIVES = os.environ.get("MCP_SHAREPOINT_ALLOWED_DRIVES", 
 MCP_SHAREPOINT_ALLOWED_LISTS = os.environ.get("MCP_SHAREPOINT_ALLOWED_LISTS", "")
 MCP_SHAREPOINT_ALLOWED_TOOLS = os.environ.get("MCP_SHAREPOINT_ALLOWED_TOOLS", "search,fetch")
 MCP_SHAREPOINT_AUTH_SECRET_ID = os.environ.get("MCP_SHAREPOINT_AUTH_SECRET_ID", "").strip()
+MCP_SHAREPOINT_TOKEN_SCOPE = os.environ.get(
+    "MCP_SHAREPOINT_TOKEN_SCOPE",
+    "https://agent365.svc.cloud.microsoft/.default",
+).strip()
+MS_GRAPH_TENANT_ID = os.environ.get("MS_GRAPH_TENANT_ID", "").strip()
+MS_GRAPH_CLIENT_ID = os.environ.get("MS_GRAPH_CLIENT_ID", "").strip()
+MS_GRAPH_CLIENT_SECRET_ID = os.environ.get("MS_GRAPH_CLIENT_SECRET_ID", "").strip()
 
 MCP_SLACK_ENABLED = os.environ.get("MCP_SLACK_ENABLED", "false").lower() == "true"
 MCP_SLACK_SERVER_URL = os.environ.get("MCP_SLACK_SERVER_URL", "").strip()
@@ -80,6 +87,7 @@ sessions_table = dynamodb.Table(DYNAMODB_TABLE)
 
 # Warm Lambda execution environments reuse this metadata cache.
 _MCP_TOOL_CACHE = {}
+_AUTH_TOKEN_CACHE = {}
 
 
 def utc_now_iso():
@@ -124,6 +132,74 @@ def get_secret_token(secret_id):
     except ValueError:
         pass
     return secret.strip()
+
+
+def get_secret_string(secret_id):
+    if not secret_id:
+        return ""
+    response = secretsmanager.get_secret_value(SecretId=secret_id)
+    return (response.get("SecretString") or "").strip()
+
+
+def microsoft_client_secret():
+    secret = get_secret_string(MS_GRAPH_CLIENT_SECRET_ID)
+    if not secret:
+        return ""
+    try:
+        parsed = json.loads(secret)
+        for key in ("client_secret", "secret", "value"):
+            if parsed.get(key):
+                return str(parsed[key]).strip()
+    except ValueError:
+        pass
+    return secret
+
+
+def microsoft_sharepoint_mcp_token():
+    if not (MS_GRAPH_TENANT_ID and MS_GRAPH_CLIENT_ID and MS_GRAPH_CLIENT_SECRET_ID and MCP_SHAREPOINT_TOKEN_SCOPE):
+        return ""
+
+    cache_key = ("sharepoint", MS_GRAPH_TENANT_ID, MS_GRAPH_CLIENT_ID, MCP_SHAREPOINT_TOKEN_SCOPE)
+    cached = _AUTH_TOKEN_CACHE.get(cache_key)
+    now = time.time()
+    if cached and cached.get("expires_at", 0) > now + 60:
+        return cached.get("access_token", "")
+
+    client_secret = microsoft_client_secret()
+    if not client_secret:
+        return ""
+
+    token_url = f"https://login.microsoftonline.com/{urllib.parse.quote(MS_GRAPH_TENANT_ID, safe='')}/oauth2/v2.0/token"
+    form = urllib.parse.urlencode({
+        "client_id": MS_GRAPH_CLIENT_ID,
+        "client_secret": client_secret,
+        "grant_type": "client_credentials",
+        "scope": MCP_SHAREPOINT_TOKEN_SCOPE,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        token_url,
+        data=form,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    access_token = text_or_empty(payload.get("access_token"))
+    if access_token:
+        _AUTH_TOKEN_CACHE[cache_key] = {
+            "access_token": access_token,
+            "expires_at": now + int(payload.get("expires_in") or 3600),
+        }
+    return access_token
+
+
+def provider_bearer_token(provider):
+    if provider.name == "sharepoint":
+        token = microsoft_sharepoint_mcp_token()
+        if token:
+            return token
+    return get_secret_token(provider.auth_secret_id)
 
 
 def slack_api(method, payload):
@@ -317,7 +393,7 @@ def json_safe_policy(policy):
 
 
 def mcp_tool_call(provider, tool_name, arguments):
-    token = get_secret_token(provider.auth_secret_id)
+    token = provider_bearer_token(provider)
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
@@ -354,7 +430,7 @@ def mcp_tool_call(provider, tool_name, arguments):
 
 
 def mcp_post(provider, method, params=None, session_id=None):
-    token = get_secret_token(provider.auth_secret_id)
+    token = provider_bearer_token(provider)
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
@@ -391,7 +467,7 @@ def mcp_post(provider, method, params=None, session_id=None):
 
 def mcp_notify(provider, method, params=None, session_id=None):
     """Send an MCP JSON-RPC notification (no request id and no response required)."""
-    token = get_secret_token(provider.auth_secret_id)
+    token = provider_bearer_token(provider)
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
@@ -828,6 +904,192 @@ def build_fetch_arguments(tool, candidate):
     return {key: value for key, value in arguments.items() if value not in (None, "")}
 
 
+def tool_named(tools, *names):
+    return tool_by_preference(tools, names)
+
+
+def sharepoint_search_arguments(tool, question, provider):
+    properties = tool_properties(tool)
+    arguments = {}
+    for key in ("searchQuery", "query", "searchText", "search"):
+        if key in properties:
+            arguments[key] = question
+            break
+    if not arguments:
+        arguments["searchQuery"] = question
+
+    sites = sorted(provider.policy.get("sites") or [])
+    if len(sites) == 1 and "siteId" in properties:
+        arguments["siteId"] = sites[0]
+    for key in ("limit", "top", "maxResults", "max_results"):
+        if key in properties:
+            arguments[key] = min(MCP_SEARCH_CANDIDATE_LIMIT, 20)
+            break
+    return arguments
+
+
+def normalize_sharepoint_candidate(provider, item, provider_rank=0):
+    if not isinstance(item, dict):
+        return {}
+    raw = item
+    file_id = deep_first_value(raw, "fileId", "fileOrFolderId", "driveItemId", "itemId", "id", max_depth=6)
+    drive_id = deep_first_value(raw, "documentLibraryId", "driveId", "parentDriveId", max_depth=6)
+    site_id = deep_first_value(raw, "siteId", "site", "sharepointSiteId", max_depth=6)
+    list_id = deep_first_value(raw, "listId", "sharepointListId", max_depth=6)
+    title = deep_first_value(raw, "name", "title", "displayName", "summary", max_depth=6)
+    url = deep_first_value(raw, "webUrl", "url", "fileOrFolderUrl", "shareUrl", "permalink", max_depth=6)
+    snippet = deep_first_value(raw, "snippet", "excerpt", "description", "text", "summary", max_depth=6)
+    return {
+        "provider": provider.name,
+        "id": file_id,
+        "title": title,
+        "url": url,
+        "snippet": snippet,
+        "site": site_id,
+        "drive": drive_id,
+        "list": list_id,
+        "updated_at": deep_first_value(raw, "lastModifiedDateTime", "updatedAt", "updated_at", max_depth=6),
+        "provider_rank": provider_rank,
+        "raw": raw,
+    }
+
+
+def sharepoint_fetch_arguments(tool, candidate):
+    properties = tool_properties(tool)
+    tool_name = text_or_empty((tool or {}).get("name"))
+    file_id = candidate.get("id")
+    drive_id = candidate.get("drive")
+    url = candidate.get("url")
+    arguments = {}
+
+    if tool_name == "getFileOrFolderMetadataByUrl" or "fileOrFolderUrl" in properties:
+        if url:
+            arguments["fileOrFolderUrl"] = url
+        return arguments
+
+    for key in ("fileId", "fileOrFolderId", "driveItemId", "itemId", "id"):
+        if key in properties and file_id:
+            arguments[key] = file_id
+            break
+    if not any(key in arguments for key in ("fileId", "fileOrFolderId", "driveItemId", "itemId", "id")) and file_id:
+        arguments["fileId" if tool_name == "readSmallTextFile" else "fileOrFolderId"] = file_id
+
+    for key in ("documentLibraryId", "driveId"):
+        if key in properties and drive_id:
+            arguments[key] = drive_id
+            break
+    if not any(key in arguments for key in ("documentLibraryId", "driveId")) and drive_id:
+        arguments["documentLibraryId"] = drive_id
+    return arguments
+
+
+def sharepoint_text_from_payload(payload):
+    if isinstance(payload, str):
+        return payload
+    if not isinstance(payload, dict):
+        return ""
+    text = deep_first_value(
+        payload,
+        "contentText",
+        "text",
+        "content",
+        "body",
+        "description",
+        "summary",
+        max_depth=8,
+    )
+    if text:
+        return text
+    if payload:
+        return json.dumps(payload, default=str)
+    return ""
+
+
+def sharepoint_evidence(provider, request_context):
+    question = text_or_empty(request_context.get("question"))
+    if not question:
+        return [], {"source": provider.name, "category": "missing_question"}
+
+    session_id = initialize_mcp(provider)
+    tools = mcp_tool_catalog(provider, session_id)
+    search_tool = tool_named(tools, "findFileOrFolder")
+    read_tool = tool_named(tools, "readSmallTextFile")
+    metadata_tool = tool_named(tools, "getFileOrFolderMetadata")
+    metadata_by_url_tool = tool_named(tools, "getFileOrFolderMetadataByUrl")
+    fetch_tool = read_tool or metadata_tool or metadata_by_url_tool
+    if not search_tool:
+        return [], {"source": provider.name, "category": "missing_sharepoint_search_tool"}
+
+    search_started = time.time()
+    search_payload = call_session_tool(
+        provider,
+        session_id,
+        search_tool,
+        sharepoint_search_arguments(search_tool, question, provider),
+    )
+    candidates = []
+    for index, item in enumerate(result_items(search_payload)[:MCP_SEARCH_CANDIDATE_LIMIT]):
+        candidate = normalize_sharepoint_candidate(provider, item, index)
+        if candidate and allowed_result(provider, candidate):
+            candidates.append(candidate)
+
+    ranked_candidates = rank_search_candidates(question, deduplicate_candidates(candidates))
+    selected = ranked_candidates[:fetch_limit_for_ranked_candidates(ranked_candidates)]
+
+    evidence = []
+    fetch_started = time.time()
+    for candidate in selected:
+        fetched = {}
+        if fetch_tool:
+            fetch_args = sharepoint_fetch_arguments(fetch_tool, candidate)
+            if fetch_args:
+                fetched = call_session_tool(provider, session_id, fetch_tool, fetch_args)
+        fetched_map = fetched if isinstance(fetched, dict) else {}
+        text = sharepoint_text_from_payload(fetched) or candidate.get("snippet")
+        url = (
+            deep_first_value(fetched_map, "webUrl", "url", "fileOrFolderUrl", "shareUrl", "permalink", max_depth=6)
+            or candidate.get("url")
+        )
+        title = (
+            deep_first_value(fetched_map, "name", "title", "displayName", "summary", max_depth=6)
+            or candidate.get("title")
+        )
+        evidence.append({
+            "provider": provider.name,
+            "title": title,
+            "url": url,
+            "text": text,
+            "updated_at": (
+                deep_first_value(fetched_map, "lastModifiedDateTime", "updatedAt", "updated_at", max_depth=6)
+                or candidate.get("updated_at")
+            ),
+            "locator": title,
+            "authority": "official_support_document",
+            "raw_result_id": candidate.get("id"),
+            "retrieval_score": candidate.get("retrieval_score", 0),
+        })
+
+    log_json({
+        "level": "INFO",
+        "message": "sharepoint_search_pipeline",
+        "query": question,
+        "candidate_count": len(ranked_candidates),
+        "fetched_count": len(evidence),
+        "search_tool": search_tool.get("name") if search_tool else "",
+        "fetch_tool": fetch_tool.get("name") if fetch_tool else "",
+        "top_candidate_title": ranked_candidates[0].get("title") if ranked_candidates else "",
+        "top_candidate_score": round(ranked_candidates[0].get("retrieval_score", 0), 3) if ranked_candidates else 0,
+        "search_ms": int((fetch_started - search_started) * 1000),
+        "fetch_ms": int((time.time() - fetch_started) * 1000),
+    })
+
+    if not ranked_candidates:
+        return [], {"source": provider.name, "category": "search_empty"}
+    if not evidence:
+        return [], {"source": provider.name, "category": "content_fetch_failed"}
+    return evidence, None
+
+
 def call_session_tool(provider, session_id, tool, arguments):
     _, result = mcp_post(
         provider,
@@ -835,6 +1097,10 @@ def call_session_tool(provider, session_id, tool, arguments):
         {"name": tool["name"], "arguments": arguments},
         session_id,
     )
+    if isinstance(result, dict) and result.get("isError"):
+        payload = extract_mcp_text_json(result)
+        message = payload.get("text") if isinstance(payload, dict) else ""
+        raise RuntimeError(message or f"MCP tool {tool.get('name')} returned isError")
     return extract_mcp_text_json(result)
 
 
@@ -1045,6 +1311,17 @@ def search_provider(provider, request_context):
     if provider.name == "atlassian":
         try:
             return atlassian_confluence_evidence(provider, request_context)
+        except urllib.error.HTTPError as error:
+            category = "authentication_failed" if error.code in {401, 403} else "rate_limited" if error.code == 429 else "unavailable"
+            return [], {"source": provider.name, "category": category, "status": error.code, "message": safe_error(error)}
+        except urllib.error.URLError as error:
+            return [], {"source": provider.name, "category": "timeout", "message": safe_error(error)}
+        except Exception as error:
+            return [], {"source": provider.name, "category": "malformed_response", "message": safe_error(error)}
+
+    if provider.name == "sharepoint":
+        try:
+            return sharepoint_evidence(provider, request_context)
         except urllib.error.HTTPError as error:
             category = "authentication_failed" if error.code in {401, 403} else "rate_limited" if error.code == 429 else "unavailable"
             return [], {"source": provider.name, "category": category, "status": error.code, "message": safe_error(error)}
