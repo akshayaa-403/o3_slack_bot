@@ -196,6 +196,42 @@ def parse_action_value(value):
     return {"action": value}
 
 
+def extract_slack_tenant(source):
+    """Best-effort tenant identity from a Slack payload.
+
+    Works for both an event_callback body (workspace at body['team_id']) and an
+    interactive payload (workspace at payload['team']['id']). This is the field
+    that lets the worker resolve which customer a message belongs to before it
+    loads that customer's config. Returns {"team_id", "enterprise_id"} with
+    values that may be None. Never raises.
+    """
+    if not isinstance(source, dict):
+        return {"team_id": None, "enterprise_id": None}
+
+    team_id = source.get("team_id")
+    enterprise_id = None
+
+    team = source.get("team")
+    if isinstance(team, dict):
+        team_id = team_id or team.get("id")
+
+    enterprise = source.get("enterprise")
+    if isinstance(enterprise, dict):
+        enterprise_id = enterprise.get("id")
+
+    if not team_id:
+        event = source.get("event")
+        if isinstance(event, dict):
+            team_id = event.get("team")
+
+    for auth in source.get("authorizations") or []:
+        if isinstance(auth, dict):
+            team_id = team_id or auth.get("team_id")
+            enterprise_id = enterprise_id or auth.get("enterprise_id")
+
+    return {"team_id": team_id, "enterprise_id": enterprise_id}
+
+
 def slack_api(method, payload):
     if not SLACK_BOT_TOKEN:
         raise ValueError("Missing SLACK_BOT_TOKEN")
@@ -427,6 +463,7 @@ def enqueue_feedback_submission(payload):
             "feedback_rating": metadata.get("rating"),
             "feedback_text": extract_feedback_text(view),
             "feedback_metadata": metadata,
+            "slack_tenant": extract_slack_tenant(payload),
         }),
     )
     return "OK"
@@ -476,6 +513,7 @@ def enqueue_live_agent_reply_submission(payload):
             "thread_ts": metadata.get("thread_ts"),
             "message_ts": metadata.get("message_ts"),
             "ticket_key": metadata.get("ticket_key"),
+            "slack_tenant": extract_slack_tenant(payload),
         }),
     )
     return "OK"
@@ -563,7 +601,8 @@ def enqueue_interactive_action(payload):
             "callback_id": payload.get("callback_id") or action.get("block_id"),
             "message_ts": container.get("message_ts") or message.get("ts"),
             "response_url": payload.get("response_url"),
-            "trigger_id": payload.get("trigger_id")
+            "trigger_id": payload.get("trigger_id"),
+            "slack_tenant": extract_slack_tenant(payload)
         })
     )
 
@@ -816,7 +855,8 @@ def lambda_handler(event, context):
                 "conversation_type": channel_type,
                 "routing_reason": routing_reason,
                 "files": image_files,
-                "has_image": bool(image_files)
+                "has_image": bool(image_files),
+                "slack_tenant": extract_slack_tenant(body)
             })
         )
 

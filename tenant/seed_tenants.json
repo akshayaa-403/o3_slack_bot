@@ -1,0 +1,126 @@
+{
+  "_comment": "Demo tenant configs for the local backend. In production these live as items in the o3_tenant_config DynamoDB table. Secrets are stored ONLY as *_secret_ref pointers to Secrets Manager - never inline. Two tenants are intentionally divergent to show that one code path serves both differently, purely from config.",
+  "tenants": [
+    {
+      "tenant_id": "innovyq",
+      "display_name": "InnovyQ",
+      "enabled": true,
+      "identity": {
+        "slack_team_ids": ["T_INNOVYQ01"],
+        "teams_aad_tenant_ids": ["aad-innovyq-0000-1111-2222"],
+        "web_api_key_refs": []
+      },
+      "intents": {
+        "lex_bot_id": "LEXBOT_INNOVYQ",
+        "lex_bot_alias_id": "TSTALIASID",
+        "locale_id": "en_US",
+        "intent_set_ref": "innovyq-it-v3",
+        "intent_count": 333
+      },
+      "knowledge_base": {
+        "enabled": true,
+        "bedrock_kb_id": "KB_INNOVYQ_IT",
+        "model_arn": "arn:aws:bedrock:ap-southeast-2::foundation-model/anthropic.claude-3-sonnet"
+      },
+      "integrations": {
+        "slack": {
+          "enabled": true,
+          "bot_user_id": "U_IVVY_INNOVYQ",
+          "bot_token_secret_ref": "tenant/innovyq/slack/bot_token",
+          "signing_secret_ref": "tenant/innovyq/slack/signing_secret"
+        },
+        "jira": {
+          "enabled": true,
+          "atlassian_domain": "innovyq.atlassian.net",
+          "project_key": "SUP",
+          "secret_ref": "tenant/innovyq/atlassian"
+        }
+      },
+      "features": {
+        "claude_fallback": true,
+        "auto_claude_fallback": true,
+        "create_jira_ticket": true,
+        "live_agent": true,
+        "image_analysis": false,
+        "bedrock_kb_assist": true,
+        "feedback_rating": true,
+        "feedback_form": true,
+        "close_summary": true
+      },
+      "limits": {
+        "inactivity_timeout_seconds": 120,
+        "session_ttl_seconds": 86400,
+        "max_daily_requests": 5000
+      },
+      "copy": {
+        "empty_user_text_reply": "Hi, I'm IvvY. How can I help with your IT request?",
+        "claude_failure_reply": "I could not resolve this automatically. Do you want me to create a Jira ticket? Reply yes to create it, or no to cancel."
+      },
+      "metadata": {
+        "schema_version": 1,
+        "onboarded_at": "2026-05-01",
+        "notes": "Pilot / reference tenant. Full IT intent set (333 intents)."
+      }
+    },
+    {
+      "tenant_id": "acme-robotics",
+      "display_name": "Acme Robotics",
+      "enabled": true,
+      "identity": {
+        "slack_team_ids": ["T_ACME0002"],
+        "teams_aad_tenant_ids": [],
+        "web_api_key_refs": ["web/acme-robotics/portal_key"]
+      },
+      "intents": {
+        "lex_bot_id": "LEXBOT_ACME",
+        "lex_bot_alias_id": "TSTALIASID",
+        "locale_id": "en_US",
+        "intent_set_ref": "acme-support-v1",
+        "intent_count": 48
+      },
+      "knowledge_base": {
+        "enabled": true,
+        "bedrock_kb_id": "KB_ACME_SUPPORT",
+        "model_arn": "arn:aws:bedrock:ap-southeast-2::foundation-model/anthropic.claude-3-sonnet"
+      },
+      "integrations": {
+        "slack": {
+          "enabled": true,
+          "bot_user_id": "U_IVVY_ACME",
+          "bot_token_secret_ref": "tenant/acme-robotics/slack/bot_token",
+          "signing_secret_ref": "tenant/acme-robotics/slack/signing_secret"
+        },
+        "jira": {
+          "enabled": false,
+          "atlassian_domain": "",
+          "secret_ref": ""
+        }
+      },
+      "features": {
+        "claude_fallback": true,
+        "auto_claude_fallback": false,
+        "create_jira_ticket": false,
+        "live_agent": false,
+        "image_analysis": true,
+        "bedrock_kb_assist": true,
+        "feedback_rating": true,
+        "feedback_form": false,
+        "close_summary": false
+      },
+      "limits": {
+        "inactivity_timeout_seconds": 300,
+        "session_ttl_seconds": 43200,
+        "max_daily_requests": 1000
+      },
+      "copy": {
+        "empty_user_text_reply": "Hello! Acme Support Bot here - what can I help you with today?",
+        "claude_failure_reply": "I couldn't solve that automatically. A specialist can take a look - want me to connect you?"
+      },
+      "metadata": {
+        "schema_version": 1,
+        "onboarded_at": "2026-07-15",
+        "notes": "Second demo tenant. No Jira, no live agent, image analysis ON, longer inactivity window, tighter daily cap."
+      }
+    }
+  ]
+}
