@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import math
 import time
 import hashlib
 import base64
@@ -124,9 +125,54 @@ BEDROCK_KB_NO_ANSWER_MARKERS = [
     ).split(",")
     if marker.strip()
 ]
+# Local (xlsx-derived) knowledge base — a temporary stand-in for a Bedrock KB so the
+# L2 "Explore Knowledge base" layer works without provisioning a vector store. Backed
+# by a JSON export of All_Intents_Full_Export.xlsx stored in S3, loaded at cold start
+# and keyword-searched in-memory. Set ENABLE_LOCAL_KB=true to turn it on.
+ENABLE_LOCAL_KB = os.environ.get("ENABLE_LOCAL_KB", "false").lower() == "true"
+LOCAL_KB_S3_BUCKET = os.environ.get("LOCAL_KB_S3_BUCKET", "o3-ivy-kb-docs-661779458398")
+LOCAL_KB_S3_KEY = os.environ.get("LOCAL_KB_S3_KEY", "intent_kb.json")
+# Minimum keyword-overlap score (fraction of query tokens matched) to count as a hit.
+LOCAL_KB_MIN_SCORE = float(os.environ.get("LOCAL_KB_MIN_SCORE", "0.30"))
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "20"))
+# Mistral (OpenAI-compatible chat API). The image screenshot->resolution step
+# uses this instead of Gemini when IMAGE_LLM_PROVIDER=mistral (the default).
+MIA_KEY = os.environ.get("MIA_KEY")
+MISTRAL_MODEL = os.environ.get("MISTRAL_MODEL", "mistral-large-latest")
+MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
+MISTRAL_TIMEOUT_SECONDS = int(os.environ.get("MISTRAL_TIMEOUT_SECONDS", "20"))
+IMAGE_LLM_PROVIDER = os.environ.get("IMAGE_LLM_PROVIDER", "mistral").strip().lower()
+# Escalation ladder (flag-gated, OFF by default). When on, each answer carries a
+# "Not helpful -> try another way" button that advances L1 Lex -> L2 KB -> L3 LLM
+# -> L4 ticket; layers that aren't provisioned (no KB, ticketing off) are skipped.
+ENABLE_ESCALATION_LADDER = os.environ.get("ENABLE_ESCALATION_LADDER", "false").lower() == "true"
+# L3 provider — replaceable per the requirement. claude (default) | mistral | gemini.
+LADDER_LLM_PROVIDER = os.environ.get("LADDER_LLM_PROVIDER", "claude").strip().lower()
+# Escalation button labels (env-overridable) and the human-handoff terminal option.
+ESCALATE_BUTTON_TEXT = os.environ.get("ESCALATE_BUTTON_TEXT", "Try another solution")
+# Distinct label for the L1 -> L2 step so the knowledge-base layer is visibly separate.
+KB_ESCALATE_BUTTON_TEXT = os.environ.get("KB_ESCALATE_BUTTON_TEXT", "Explore Knowledge base")
+LIVE_AGENT_BUTTON_TEXT = os.environ.get("LIVE_AGENT_BUTTON_TEXT", "Talk to a support agent")
+# Shown when Lex (L1) can't answer, inviting the user to search the knowledge base (L2).
+LEX_NO_ANSWER_EXPLORE_KB_TEXT = os.environ.get(
+    "LEX_NO_ANSWER_EXPLORE_KB_TEXT",
+    "I couldn't find a direct answer for that. Want me to search the knowledge base?"
+)
+# When the automated layers are exhausted, offer a live agent instead of a dead end.
+ENABLE_LIVE_AGENT_ESCALATION = os.environ.get("ENABLE_LIVE_AGENT_ESCALATION", "true").lower() == "true"
+# LLM chat mode: once the ladder reaches L3 (LLM), let the user keep chatting with the
+# LLM for follow-up turns (with conversation context) instead of re-routing each message
+# to Lex. Capped at LLM_CHAT_MAX_MESSAGES turns; a live agent is reachable at any point.
+ENABLE_LLM_CHAT = os.environ.get("ENABLE_LLM_CHAT", "true").lower() == "true"
+LLM_CHAT_MAX_MESSAGES = int(os.environ.get("LLM_CHAT_MAX_MESSAGES", "50"))
+LLM_CHAT_HISTORY_MAX_CHARS = int(os.environ.get("LLM_CHAT_HISTORY_MAX_CHARS", "6000"))
+LLM_CHAT_LIMIT_REPLY = os.environ.get(
+    "LLM_CHAT_LIMIT_REPLY",
+    "We've gone back and forth quite a few times on this. Let me hand you to a support "
+    "agent who can take it from here — tap the button below."
+)
 JIRA_UNCLEAR_CONFIRMATION_REPLY = os.environ.get(
     "JIRA_UNCLEAR_CONFIRMATION_REPLY",
     "Please reply yes to create the Jira ticket, or no to cancel."
@@ -246,6 +292,7 @@ ACTION_ID_LIVE_AGENT_REASSIGN = "ivy_live_agent_reassign"
 ACTION_ID_CREATE_JIRA_TICKET = "ivy_create_jira_ticket"
 ACTION_ID_CLOSE_AND_SUMMARIZE = "ivy_close_and_summarize"
 ACTION_ID_FEEDBACK_RATING = "ivy_feedback_rating"
+ACTION_ID_ESCALATE = "ivy_escalate"
 
 SESSION_STATE_OPEN = "OPEN"
 SESSION_STATE_COLLECTING_DETAILS = "COLLECTING_DETAILS"
@@ -272,6 +319,7 @@ CLOSE_SUMMARY_RESPONSE_SOURCES = {
     "image_screenshot_match_lex",
     "image_bedrock_kb",
     "image_gemini",
+    "image_mistral",
 }
 
 JIRA_CONFIRM_YES = {
@@ -1269,7 +1317,7 @@ def terminal_session_reply(session_item):
         return "This issue has already been sent to live agent support. Please start a new message for a different issue."
 
     if session_item.get("conversation_status") == "failed":
-        return "This IVY session is in a failed state. Please start a new message for a new issue."
+        return "This IVY session is marked as closed. Please start a new message for a new issue."
 
     return "This IVY session is already closed. Please start a new message for a new issue."
 
@@ -1343,6 +1391,198 @@ def assistance_blocks(lex_reply, session_id=None, session_root_ts=None):
             ]
         }
     ]
+
+
+# --- Escalation ladder (flag-gated: ENABLE_ESCALATION_LADDER) ----------------
+# L1 Lex -> L2 KB -> L3 LLM -> L4 ticket. Each answer carries a "Not helpful ->
+# try another way" button (ACTION_ID_ESCALATE) whose value packs the target level
+# and the original query, so the flow is self-contained (no extra session state).
+# Automated answer-producing layers. Live agent (human) is a terminal handoff shown
+# after these are exhausted, not an auto-run layer.
+ESCALATION_LEVELS = ["lex", "kb", "llm"]
+ESCALATION_MAX_QUERY_CHARS = 1500
+ESCALATION_NO_ANSWER_TEXT = "I couldn't find a confident answer for that."
+# Shown when a specific layer runs but finds nothing, so the layer is visible (not a
+# silent skip) and the user is offered the next one.
+ESCALATION_KB_NO_ANSWER_TEXT = os.environ.get(
+    "ESCALATION_KB_NO_ANSWER_TEXT",
+    "I couldn't find anything specific in the knowledge base for this. "
+    "Want me to try our AI assistant?"
+)
+ESCALATION_EXHAUSTED_REPLY = (
+    "I've tried every automated option I have and still couldn't resolve this. "
+    "Please reach out to the IT support team directly and reference this chat."
+)
+
+
+def escalation_layer_available(level):
+    """A layer only shows up in the ladder if its backing service is provisioned."""
+    if level == "lex":
+        return True
+    if level == "kb":
+        # Available if either a real Bedrock KB is provisioned OR the local
+        # (xlsx-derived) KB stand-in is enabled.
+        return bool(
+            (ENABLE_BEDROCK_KB_ASSIST and BEDROCK_KNOWLEDGE_BASE_ID and BEDROCK_KB_MODEL_ARN)
+            or ENABLE_LOCAL_KB
+        )
+    if level == "llm":
+        return True
+    if level == "ticket":
+        return bool(ENABLE_CREATE_JIRA_TICKET and CREATE_JIRA_TICKET_FUNCTION)
+    return False
+
+
+def next_escalation_index(start_index):
+    """First available layer index at/after start_index, or None if none remain."""
+    for index in range(max(start_index, 0), len(ESCALATION_LEVELS)):
+        if escalation_layer_available(ESCALATION_LEVELS[index]):
+            return index
+    return None
+
+
+def escalation_llm_answer(query, session_id=None, channel=None):
+    """L3 — pluggable LLM. claude (Bedrock Lambda) by default; mistral/gemini too."""
+    if LADDER_LLM_PROVIDER == "mistral":
+        return invoke_mistral_from_text(query)
+    if LADDER_LLM_PROVIDER == "gemini":
+        return invoke_gemini_from_text(query)
+    result = invoke_claude_fallback({
+        "text": query, "raw_text": query, "session_id": session_id, "channel": channel,
+        "lex": {"intent": "EscalationLLM", "state": "Fulfilled", "slots": {}, "reply": ""},
+        "session": {"conversation_status": "active"},
+    })
+    reply = (result.get("reply") or "").strip()
+    return {"ok": bool(result.get("ok") and reply), "reply": reply, "error": result.get("error")}
+
+
+def run_escalation_layer(level, query, session_id=None, channel=None):
+    """Run one non-Lex layer. Returns (reply_text, ok)."""
+    if level == "kb":
+        # Prefer a real Bedrock KB when provisioned; otherwise fall back to the local
+        # xlsx-derived KB stand-in.
+        if BEDROCK_KNOWLEDGE_BASE_ID and BEDROCK_KB_MODEL_ARN:
+            result = invoke_bedrock_knowledge_base(query)
+            if result.get("ok") or not ENABLE_LOCAL_KB:
+                return (result.get("reply") or "", bool(result.get("ok")))
+        result = invoke_local_kb(query)
+        return (result.get("reply") or "", bool(result.get("ok")))
+    if level == "llm":
+        result = escalation_llm_answer(query, session_id, channel)
+        return (result.get("reply") or "", bool(result.get("ok")))
+    if level == "ticket":
+        result = invoke_create_jira_ticket({
+            "text": query, "raw_text": query, "session_id": session_id,
+            "channel": channel, "intent_name": "EscalationTicket", "request_text": query,
+        })
+        if result.get("ok"):
+            key = result.get("ticket_key") or result.get("jira_ticket_key") or ""
+            url = result.get("ticket_url") or result.get("jira_ticket_url") or ""
+            message = "I've raised a support ticket" + (f" ({key})" if key else "") + " for you."
+            if url:
+                message += f" <{url}|View ticket>"
+            return (message, True)
+        return (result.get("error") or "I couldn't raise a ticket right now.", False)
+    return ("", False)
+
+
+def escalation_layer_no_answer_text(level):
+    """User-facing line when a layer ran but found nothing — keeps L2/L3 visible."""
+    if level == "kb":
+        return ESCALATION_KB_NO_ANSWER_TEXT
+    return ESCALATION_NO_ANSWER_TEXT
+
+
+def escalate_autoadvance(start_index, query, session_id=None, channel=None):
+    """Run layers from start_index onward, auto-skipping any that return no usable
+    answer, and stop at the first that DOES answer. This is why the user never has
+    to click through empty layers: a click (or the initial fallthrough) advances in
+    the background until a real answer appears, or all layers are exhausted.
+
+    Returns (answered_index, reply_text). answered_index is None if nothing answered.
+    """
+    index = next_escalation_index(start_index)
+    while index is not None:
+        level = ESCALATION_LEVELS[index]
+        reply_text, ok = run_escalation_layer(level, query, session_id, channel)
+        if ok and has_meaningful_bot_answer(reply_text):
+            return index, reply_text
+        index = next_escalation_index(index + 1)
+    return None, ESCALATION_EXHAUSTED_REPLY
+
+
+def has_llm_chat_active(session_item):
+    """True when the session has reached L3 and is in a running LLM chat (not capped)."""
+    return bool(
+        ENABLE_LLM_CHAT
+        and session_item.get("llm_chat_status") == "active"
+    )
+
+
+def trim_llm_chat_history(history):
+    """Keep the running transcript bounded so it never blows up the prompt or the item."""
+    history = history or ""
+    if len(history) <= LLM_CHAT_HISTORY_MAX_CHARS:
+        return history
+    return history[-LLM_CHAT_HISTORY_MAX_CHARS:]
+
+
+def build_llm_chat_prompt(original_issue, history, user_message):
+    """Compose a context-carrying prompt so follow-up LLM turns feel like a real chat."""
+    parts = []
+    if original_issue:
+        parts.append("The user's original issue:\n" + original_issue)
+    if history:
+        parts.append("Conversation so far:\n" + history)
+    parts.append("User's latest message:\n" + (user_message or ""))
+    parts.append(
+        "Continue helping the user with a clear, concrete next step. If the issue now "
+        "looks resolved, say so briefly."
+    )
+    return "\n\n".join(parts)
+
+
+def escalation_blocks(reply_text, query, next_index, session_id=None, session_root_ts=None):
+    """Answer section + a Resolved button and (if a further layer exists) an escalate button."""
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": slack_mrkdwn(reply_text)}}]
+    elements = []
+    if next_index is not None:
+        # Another automated layer remains -> escalate to it. The L1->L2 (KB) step gets
+        # its own "Explore Knowledge base" label so the layers read as distinct.
+        next_button_text = (
+            KB_ESCALATE_BUTTON_TEXT
+            if ESCALATION_LEVELS[next_index] == "kb"
+            else ESCALATE_BUTTON_TEXT
+        )
+        elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": next_button_text},
+            "style": "primary",
+            "action_id": ACTION_ID_ESCALATE,
+            "value": json.dumps({
+                "level": next_index,
+                "q": (query or "")[:ESCALATION_MAX_QUERY_CHARS],
+                "sid": session_id,
+                "srt": session_root_ts,
+            }),
+        })
+    elif ENABLE_LIVE_AGENT_ESCALATION:
+        # Automated layers exhausted -> offer a human. Reuses the live-agent handler.
+        elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": LIVE_AGENT_BUTTON_TEXT},
+            "style": "primary",
+            "action_id": ACTION_ID_LIVE_AGENT_SUPPORT,
+            "value": action_button_value("live_agent_support", session_id, session_root_ts),
+        })
+    elements.append({
+        "type": "button",
+        "text": {"type": "plain_text", "text": "Resolved"},
+        "action_id": ACTION_ID_CLOSE_AND_SUMMARIZE,
+        "value": action_button_value("close_and_summarize", session_id, session_root_ts),
+    })
+    blocks.append({"type": "actions", "block_id": "ivy_escalation_actions", "elements": elements})
+    return blocks
 
 
 def mcp_followup_reply_text(reply):
@@ -2604,6 +2844,133 @@ def bedrock_kb_answer_is_useful(answer):
     return not any(marker in value_lower for marker in BEDROCK_KB_NO_ANSWER_MARKERS)
 
 
+_local_kb_cache = None
+
+# Common words that carry no matching signal, so they don't inflate overlap scores.
+_LOCAL_KB_STOPWORDS = {
+    "the", "a", "an", "to", "of", "in", "on", "for", "and", "or", "is", "are",
+    "am", "i", "my", "me", "you", "your", "it", "this", "that", "how", "do",
+    "can", "cant", "cannot", "not", "with", "at", "be", "have", "has", "get",
+    "getting", "unable", "issue", "issues", "problem", "help", "please", "need",
+    "want", "when", "what", "why", "if", "im", "ive", "was", "were", "from",
+}
+
+
+def _local_kb_tokens(text):
+    tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return {t for t in tokens if len(t) > 2 and t not in _LOCAL_KB_STOPWORDS}
+
+
+def load_local_kb():
+    """Load and cache the xlsx-derived intent KB from S3. Returns a list of dicts,
+    each pre-tokenized as `_tokens` (utterances + intent name + category)."""
+    global _local_kb_cache
+    if _local_kb_cache is not None:
+        return _local_kb_cache
+
+    if not ENABLE_LOCAL_KB:
+        _local_kb_cache = {"entries": [], "idf": {}}
+        return _local_kb_cache
+
+    try:
+        response = s3_client.get_object(Bucket=LOCAL_KB_S3_BUCKET, Key=LOCAL_KB_S3_KEY)
+        entries = json.loads(response["Body"].read())
+    except Exception as e:
+        log_json({
+            "level": "ERROR",
+            "message": "local_kb_load_failed",
+            "bucket": LOCAL_KB_S3_BUCKET,
+            "key": LOCAL_KB_S3_KEY,
+            "error": str(e),
+        })
+        _local_kb_cache = {"entries": [], "idf": {}}
+        return _local_kb_cache
+
+    prepared = []
+    document_frequency = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not (entry.get("response") or "").strip():
+            continue
+        blob = " ".join([
+            entry.get("intent") or "",
+            entry.get("category") or "",
+            " ".join(entry.get("utterances") or []),
+        ])
+        tokens = _local_kb_tokens(blob)
+        for token in tokens:
+            document_frequency[token] = document_frequency.get(token, 0) + 1
+        prepared.append({
+            "intent": entry.get("intent") or "",
+            "response": (entry.get("response") or "").strip(),
+            "_tokens": tokens,
+        })
+
+    # Inverse document frequency so distinctive words (e.g. "pcq", "adam") outweigh
+    # generic ones (e.g. "keeps", "access") when scoring a match.
+    total_docs = len(prepared)
+    idf = {
+        token: math.log((total_docs + 1) / (freq + 1)) + 1.0
+        for token, freq in document_frequency.items()
+    }
+
+    _local_kb_cache = {"entries": prepared, "idf": idf}
+    log_json({
+        "level": "INFO",
+        "message": "local_kb_loaded",
+        "entries": len(prepared),
+    })
+    return _local_kb_cache
+
+
+def invoke_local_kb(query):
+    """L2 stand-in: keyword-overlap search over the xlsx-derived intent KB.
+
+    Scores each entry by the fraction of the query's meaningful tokens that appear in
+    the entry (utterances + intent name + category), and returns the best-scoring
+    article's response when it clears LOCAL_KB_MIN_SCORE. No vector store required.
+    """
+    kb = load_local_kb()
+    entries = kb["entries"]
+    idf = kb["idf"]
+    if not entries:
+        return {"ok": False, "error": "local_kb_empty", "error_code": "local_kb_empty"}
+
+    query_tokens = _local_kb_tokens(query)
+    if not query_tokens:
+        return {"ok": False, "error": "local_kb_no_query_tokens", "error_code": "local_kb_no_query_tokens"}
+
+    # IDF-weighted overlap, normalized by the query's total IDF weight so the score is
+    # the fraction of the query's *distinctive* content the article covers.
+    denominator = sum(idf.get(token, 1.0) for token in query_tokens)
+    best_entry = None
+    best_score = 0.0
+    for entry in entries:
+        matched = query_tokens & entry["_tokens"]
+        if not matched:
+            continue
+        score = sum(idf.get(token, 1.0) for token in matched) / denominator
+        if score > best_score:
+            best_score = score
+            best_entry = entry
+
+    if best_entry is None or best_score < LOCAL_KB_MIN_SCORE:
+        return {
+            "ok": False,
+            "error": "local_kb_no_match",
+            "error_code": "local_kb_no_match",
+            "best_score": round(best_score, 3),
+        }
+
+    return {
+        "ok": True,
+        "reply": best_entry["response"],
+        "summary": best_entry["response"],
+        "source": "local_knowledge_base",
+        "matched_intent": best_entry["intent"],
+        "score": round(best_score, 3),
+    }
+
+
 def invoke_bedrock_knowledge_base(query):
     if not BEDROCK_KNOWLEDGE_BASE_ID or not BEDROCK_KB_MODEL_ARN:
         return {
@@ -2802,6 +3169,118 @@ def invoke_gemini_from_text(query):
         "source": "gemini",
         "model_id": GEMINI_MODEL
     }
+
+
+def _image_llm_prompt(query):
+    return "\n".join([
+        "You are IVY, a concise IT support assistant.",
+        "The text below was extracted from a screenshot the user shared.",
+        "Use it to suggest the most likely resolution.",
+        "If the extracted text is ambiguous, ask one clear clarifying question.",
+        "Do not claim that a Jira ticket was created.",
+        "",
+        "Screenshot text:",
+        query,
+    ])
+
+
+def invoke_mistral_from_text(query):
+    """Screenshot-text -> resolution via the Mistral chat API (mirror of the
+    Gemini path). Returns the same {ok, reply, summary, source, model_id} shape."""
+    if not MIA_KEY:
+        return {
+            "ok": False,
+            "error": "missing_mistral_api_key",
+            "error_code": "missing_mistral_api_key",
+        }
+
+    data = json.dumps({
+        "model": MISTRAL_MODEL,
+        "messages": [{"role": "user", "content": _image_llm_prompt(query)}],
+        "temperature": 0.2,
+    }).encode("utf-8")
+
+    request = urllib.request.Request(
+        MISTRAL_ENDPOINT,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {MIA_KEY}",
+        },
+        method="POST",
+    )
+
+    started_at = time.time()
+    try:
+        with urllib.request.urlopen(request, timeout=MISTRAL_TIMEOUT_SECONDS) as response:
+            response_body = json.loads(response.read().decode("utf-8"))
+    except Exception as e:
+        error_body = None
+        if hasattr(e, "read"):
+            try:
+                error_body = e.read().decode("utf-8", errors="replace")[:1000]
+            except Exception:
+                error_body = None
+        log_json({
+            "level": "ERROR",
+            "message": "mistral_request_failed",
+            "model_id": MISTRAL_MODEL,
+            "timeout_seconds": MISTRAL_TIMEOUT_SECONDS,
+            "latency_seconds": round(time.time() - started_at, 2),
+            "error": str(e),
+            "error_body": error_body,
+        })
+        return {
+            "ok": False,
+            "error": str(e),
+            "error_code": "mistral_request_failed",
+            "error_body": error_body,
+        }
+
+    choices = response_body.get("choices") or []
+    reply = ""
+    if choices:
+        reply = ((choices[0].get("message") or {}).get("content") or "").strip()
+    if not reply:
+        log_json({
+            "level": "ERROR",
+            "message": "mistral_empty_reply",
+            "model_id": MISTRAL_MODEL,
+            "latency_seconds": round(time.time() - started_at, 2),
+            "choice_count": len(choices),
+        })
+        return {
+            "ok": False,
+            "error": "empty_mistral_reply",
+            "error_code": "empty_mistral_reply",
+            "raw_response": response_body,
+        }
+
+    log_json({
+        "level": "INFO",
+        "message": "mistral_request_completed",
+        "model_id": MISTRAL_MODEL,
+        "latency_seconds": round(time.time() - started_at, 2),
+        "choice_count": len(choices),
+        "reply_length": len(reply),
+    })
+
+    return {
+        "ok": True,
+        "reply": reply,
+        "summary": reply,
+        "source": "mistral",
+        "model_id": MISTRAL_MODEL,
+    }
+
+
+def invoke_image_llm(query):
+    """Resolve screenshot text with the configured provider (Mistral by default,
+    Gemini when IMAGE_LLM_PROVIDER=gemini). Each returns a `source` field the
+    caller uses for telemetry labels."""
+    if IMAGE_LLM_PROVIDER == "gemini":
+        return invoke_gemini_from_text(query)
+    return invoke_mistral_from_text(query)
 
 
 def get_session_item(session_id):
@@ -4582,9 +5061,21 @@ def invoke_live_agent_handoff(payload):
         result["target"] = "lambda"
         return result
 
-    result = invoke_live_agent_webhook(payload)
-    result["target"] = "webhook"
-    return result
+    if LIVE_AGENT_WEBHOOK_URL:
+        result = invoke_live_agent_webhook(payload)
+        result["target"] = "webhook"
+        return result
+
+    # No live-agent backend wired yet: log the request internally and acknowledge
+    # gracefully rather than erroring. (Full build — persisted tickets + on-call
+    # roster routing + in-Slack agent chat — is pending the agent roster.)
+    log_json({
+        "level": "INFO",
+        "message": "live_agent_request_logged_internally",
+        "session_id": (payload.get("session") or {}).get("session_id") or payload.get("session_id"),
+        "user": payload.get("user"),
+    })
+    return {"ok": True, "target": "internal", "response": {"reply": LIVE_AGENT_DEFERRED_REPLY}}
 
 
 def live_agent_reply(result):
@@ -4833,6 +5324,70 @@ def handle_interactive_action(session_item, body, session_id):
             "reply": "Closed this IVY session and started the summary.",
             "manual_close_summary": True,
             "manual_close_timeout_token": session_item.get("timeout_token"),
+        })
+        return result
+
+    if action_id == ACTION_ID_ESCALATE:
+        payload = body.get("action_payload") or parse_action_value(body.get("action_value"))
+        query = (payload.get("q") or session_item.get("last_user_text") or "").strip()
+        try:
+            requested_index = int(payload.get("level"))
+        except (TypeError, ValueError):
+            requested_index = None
+        session_root_ts = payload.get("srt") or session_item.get("session_root_ts") or session_item.get("thread_ts")
+        if not ENABLE_ESCALATION_LADDER or requested_index is None or not query:
+            return result
+        # Run ONE layer per click so each layer is a distinct, visible step. If the
+        # layer produces no usable answer (e.g. the KB has no matching article), we
+        # DON'T silently jump ahead — we say so and offer a button to the next layer.
+        target_index = next_escalation_index(requested_index)
+        if target_index is None:
+            result.update({
+                "lex_state": "Failed",
+                "response_source": "escalation_exhausted",
+                "reply": ESCALATION_EXHAUSTED_REPLY,
+            })
+            return result
+        level = ESCALATION_LEVELS[target_index]
+        reply_text, layer_ok = run_escalation_layer(level, query, session_id, body.get("channel"))
+        answered = layer_ok and has_meaningful_bot_answer(reply_text)
+        next_index = next_escalation_index(target_index + 1)
+        if not answered:
+            # Layer had nothing — make that explicit and steer to the next layer.
+            reply_text = escalation_layer_no_answer_text(level)
+        response_source = "escalation_" + level + ("" if answered else "_no_answer")
+        result.update({
+            "lex_intent": "Escalation_" + level,
+            "lex_state": "Fulfilled",
+            "response_source": response_source,
+            "reply": reply_text,
+            "blocks": escalation_blocks(reply_text, query, next_index, session_id, session_root_ts),
+        })
+        # When no further automated layer remains we show a "live agent" button; prime
+        # the state its handler (has_pending_final_support_options) requires so it works.
+        if next_index is None and ENABLE_LIVE_AGENT_ESCALATION:
+            result.update({
+                "next_action": NEXT_ACTION_FINAL_SUPPORT_OPTIONS,
+                "support_options_status": "pending",
+                "support_original_text": query,
+                "support_raw_text": query,
+            })
+        # A real L3 (LLM) answer opens a running chat: the user can keep replying and
+        # each message continues with the LLM (up to LLM_CHAT_MAX_MESSAGES turns).
+        if answered and level == "llm" and ENABLE_LLM_CHAT:
+            result.update({
+                "llm_chat_status": "active",
+                "llm_chat_count": 0,
+                "llm_chat_history": trim_llm_chat_history("IVY: " + (reply_text or "")),
+            })
+        log_json({
+            "level": "INFO",
+            "message": "escalation_ladder_advanced",
+            "session_id": session_id,
+            "level": level,
+            "answered": answered,
+            "next_index": next_index,
+            "offers_live_agent": next_index is None and ENABLE_LIVE_AGENT_ESCALATION,
         })
         return result
 
@@ -6368,6 +6923,10 @@ def process_record(record):
     live_agent_error = None
     live_agent_error_code = None
     slack_blocks = None
+    llm_chat_status = None
+    llm_chat_count = None
+    llm_chat_history = None
+    llm_chat_handled = False
     jira_confirmation_handled = False
     interactive_action_handled = False
     assistance_details_handled = False
@@ -6489,6 +7048,9 @@ def process_record(record):
         last_live_agent_ticket_url = interactive_result.get("last_live_agent_ticket_url")
         live_agent_error = interactive_result.get("live_agent_error")
         live_agent_error_code = interactive_result.get("live_agent_error_code")
+        llm_chat_status = interactive_result.get("llm_chat_status")
+        llm_chat_count = interactive_result.get("llm_chat_count")
+        llm_chat_history = interactive_result.get("llm_chat_history")
         manual_close_summary = interactive_result.get("manual_close_summary", False)
         manual_close_timeout_token = interactive_result.get("manual_close_timeout_token")
         workflow_state = interactive_result.get("workflow_state")
@@ -6612,21 +7174,57 @@ def process_record(record):
         )
         image_query = image_issue_text(text, image_result)
 
-        if image_result.get("ok") and image_query:
-            # Direct path: OCR-extracted text -> Gemini. No screenshot vector
-            # match, no Lex, no Bedrock KB.
-            gemini_result = invoke_gemini_from_text(image_query)
-            if gemini_result.get("ok"):
+        if ENABLE_ESCALATION_LADDER and image_result.get("ok") and image_query:
+            # Ladder path: send the screenshot's OCR text to Lex FIRST (L1), then
+            # let the downstream ladder block attach the escalate button so the
+            # user can advance L2 KB -> L3 LLM -> L4 ticket. This makes an image
+            # follow the same escalation ladder as a typed message.
+            text = image_query
+            raw_text = image_query
+            update_processing_message(processing_message, "Checking IVY routing...")
+            lex_response = lex.recognize_text(
+                botId=BOT_ID,
+                botAliasId=BOT_ALIAS_ID,
+                localeId=LOCALE_ID,
+                sessionId=lex_session_id,
+                text=image_query,
+            )
+            lex_state_obj = lex_response.get("sessionState", {})
+            intent = lex_state_obj.get("intent", {})
+            lex_session_attributes = lex_state_obj.get("sessionAttributes", {}) or {}
+            lex_intent = intent.get("name", "UNKNOWN")
+            lex_state = intent.get("state", "UNKNOWN")
+            lex_slots = simplify_slots(intent.get("slots", {}))
+            lex_reply, lex_reply_empty = get_lex_reply(lex_response.get("messages", []))
+            response_source = "lex"
+            image_status = "completed"
+            image_resolution_source = "lex_ladder"
+            log_json({
+                "level": "INFO",
+                "message": "image_routed_to_lex_ladder",
+                "event_id": event_id,
+                "session_id": session_id,
+                "lex_intent": lex_intent,
+                "lex_state": lex_state,
+            })
+
+        elif image_result.get("ok") and image_query:
+            # Direct path: OCR-extracted text -> LLM (Mistral by default, Gemini
+            # if IMAGE_LLM_PROVIDER=gemini). No screenshot vector match, no Lex,
+            # no Bedrock KB.
+            llm_result = invoke_image_llm(image_query)
+            llm_source = llm_result.get("source", IMAGE_LLM_PROVIDER)
+            if llm_result.get("ok"):
                 lex_intent = "ImageLLMFallback"
                 lex_state = "Fulfilled"
                 lex_slots = {}
                 lex_session_attributes = {}
-                lex_reply = gemini_result["reply"]
+                lex_reply = llm_result["reply"]
                 lex_reply_empty = False
                 image_status = "completed"
-                image_resolution_source = "gemini"
-                response_source = "image_gemini"
-                image_summary = gemini_result.get("summary") or image_summary
+                image_resolution_source = llm_source
+                response_source = f"image_{llm_source}"
+                image_summary = llm_result.get("summary") or image_summary
             else:
                 lex_intent = "ImageLLMFallback"
                 lex_state = "Failed"
@@ -6635,8 +7233,8 @@ def process_record(record):
                 image_status = "failed"
                 image_resolution_source = "unresolved"
                 response_source = "image"
-                image_error = gemini_result.get("error")
-                image_error_code = gemini_result.get("error_code")
+                image_error = llm_result.get("error")
+                image_error_code = llm_result.get("error_code")
                 lex_reply = image_reply_from_result({
                     "ok": False,
                     "error": image_error,
@@ -6840,6 +7438,69 @@ def process_record(record):
             "jira_error_code": jira_error_code
         })
 
+    elif has_llm_chat_active(existing_session) and text:
+        # L3 chat continuation: the user reached the LLM and keeps replying. Each turn
+        # goes straight to the LLM (with conversation context) instead of back to Lex,
+        # up to LLM_CHAT_MAX_MESSAGES turns. A live agent stays one tap away.
+        llm_chat_handled = True
+        prior_count = int(existing_session.get("llm_chat_count") or 0)
+        original_issue = (
+            existing_session.get("support_original_text")
+            or existing_session.get("last_user_text")
+            or ""
+        )
+        prior_history = existing_session.get("llm_chat_history") or ""
+        lex_intent = "LlmChat"
+        lex_state = "Fulfilled"
+        lex_slots = {}
+        lex_session_attributes = {}
+        lex_reply_empty = False
+        # Keep the live-agent button primed and the session in a details-collecting state.
+        next_action = NEXT_ACTION_FINAL_SUPPORT_OPTIONS
+        support_options_status = "pending"
+        support_original_text_value = original_issue
+
+        if prior_count >= LLM_CHAT_MAX_MESSAGES:
+            # Hit the message cap — stop chatting and steer to a human.
+            lex_reply = LLM_CHAT_LIMIT_REPLY
+            response_source = "llm_chat_limit"
+            slack_blocks = escalation_blocks(lex_reply, original_issue, None, session_id, session_root_ts)
+            llm_chat_status = "capped"
+            llm_chat_count = prior_count
+            llm_chat_history = prior_history
+            log_json({
+                "level": "INFO",
+                "message": "llm_chat_limit_reached",
+                "event_id": event_id,
+                "session_id": session_id,
+                "count": prior_count,
+            })
+        else:
+            update_processing_message(processing_message, "Thinking through this...")
+            chat_result = escalation_llm_answer(
+                build_llm_chat_prompt(original_issue, prior_history, text),
+                session_id,
+                channel,
+            )
+            reply = (chat_result.get("reply") or "").strip() or ESCALATION_EXHAUSTED_REPLY
+            lex_reply = reply
+            claude_fallback_attempted = True
+            response_source = "llm_chat"
+            slack_blocks = escalation_blocks(reply, original_issue, None, session_id, session_root_ts)
+            llm_chat_count = prior_count + 1
+            llm_chat_status = "active"
+            llm_chat_history = trim_llm_chat_history(
+                prior_history + f"\nUser: {text}\nIVY: {reply}"
+            )
+            log_json({
+                "level": "INFO" if chat_result.get("ok") else "WARN",
+                "message": "llm_chat_turn",
+                "event_id": event_id,
+                "session_id": session_id,
+                "count": llm_chat_count,
+                "ok": chat_result.get("ok"),
+            })
+
     elif text:
         update_processing_message(processing_message, "Checking IVY routing...")
         response = lex.recognize_text(
@@ -6888,6 +7549,9 @@ def process_record(record):
         and not assistance_details_handled
         and not jira_confirmation_handled
         and response_source != "router"
+        # With the escalation ladder on, KB/LLM are reached by the user clicking
+        # "escalate", not by silent auto-fallback — so suppress the auto path.
+        and not ENABLE_ESCALATION_LADDER
         and should_use_claude_fallback(text, lex_intent, lex_state, lex_reply_empty)
     )
 
@@ -7008,7 +7672,65 @@ def process_record(record):
             "error": claude_fallback_error
         })
 
-    if (
+    ladder_active = (
+        ENABLE_ESCALATION_LADDER
+        and not interactive_action_handled
+        and not assistance_details_handled
+        and not jira_confirmation_handled
+        and response_source == "lex"
+        and text
+        and lex_state != "Ignored"
+        and not next_action
+        and not jira_status
+        and has_meaningful_user_issue(text)
+    )
+    if ladder_active:
+        # Lex's empty-reply placeholder (EMPTY_LEX_REPLY) reads as a real sentence, so
+        # gate on lex_reply_empty too — otherwise "I could not generate a response..."
+        # leaks out as if Lex had answered, instead of offering the knowledge base.
+        if has_meaningful_bot_answer(lex_reply) and not lex_reply_empty:
+            # L1 (Lex) gave a real answer — show it, escalate button -> next layer.
+            answer = lex_reply
+            next_index = next_escalation_index(1)
+            answered_level = "lex"
+        else:
+            next_index = next_escalation_index(1)
+            if next_index is not None and ESCALATION_LEVELS[next_index] == "kb":
+                # L1 had no usable answer AND a knowledge base exists — keep L1 and L2
+                # separate: DON'T auto-run the KB. Show a short prompt with the
+                # "Explore Knowledge base" button so the user opts into L2.
+                answer = LEX_NO_ANSWER_EXPLORE_KB_TEXT
+                answered_level = "lex_no_answer"
+            else:
+                # No KB layer available — auto-advance in the BACKGROUND (no click)
+                # through the next available layers until one answers.
+                answered_index, answer = escalate_autoadvance(1, text, session_id, channel)
+                next_index = next_escalation_index((answered_index + 1) if answered_index is not None else len(ESCALATION_LEVELS))
+                answered_level = ESCALATION_LEVELS[answered_index] if answered_index is not None else "exhausted"
+        lex_reply = answer
+        slack_blocks = escalation_blocks(answer, text, next_index, session_id, session_root_ts)
+        # If auto-advance already exhausted the automated layers, the block shows a
+        # live-agent button; prime the state its handler requires. (The handler falls
+        # back to last_user_text for ticket context, so we only set these two.)
+        if next_index is None and ENABLE_LIVE_AGENT_ESCALATION:
+            next_action = NEXT_ACTION_FINAL_SUPPORT_OPTIONS
+            support_options_status = "pending"
+        # If auto-advance landed on L3 (LLM), open a running chat so the user can keep
+        # replying to the LLM directly.
+        if answered_level == "llm" and ENABLE_LLM_CHAT:
+            llm_chat_status = "active"
+            llm_chat_count = 0
+            llm_chat_history = trim_llm_chat_history("IVY: " + (answer or ""))
+            support_original_text_value = support_original_text_value or text
+        log_json({
+            "level": "INFO",
+            "message": "escalation_ladder_lex_answer",
+            "event_id": event_id,
+            "session_id": session_id,
+            "answered_level": answered_level,
+            "next_index": next_index,
+        })
+    elif (
         not interactive_action_handled
         and not assistance_details_handled
         and not jira_confirmation_handled
@@ -7119,7 +7841,9 @@ def process_record(record):
             "timeout_schedule_name": timeout_schedule_name(session_id, "prompt")
         }
 
-    if offer_close_summary:
+    # The ladder's own blocks already include a "Resolved" (close) button, so don't
+    # append the close-summary actions on top — that was producing duplicate rows.
+    if offer_close_summary and not ladder_active:
         slack_blocks = add_close_summary_actions(slack_blocks, lex_reply, session_id, session_root_ts)
 
     created_at_expression = (
@@ -7503,6 +8227,9 @@ def process_record(record):
         "live_agent_updated_at": live_agent_updated_at,
         "live_agent_error": live_agent_error,
         "live_agent_error_code": live_agent_error_code,
+        "llm_chat_status": llm_chat_status,
+        "llm_chat_count": llm_chat_count,
+        "llm_chat_history": llm_chat_history,
     }
 
     for attribute_name, attribute_value in support_flow_attributes.items():
@@ -7720,6 +8447,9 @@ def process_record(record):
             "rovo_requested_at": rovo_requested_at,
             "support_options_status": support_options_status,
             "support_resolved_at": support_resolved_at,
+            "llm_chat_status": llm_chat_status,
+            "llm_chat_count": llm_chat_count,
+            "llm_chat_history": llm_chat_history,
             "live_agent_status": live_agent_status,
             "live_agent_requested_at": live_agent_requested_at,
             "live_agent_updated_at": live_agent_updated_at,

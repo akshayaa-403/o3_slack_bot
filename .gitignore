@@ -77,3 +77,7 @@ handler_out.json
 url_verify_event.json
 fixtures/scratch/
 response.json
+
+# Generated intent exports (may contain real ticket/customer text) — regenerate
+# with scripts/generate_intents_from_jira.py rather than committing a run's output.
+data/intents_from_jira_*.csv

@@ -11,8 +11,17 @@ from botocore.exceptions import ClientError
 
 sqs = boto3.client("sqs")
 dynamodb = boto3.resource("dynamodb")
+lambda_client = boto3.client("lambda")
 
 QUEUE_URL = os.environ["SQS_QUEUE_URL"]
+# Async-invoked for the tickets->Lex-intents flow (/generate-intents + its buttons).
+INTENTS_FUNCTION = os.environ.get("INTENTS_FUNCTION", "")
+# Slack Block Kit action_ids for the intents review card (agents/review.py).
+INTENTS_ACTION_PREFIX = "agent2_intents_"
+INTENTS_ACTION_MAP = {
+    "agent2_intents_approve": "approve",
+    "agent2_intents_discard": "discard",
+}
 # Slack signature verification is disabled by default for open testing.
 # Set VERIFY_SLACK_SIGNATURE=true and SLACK_SIGNING_SECRET to enforce it again.
 SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "")
@@ -620,6 +629,71 @@ def enqueue_interactive_action(payload):
     return "OK"
 
 
+def parse_slash_command(raw_body):
+    """Return a slash-command dict if raw_body is a slash command, else None.
+
+    Slash commands arrive form-encoded (like interactive payloads) but carry a
+    `command` field instead of `payload`."""
+    parsed = urllib.parse.parse_qs(raw_body or "", keep_blank_values=True)
+    command = parsed.get("command")
+    if not command:
+        return None
+    return {key: (values[0] if values else "") for key, values in parsed.items()}
+
+
+def invoke_intents_async(payload):
+    """Fire-and-forget invoke of O3_intents so the slash command / button click can
+    ack Slack inside the 3s window while the pipeline runs separately."""
+    if not INTENTS_FUNCTION:
+        log_json({"level": "ERROR", "message": "intents_function_not_configured"})
+        return False
+    lambda_client.invoke(
+        FunctionName=INTENTS_FUNCTION,
+        InvocationType="Event",
+        Payload=json.dumps(payload).encode("utf-8"),
+    )
+    return True
+
+
+def handle_slash_command(slash):
+    command = (slash.get("command") or "").strip()
+    if command == "/generate-intents":
+        ok = invoke_intents_async({
+            "action": "generate",
+            "channel": slash.get("channel_id"),
+            "user": slash.get("user_id"),
+            "text": slash.get("text", ""),
+            "response_url": slash.get("response_url"),
+        })
+        text = (":hourglass: Generating intents from resolved tickets… "
+                "I'll post a review card here shortly.") if ok else \
+               ":x: Intents pipeline isn't configured (INTENTS_FUNCTION)."
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"response_type": "ephemeral", "text": text}),
+        }
+    log_json({"level": "INFO", "message": "unknown_slash_command", "command": command})
+    return {"statusCode": 200, "body": ""}
+
+
+def route_intents_interactive(payload, action):
+    """Route an intents review-card button (approve/deny) to O3_intents."""
+    channel = (payload.get("channel") or {}).get("id")
+    action_value = parse_action_value(action.get("value"))
+    proposal_id = action_value.get("proposal_id", "")
+    invoke_intents_async({
+        "action": INTENTS_ACTION_MAP.get(action.get("action_id"), ""),
+        "channel": channel,
+        "user": (payload.get("user") or {}).get("id"),
+        "proposal_id": proposal_id,
+        "response_url": payload.get("response_url"),
+    })
+    log_json({"level": "INFO", "message": "intents_interactive_routed",
+              "action_id": action.get("action_id"), "proposal_id": proposal_id})
+    return {"statusCode": 200, "body": ""}
+
+
 def should_process_slack_event(slack_event):
     event_type = slack_event.get("type")
 
@@ -715,11 +789,20 @@ def lambda_handler(event, context):
                     "body": "live agent reply modal failed",
                 }
 
+        # Intents review-card buttons go to the intents pipeline, not the worker.
+        if str(action.get("action_id") or "").startswith(INTENTS_ACTION_PREFIX):
+            return route_intents_interactive(interactive_payload, action)
+
         result = enqueue_interactive_action(interactive_payload)
         return {
             "statusCode": 200,
             "body": result
         }
+
+    # Slash commands (e.g. /generate-intents) arrive form-encoded with `command`.
+    slash = parse_slash_command(raw_body)
+    if slash:
+        return handle_slash_command(slash)
 
     body = json.loads(raw_body or "{}")
 

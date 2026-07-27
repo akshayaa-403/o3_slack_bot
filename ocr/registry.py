@@ -15,10 +15,7 @@ if TYPE_CHECKING:
 
 # name -> (module path, class name)
 ENGINES: dict[str, tuple[str, str]] = {
-    "easyocr": ("ocr.engines.easyocr_engine", "EasyOcrEngine"),
-    "paddleocr": ("ocr.engines.paddleocr_engine", "PaddleOcrEngine"),
     "textract": ("ocr.engines.textract_engine", "TextractEngine"),
-    "mistral-ocr": ("ocr.engines.mistral_engine", "MistralOcrEngine"),
 }
 
 

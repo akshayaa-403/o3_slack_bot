@@ -10,14 +10,16 @@ BEDROCK_MODEL_ID = os.environ.get(
     "BEDROCK_MODEL_ID",
     "anthropic.claude-haiku-4-5-20251001-v1:0"
 )
-CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "500"))
+CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "800"))
 CLAUDE_TEMPERATURE = float(os.environ.get("CLAUDE_TEMPERATURE", "0.2"))
 CLAUDE_SYSTEM_PROMPT = os.environ.get(
     "CLAUDE_SYSTEM_PROMPT",
     (
-        "You are IVY, a concise IT and support assistant. "
-        "Use only the current user request and session context. "
-        "If the request is ambiguous, ask one clear clarifying question. "
+        "You are IVY, an IT and support assistant. "
+        "Give a clear, concrete, step-by-step solution the user can act on right away, "
+        "using short numbered steps and leading with the most likely fix. "
+        "Only ask a clarifying question if you genuinely cannot give any useful "
+        "guidance without more detail; otherwise provide the best actionable steps. "
         "Do not claim that a ticket was created."
     )
 )
@@ -142,6 +144,17 @@ def extract_claude_text(response_body):
     return "\n".join(parts).strip()
 
 
+def extract_converse_text(response):
+    """Pull assistant text out of a Bedrock Converse response (model-agnostic)."""
+    parts = []
+    message = (response.get("output") or {}).get("message") or {}
+    for item in message.get("content") or []:
+        text = (item.get("text") or "").strip()
+        if text:
+            parts.append(text)
+    return "\n".join(parts).strip()
+
+
 def invoke_claude(event):
     prompt = build_user_prompt(event)
     mode = guardrail_mode()
@@ -159,41 +172,33 @@ def invoke_claude(event):
                 **guardrail_metadata(input_guardrail, "INPUT")
             }
 
-    body = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": CLAUDE_MAX_TOKENS,
-        "temperature": CLAUDE_TEMPERATURE,
-        "system": CLAUDE_SYSTEM_PROMPT,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": prompt
-                    }
-                ]
-            }
-        ]
-    }
-
-    invoke_params = {
+    # Converse API — model-agnostic, so BEDROCK_MODEL_ID can be Amazon Nova, Claude,
+    # Llama, etc. without changing the request shape.
+    converse_params = {
         "modelId": BEDROCK_MODEL_ID,
-        "body": json.dumps(body).encode("utf-8"),
-        "contentType": "application/json",
-        "accept": "application/json"
+        "messages": [
+            {"role": "user", "content": [{"text": prompt}]}
+        ],
+        "inferenceConfig": {
+            "maxTokens": CLAUDE_MAX_TOKENS,
+            "temperature": CLAUDE_TEMPERATURE,
+        },
     }
+    if CLAUDE_SYSTEM_PROMPT:
+        converse_params["system"] = [{"text": CLAUDE_SYSTEM_PROMPT}]
 
     if guardrails_enabled() and mode == "invoke":
-        invoke_params["guardrailIdentifier"] = BEDROCK_GUARDRAIL_ID
-        invoke_params["guardrailVersion"] = BEDROCK_GUARDRAIL_VERSION
-        invoke_params["trace"] = BEDROCK_GUARDRAIL_TRACE
+        converse_params["guardrailConfig"] = {
+            "guardrailIdentifier": BEDROCK_GUARDRAIL_ID,
+            "guardrailVersion": BEDROCK_GUARDRAIL_VERSION,
+            "trace": BEDROCK_GUARDRAIL_TRACE,
+        }
 
-    response = bedrock.invoke_model(**invoke_params)
+    response = bedrock.converse(**converse_params)
 
-    response_body = json.loads(response["body"].read().decode("utf-8"))
-    reply = extract_claude_text(response_body)
-    invoke_guardrail_action = response_body.get("amazon-bedrock-guardrailAction")
+    reply = extract_converse_text(response)
+    stop_reason = response.get("stopReason")
+    invoke_guardrail_action = "GUARDRAIL_INTERVENED" if stop_reason == "guardrail_intervened" else None
 
     if not reply:
         return {
@@ -214,8 +219,8 @@ def invoke_claude(event):
                 "reply": extract_guardrail_output(output_guardrail, CLAUDE_GUARDRAIL_BLOCK_REPLY),
                 "source": "claude_guardrail",
                 "model_id": BEDROCK_MODEL_ID,
-                "stop_reason": response_body.get("stop_reason"),
-                "usage": response_body.get("usage", {}),
+                "stop_reason": stop_reason,
+                "usage": response.get("usage", {}),
                 **guardrail_metadata(output_guardrail, "OUTPUT")
             }
 
@@ -224,8 +229,8 @@ def invoke_claude(event):
         "reply": reply,
         "source": "claude",
         "model_id": BEDROCK_MODEL_ID,
-        "stop_reason": response_body.get("stop_reason"),
-        "usage": response_body.get("usage", {}),
+        "stop_reason": stop_reason,
+        "usage": response.get("usage", {}),
         "guardrail_action": invoke_guardrail_action,
         "guardrail_mode": mode
     }
