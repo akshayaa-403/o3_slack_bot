@@ -1,0 +1,33 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:REGION:ACCOUNT_ID:log-group:/aws/lambda/kb_connect_oauth:*"
+    },
+    {
+      "Sid": "StoreConnectorCredentials",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:TagResource"
+      ],
+      "Resource": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:ivvy-bot/kb-connect/*"
+    },
+    {
+      "Sid": "NoReadingSecretsBack",
+      "Effect": "Deny",
+      "Action": [
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

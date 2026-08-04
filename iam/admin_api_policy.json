@@ -1,0 +1,72 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:REGION:ACCOUNT_ID:log-group:/aws/lambda/o3_admin_api:*"
+    },
+    {
+      "Sid": "TenantRegistry",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:Scan",
+        "dynamodb:DeleteItem"
+      ],
+      "Resource": "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/ivvy-bot-tenants"
+    },
+    {
+      "Sid": "DraftedIntents",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:Query",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem"
+      ],
+      "Resource": "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/ivvy-bot-intents"
+    },
+    {
+      "Sid": "ManageConnectorCredentials",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:TagResource",
+        "secretsmanager:DeleteSecret"
+      ],
+      "Resource": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:ivvy-bot/*"
+    },
+    {
+      "Sid": "NoReadingSecretsBack",
+      "Effect": "Deny",
+      "Action": [
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadMetrics",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:GetMetricData"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "StartProvisioning",
+      "Effect": "Allow",
+      "Action": [
+        "states:StartExecution"
+      ],
+      "Resource": "arn:aws:states:REGION:ACCOUNT_ID:stateMachine:ivvy-bot-provision-tenant"
+    }
+  ]
+}

@@ -81,3 +81,20 @@ response.json
 # Generated intent exports (may contain real ticket/customer text) — regenerate
 # with scripts/generate_intents_from_jira.py rather than committing a run's output.
 data/intents_from_jira_*.csv
+# ---------------------------------------------------------------------------
+# Admin console / multi-tenant control-plane spike (2026-07-29)
+#
+# A complete but UNDEPLOYED body of work: a web console for creating tenants,
+# its API Lambda, a metrics emitter, IAM/infra scaffolding and their tests.
+# Kept out of git deliberately while it is still a spike. Nothing here has
+# been created in AWS.
+#
+# Context and how to resume: .claude/HANDOFF.md (also ignored).
+# The worker's metrics wiring was reverted; the diff is preserved at
+# .claude/patches/worker-metrics-wiring.patch
+# ---------------------------------------------------------------------------
+admin-console/
+ivvy_metrics.py
+ARCHITECTURE.md
+tests/test_admin_api.py
+tests/test_ivvy_metrics.py

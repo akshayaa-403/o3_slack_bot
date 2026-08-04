@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in — IvvY</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%230E0E12'/><path d='M10 7l6 9M22 7l-6 9M16 16v9' stroke='%23FBFBF9' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Familjen+Grotesk:wght@500;600;700&family=Hanken+Grotesk:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="css/app.css">
+<script src="js/config.js"></script>
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem('ivvy_theme');
+      if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+    } catch (e) {}
+  })();
+</script>
+<style>
+  /* Popup-only layout. Kept here rather than in app.css because nothing else
+     uses it and it is deleted along with this file when real OAuth lands. */
+  body { padding: 0.875rem; gap: 0.875rem; }
+  .sheet {
+    flex: 1; background: var(--panel); border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 1.25rem; display: flex; flex-direction: column; gap: 0.875rem;
+    justify-content: center;
+  }
+  .ask { font-size: 0.9375rem; color: var(--ink-2); }
+  .acts { margin-top: auto; display: flex; flex-direction: column; gap: 0.5rem; }
+  .acts .btn { width: 100%; }
+</style>
+</head>
+<body>
+  <div class="sheet" id="sheet">
+    <p class="ask">Completing sign-in…</p>
+  </div>
+<script type="module" src="js/popup.js"></script>
+</body>
+</html>

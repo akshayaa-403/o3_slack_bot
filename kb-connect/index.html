@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Teach your bot — IvvY</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%230E0E12'/><path d='M10 7l6 9M22 7l-6 9M16 16v9' stroke='%23FBFBF9' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Familjen+Grotesk:wght@500;600;700&family=Hanken+Grotesk:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="css/app.css">
+<script src="js/config.js"></script>
+<script>
+  /* Applied before first paint so a dark-mode user never sees a white flash. */
+  (function () {
+    try {
+      var t = localStorage.getItem('ivvy_theme');
+      if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+    } catch (e) { /* private mode */ }
+  })();
+</script>
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M6 4l6 9M18 4l-6 9M12 13v7" stroke="currentColor" stroke-width="2.4"
+              stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </span>
+    <span class="brand-name">IvvY</span>
+  </div>
+
+  <button class="theme" id="theme" type="button" aria-pressed="false">
+    <span class="theme-track" aria-hidden="true"><span class="theme-knob"></span></span>
+    <span class="theme-label" id="theme-label">Light</span>
+  </button>
+</header>
+
+<main class="page">
+
+  <section class="lede-block">
+    <p class="eyebrow">Connect your knowledge sources</p>
+    <h1 class="display">Ivvy Bot</h1>
+    <p class="lede">I answer IT and HR questions right here in Slack. 
+      I learn from tickets your team has already resolved — so the more I'm connected to, 
+      the more I can answer on my own.</p>
+  </section>
+
+  <section class="lines" id="lines" aria-label="Connected knowledge sources"></section>
+
+  <section id="inactive-area" aria-label="Not-connected knowledge sources"></section>
+
+  <section id="more-area" aria-label="More connectors"></section>
+
+  <section class="summary" id="summary" aria-live="polite"></section>
+
+</main>
+
+<footer class="foot">
+  <p class="foot-note" id="foot-note"></p>
+  <button class="btn btn-solid" id="finish" type="button" disabled>Start answering</button>
+</footer>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
