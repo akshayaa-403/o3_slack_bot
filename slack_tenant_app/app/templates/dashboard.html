@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ tenant.name }} — IvvY</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Familjen+Grotesk:wght@500;600;700&family=Hanken+Grotesk:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+<style>
+  /* This dashboard has three connectors, not kb-connect's original four —
+     a fixed 4-column grid would leave an empty track and read as
+     left-aligned rather than centred. Capping the grid's own width and
+     centring that block (instead of trying to centre items within extra
+     columns) is what actually centres a short row of tiles. */
+  .lines {
+    grid-template-columns: repeat(3, minmax(0, 16rem));
+    max-width: 58rem;
+    margin: 0 auto;
+    justify-content: center;
+  }
+  @media (max-width: 64rem) {
+    .lines { grid-template-columns: repeat(2, minmax(0, 16rem)); }
+  }
+  @media (max-width: 34rem) {
+    .lines { grid-template-columns: minmax(0, 16rem); }
+  }
+</style>
+<script>
+  /* Applied before first paint so a dark-mode user never sees a white flash. */
+  (function () {
+    try {
+      var t = localStorage.getItem('ivvy_theme');
+      if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+    } catch (e) { /* private mode */ }
+  })();
+</script>
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M6 4l6 9M18 4l-6 9M12 13v7" stroke="currentColor" stroke-width="2.4"
+              stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </span>
+    <span class="brand-name">IvvY</span>
+  </div>
+
+  <div style="display:flex; align-items:center; gap:1rem;">
+    <span class="eyebrow">{{ tenant.name }}</span>
+    <span class="eyebrow" style="opacity:0.6;" title="Tenant ID">{{ tenant.tenant_id }}</span>
+    <button class="theme" id="theme" type="button" aria-pressed="false">
+      <span class="theme-track" aria-hidden="true"><span class="theme-knob"></span></span>
+      <span class="theme-label" id="theme-label">Light</span>
+    </button>
+  </div>
+</header>
+
+<main class="page">
+
+  <section class="lede-block">
+    <p class="eyebrow">Connect your knowledge sources</p>
+    <h1 class="display">{{ tenant.name }}</h1>
+    <p class="lede">I answer IT and HR questions right here in Slack.
+      I learn from tickets your team has already resolved — connect Jira,
+      Confluence, SharePoint, or G Suite and I'll start reading from them too.</p>
+  </section>
+
+  <section class="lines" aria-label="Connect a service">
+    {% for c in connectors %}
+      {% set connected = c.id in tenant.connected_services %}
+      {% if connected and c.products %}
+        {# Sub-tiles: Jira/Confluence branch off the one Atlassian sign-in,
+           same tree/children/node shape kb-connect uses once a source with
+           multiple products is connected. #}
+        <div class="tree" data-tree="{{ c.id }}">
+          <article class="line line-live line-root" style="--line:{{ c.color }}">
+            <div class="line-top">
+              <span class="line-mark" aria-hidden="true">{{ c.logo|safe }}</span>
+              <span class="line-kind"><span class="eyebrow">{{ c.kind }}</span></span>
+              <span class="pill pill-live">Connected</span>
+            </div>
+            <h2 class="line-name">{{ c.name }}</h2>
+          </article>
+          <div class="branch" aria-hidden="true"></div>
+          <div class="children">
+            {% for p in c.products %}
+              <article class="node" style="--line:{{ c.color }}">
+                <div class="product-head">
+                  <span class="product-mark" aria-hidden="true">{{ p.logo|safe }}</span>
+                  <span class="product-name">{{ p.name }}</span>
+                  {% if p.state == 'indexed' %}
+                    <span class="pill pill-live">Live</span>
+                  {% elif p.state == 'failed' %}
+                    <span class="pill pill-failed">Failed</span>
+                  {% else %}
+                    <span class="pill pill-off">Not connected</span>
+                  {% endif %}
+                </div>
+                <p class="line-blurb">{{ p.blurb }}</p>
+
+                {% if p.state == 'indexed' %}
+                  <span class="line-feed" style="color:var(--live)">{{ p.count }} item(s) synced</span>
+                {% elif p.state == 'failed' %}
+                  <p class="line-feed" style="color:var(--stop)">{{ p.error or 'Something went wrong.' }}</p>
+                {% endif %}
+
+                <div class="line-foot product-foot">
+                  {% if p.state == 'indexed' %}
+                    <div class="action-group">
+                      <form method="post" action="/connectors/{{ c.id }}/products/{{ p.id }}/enable?tenant_id={{ tenant.tenant_id }}">
+                        <button class="btn btn-quiet" type="submit">Read again</button>
+                      </form>
+                      <form method="post" action="/connectors/{{ c.id }}/products/{{ p.id }}/disable?tenant_id={{ tenant.tenant_id }}">
+                        <button class="btn btn-quiet btn-danger" type="submit">Disconnect</button>
+                      </form>
+                    </div>
+                  {% elif p.state == 'failed' %}
+                    <form method="post" action="/connectors/{{ c.id }}/products/{{ p.id }}/enable?tenant_id={{ tenant.tenant_id }}">
+                      <button class="btn" type="submit">Try again</button>
+                    </form>
+                  {% else %}
+                    <form method="post" action="/connectors/{{ c.id }}/products/{{ p.id }}/enable?tenant_id={{ tenant.tenant_id }}">
+                      <button class="btn btn-solid" type="submit">Enable</button>
+                    </form>
+                  {% endif %}
+                </div>
+              </article>
+            {% endfor %}
+          </div>
+        </div>
+      {% else %}
+        <article class="line{{ ' line-live' if connected else '' }}" style="--line:{{ c.color }}">
+          <div class="line-top">
+            <span class="line-mark" aria-hidden="true">{{ c.logo|safe }}</span>
+            <span class="line-kind"><span class="eyebrow">{{ c.kind }}</span></span>
+            <span class="pill {{ 'pill-live' if connected else 'pill-off' }}">
+              {{ 'Connected' if connected else 'Not connected' }}
+            </span>
+          </div>
+
+          <h2 class="line-name">{{ c.name }}</h2>
+          <p class="line-blurb">{{ c.blurb }}</p>
+
+          <div class="line-feeds">
+            {% for feed in c.feeds %}
+              <span class="line-feed">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
+                     stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+                <span>{{ feed }}</span>
+              </span>
+            {% endfor %}
+          </div>
+
+          <div class="line-foot">
+            {% if connected %}
+              <span class="line-feed" style="color:var(--live)">
+                {{ tenant.connected_services[c.id].intents_added|default([])|length }} item(s) synced
+              </span>
+            {% else %}
+              <a class="btn btn-solid" href="/connectors/{{ c.id }}/connect?tenant_id={{ tenant.tenant_id }}">
+                Connect {{ c.name }}
+              </a>
+            {% endif %}
+          </div>
+        </article>
+      {% endif %}
+    {% endfor %}
+  </section>
+
+  {% if tenant.connected_services %}
+  <section class="summary" aria-live="polite">
+    <div class="summary-card">
+      <span class="eyebrow">Your knowledge base</span>
+      <p class="summary-head">{{ tenant.connected_services|length }} of {{ connectors|length }} sources connected.</p>
+    </div>
+  </section>
+  {% endif %}
+
+</main>
+
+<footer class="foot">
+  <p class="foot-note">
+    {% if tenant.connected_services %}
+      {{ tenant.connected_services|length }} of {{ connectors|length }} sources connected. You can add the rest later.
+    {% else %}
+      Connect at least one source and I will have something to answer from.
+    {% endif %}
+  </p>
+</footer>
+
+<script>
+  (function () {
+    var THEME_KEY = 'ivvy_theme';
+    var themeBtn = document.getElementById('theme');
+    var themeLabel = document.getElementById('theme-label');
+
+    var systemDark = function () { return matchMedia('(prefers-color-scheme: dark)').matches; };
+    var isDark = function () {
+      return (document.documentElement.dataset.theme || (systemDark() ? 'dark' : 'light')) === 'dark';
+    };
+
+    function paintTheme() {
+      var dark = isDark();
+      themeBtn.setAttribute('aria-pressed', String(dark));
+      themeLabel.textContent = dark ? 'Dark' : 'Light';
+      themeBtn.setAttribute('aria-label', 'Theme: ' + (dark ? 'dark' : 'light') + '. Switch to ' + (dark ? 'light' : 'dark') + '.');
+    }
+
+    themeBtn.addEventListener('click', function () {
+      var next = isDark() ? 'light' : 'dark';
+      document.documentElement.dataset.theme = next;
+      try { localStorage.setItem(THEME_KEY, next); } catch (e) { /* private mode */ }
+      paintTheme();
+    });
+
+    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+      if (!document.documentElement.dataset.theme) paintTheme();
+    });
+
+    paintTheme();
+  })();
+</script>
+
+</body>
+</html>

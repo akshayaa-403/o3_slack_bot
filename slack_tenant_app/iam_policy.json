@@ -1,0 +1,42 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:REGION:ACCOUNT_ID:log-group:/aws/lambda/slack_tenant_app:*"
+    },
+    {
+      "Sid": "TenantDataTables",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:Query",
+        "dynamodb:BatchWriteItem"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/tenants",
+        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/tenants/index/*",
+        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/intents",
+        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/conversations"
+      ]
+    },
+    {
+      "Sid": "TenantBuckets",
+      "Effect": "Allow",
+      "Action": [
+        "s3:HeadBucket",
+        "s3:CreateBucket"
+      ],
+      "Resource": "arn:aws:s3:::tenant-data-*"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+[
+  {
+    "IndexName": "slack_team_id-index",
+    "KeySchema": [{"AttributeName": "slack_team_id", "KeyType": "HASH"}],
+    "Projection": {"ProjectionType": "ALL"}
+  }
+]
