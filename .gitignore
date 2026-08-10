@@ -98,3 +98,7 @@ ivvy_metrics.py
 ARCHITECTURE.md
 tests/test_admin_api.py
 tests/test_ivvy_metrics.py
+
+# Vendored pip install target for the Lambda bundle; rebuilt at deploy time
+# via: pip install -r requirements.txt -t package/
+slack_tenant_app/package/

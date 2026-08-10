@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -90,23 +89,6 @@ def build_summary(lines: list[OcrLine], max_lines: int = 8) -> str:
     if not texts:
         return "No readable text was detected in the image."
     return "Detected text: " + " | ".join(texts[:max_lines])
-
-
-def load_pil_image(image_bytes: bytes):
-    """Lazy-load a PIL RGB image from bytes (Pillow required)."""
-
-    from PIL import Image  # local import: Pillow is an optional dep
-
-    image = Image.open(io.BytesIO(image_bytes))
-    return image.convert("RGB")
-
-
-def load_numpy_image(image_bytes: bytes):
-    """Lazy-load an RGB numpy array from bytes (Pillow + numpy required)."""
-
-    import numpy as np
-
-    return np.array(load_pil_image(image_bytes))
 
 
 class OcrEngine(ABC):
