@@ -6,6 +6,7 @@ import time
 import hashlib
 import base64
 import boto3
+import contextvars
 import urllib.error
 import urllib.request
 import urllib.parse
@@ -33,6 +34,141 @@ LOCALE_ID = os.environ.get("LOCALE_ID", "en_US")
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "o3_slack_sessions")
+
+# --- Multi-tenant resolution -------------------------------------------------
+# Workspaces onboarded through slack_tenant_app get their own bot token and
+# Lex bot. The handler already stamps every SQS message with
+# `slack_tenant: {team_id, ...}`; this is the consumer side of that.
+#
+# Off by default. With MULTITENANT_ENABLED unset, every lookup short-circuits
+# and the module-level env vars above are used exactly as before — so this
+# whole block is inert until deliberately switched on.
+MULTITENANT_ENABLED = os.environ.get("MULTITENANT_ENABLED", "false").lower() == "true"
+TENANTS_TABLE = os.environ.get("TENANTS_TABLE", "tenants")
+
+# Per-record, not per-invocation: one SQS batch can carry messages from
+# different workspaces, so a value cached at module scope would post one
+# tenant's reply using another tenant's token. A ContextVar is used rather
+# than a plain global because it is the construct built for this, and it
+# stays correct if the worker is ever made concurrent.
+_tenant_ctx = contextvars.ContextVar("tenant_ctx", default=None)
+
+_tenants_table = None
+_tenant_kms_client = None
+
+
+def current_slack_token():
+    """Bot token for the record being processed.
+
+    Falls back to the single-workspace env var whenever no tenant resolved —
+    which is every message until workspaces start onboarding.
+    """
+    tenant = _tenant_ctx.get()
+    if tenant and tenant.get("bot_token"):
+        return tenant["bot_token"]
+    return SLACK_BOT_TOKEN
+
+
+def current_lex_config():
+    """(botId, botAliasId, localeId) for the record being processed."""
+    answering = (_tenant_ctx.get() or {}).get("answering") or {}
+    return (
+        answering.get("lex_bot_id") or BOT_ID,
+        answering.get("lex_bot_alias_id") or BOT_ALIAS_ID,
+        answering.get("lex_locale_id") or LOCALE_ID,
+    )
+
+
+def with_tenant_token(payload):
+    """Stamp the current tenant's bot token onto a downstream invoke payload.
+
+    Lambdas we invoke (summarizer, live agent) post to Slack themselves, so
+    they need the same per-tenant token this record is being handled with.
+    Passing it on the payload keeps the DynamoDB lookup and KMS decrypt in
+    one place here, rather than every downstream function re-implementing
+    resolution and needing its own IAM.
+
+    Adds nothing when no tenant is in context, so today's payloads are
+    unchanged and the downstream env-var fallback keeps applying.
+    """
+    tenant = _tenant_ctx.get()
+    if not tenant or not tenant.get("bot_token"):
+        return payload
+    if not isinstance(payload, dict):
+        return payload
+    return {**payload, "slack_bot_token": tenant["bot_token"]}
+
+
+def _decrypt_tenant_bot_token(tenant):
+    """Decrypt a tenant's Slack bot token.
+
+    Mirrors slack_tenant_app/app/crypto.py. The encryption context must match
+    the writer's exactly or KMS refuses to decrypt — that is what prevents one
+    tenant's ciphertext being replayed as another's, so it is a security
+    control, not a formality.
+    """
+    stored = tenant.get("bot_access_token")
+    if not isinstance(stored, dict) or stored.get("__enc__") != "kms.v1":
+        # Written before encryption existed, or absent.
+        return stored if isinstance(stored, str) else None
+
+    global _tenant_kms_client
+    if _tenant_kms_client is None:
+        _tenant_kms_client = boto3.client("kms", region_name=AWS_REGION)
+
+    resp = _tenant_kms_client.decrypt(
+        CiphertextBlob=base64.b64decode(stored["data"]),
+        EncryptionContext={
+            "tenant_id": tenant["tenant_id"],
+            "purpose": "connector-oauth-token",
+        },
+    )
+    return json.loads(resp["Plaintext"].decode("utf-8")).get("token")
+
+
+def resolve_tenant(slack_tenant):
+    """Resolve an incoming message to its tenant, or None for the env-var path.
+
+    Never raises. A lookup failure falls back to existing single-workspace
+    behaviour, which is strictly better than dropping the message — the
+    caller cannot do anything useful with an exception here.
+    """
+    if not MULTITENANT_ENABLED:
+        return None
+
+    team_id = (slack_tenant or {}).get("team_id")
+    if not team_id:
+        return None
+
+    try:
+        global _tenants_table
+        if _tenants_table is None:
+            _tenants_table = boto3.resource(
+                "dynamodb", region_name=AWS_REGION).Table(TENANTS_TABLE)
+
+        items = _tenants_table.query(
+            IndexName="slack_team_id-index",
+            KeyConditionExpression="slack_team_id = :t",
+            ExpressionAttributeValues={":t": team_id},
+        ).get("Items") or []
+        if not items:
+            return None
+
+        tenant = items[0]
+        return {
+            "tenant_id": tenant.get("tenant_id"),
+            "status": tenant.get("status", "active"),
+            "answering": tenant.get("answering") or {},
+            "bot_token": _decrypt_tenant_bot_token(tenant),
+        }
+    except Exception as exc:
+        log_json({
+            "level": "ERROR",
+            "message": "tenant_resolution_failed",
+            "team_id": team_id,
+            "error": exc.__class__.__name__,
+        })
+        return None
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "86400"))
 INACTIVITY_TIMEOUT_SECONDS = int(os.environ.get("INACTIVITY_TIMEOUT_SECONDS", "30"))
 TIMEOUT_SCHEDULING_ENABLED = os.environ.get("TIMEOUT_SCHEDULING_ENABLED", "true").lower() == "true"
@@ -416,7 +552,7 @@ def send_slack_message(channel, text, blocks=None, thread_ts=None):
         data=data,
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {SLACK_BOT_TOKEN}"
+            "Authorization": f"Bearer {current_slack_token()}"
         },
         method="POST"
     )
@@ -1040,7 +1176,7 @@ def slack_api(method, params=None, payload=None, http_method=None):
     params = params or {}
     url = f"https://slack.com/api/{method}"
     data = None
-    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    headers = {"Authorization": f"Bearer {current_slack_token()}"}
 
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
@@ -2228,7 +2364,7 @@ def invoke_summarizer(payload):
         response = lambda_client.invoke(
             FunctionName=SUMMARIZER_FUNCTION_NAME,
             InvocationType="RequestResponse",
-            Payload=json.dumps(payload).encode("utf-8")
+            Payload=json.dumps(with_tenant_token(payload)).encode("utf-8")
         )
 
     except ClientError as e:
@@ -5020,7 +5156,7 @@ def invoke_live_agent_function(payload):
         response = lambda_client.invoke(
             FunctionName=LIVE_AGENT_FUNCTION,
             InvocationType="RequestResponse",
-            Payload=json.dumps(payload).encode("utf-8")
+            Payload=json.dumps(with_tenant_token(payload)).encode("utf-8")
         )
 
     except ClientError as e:
@@ -6101,7 +6237,7 @@ def invoke_live_agent_support_control(pointer, body, action_id):
     response = lambda_client.invoke(
         FunctionName=LIVE_AGENT_FUNCTION,
         InvocationType="RequestResponse",
-        Payload=json.dumps(payload).encode("utf-8"),
+        Payload=json.dumps(with_tenant_token(payload)).encode("utf-8"),
     )
     raw_payload = response.get("Payload").read().decode("utf-8") if response.get("Payload") else "{}"
     parsed = json.loads(raw_payload or "{}")
@@ -7182,10 +7318,11 @@ def process_record(record):
             text = image_query
             raw_text = image_query
             update_processing_message(processing_message, "Checking IVY routing...")
+            lex_bot_id, lex_alias_id, lex_locale_id = current_lex_config()
             lex_response = lex.recognize_text(
-                botId=BOT_ID,
-                botAliasId=BOT_ALIAS_ID,
-                localeId=LOCALE_ID,
+                botId=lex_bot_id,
+                botAliasId=lex_alias_id,
+                localeId=lex_locale_id,
                 sessionId=lex_session_id,
                 text=image_query,
             )
@@ -7503,10 +7640,11 @@ def process_record(record):
 
     elif text:
         update_processing_message(processing_message, "Checking IVY routing...")
+        lex_bot_id, lex_alias_id, lex_locale_id = current_lex_config()
         response = lex.recognize_text(
-            botId=BOT_ID,
-            botAliasId=BOT_ALIAS_ID,
-            localeId=LOCALE_ID,
+            botId=lex_bot_id,
+            botAliasId=lex_alias_id,
+            localeId=lex_locale_id,
             sessionId=lex_session_id,
             text=text
         )
@@ -7880,6 +8018,7 @@ def process_record(record):
             conversation_status = :conversation_status,
             session_state = :session_state,
             timeout_status = :timeout_status,
+            slack_team_id = :slack_team_id,
             {created_at_expression},
             updated_at = :updated_at,
             #ttl = :ttl
@@ -7887,6 +8026,13 @@ def process_record(record):
 
     expression_attribute_values = {
         ":channel": channel,
+        # Stamped on every session so anything that acts on a session LATER
+        # can work out which workspace it belongs to. The timeout handler
+        # wakes from EventBridge hours after the fact with no live payload to
+        # carry a token, so the session record is the only durable place that
+        # information can come from. Empty string rather than None because
+        # DynamoDB rejects a null here and the readers treat "" as absent.
+        ":slack_team_id": (body.get("slack_tenant") or {}).get("team_id") or "",
         ":user": user,
         ":event_id": event_id,
         ":last_user_text": text,
@@ -8797,7 +8943,29 @@ def lambda_handler(event, context):
     batch_item_failures = []
 
     for record in event["Records"]:
+        token_ctx = None
         try:
+            # Resolve the tenant before process_record runs, since its first
+            # Slack call (fetch_conversation_metadata) needs the right token
+            # already in context. Reset in `finally` so a tenant can never
+            # bleed into the next record of the same batch.
+            tenant = resolve_tenant(
+                json.loads(record["body"]).get("slack_tenant")
+            )
+
+            if tenant and tenant.get("status", "active") != "active":
+                # An expired or suspended plan is not a transient fault —
+                # returning it to the queue would just retry until the
+                # redrive policy gives up. Log it and acknowledge.
+                log_json({
+                    "level": "WARNING",
+                    "message": "tenant_inactive_message_dropped",
+                    "tenant_id": tenant.get("tenant_id"),
+                    "status": tenant.get("status"),
+                })
+                continue
+
+            token_ctx = _tenant_ctx.set(tenant)
             process_record(record)
 
         except Exception as e:
@@ -8815,6 +8983,13 @@ def lambda_handler(event, context):
                 batch_item_failures.append({
                     "itemIdentifier": message_id
                 })
+
+        finally:
+            # Always clear, including on the error path: a leaked context
+            # would hand the next record in this batch the previous
+            # tenant's bot token.
+            if token_ctx is not None:
+                _tenant_ctx.reset(token_ctx)
 
     return {
         "batchItemFailures": batch_item_failures

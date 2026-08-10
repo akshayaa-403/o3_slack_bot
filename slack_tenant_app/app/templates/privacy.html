@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy — IvvY</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Familjen+Grotesk:wght@500;600;700&family=Hanken+Grotesk:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+<style>
+  .doc { max-width: 46rem; margin: 0 auto; display: flex; flex-direction: column; gap: 1.75rem; }
+  .doc h2 { font-size: 1.125rem; font-weight: 600; margin-bottom: 0.5rem; }
+  .doc p, .doc li { color: var(--ink-2); line-height: 1.65; }
+  .doc ul { padding-left: 1.25rem; display: flex; flex-direction: column; gap: 0.4rem; }
+  .doc a { color: var(--ink); }
+  .doc .status { font-size: 0.8125rem; }
+</style>
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem('ivvy_theme');
+      if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+    } catch (e) { /* private mode */ }
+  })();
+</script>
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M6 4l6 9M18 4l-6 9M12 13v7" stroke="currentColor" stroke-width="2.4"
+              stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </span>
+    <span class="brand-name">IvvY</span>
+  </div>
+</header>
+
+<main class="page">
+  <div class="doc">
+    <div class="lede-block">
+      <p class="eyebrow">Legal</p>
+      <h1 class="display">Privacy Policy</h1>
+      <p class="status">Last updated: {{ last_updated }}</p>
+    </div>
+
+    <section>
+      <h2>What we collect</h2>
+      <ul>
+        <li><strong>Slack workspace details</strong> — workspace (team) ID and name, captured when an admin installs IvvY.</li>
+        <li><strong>Installing admin's email address</strong> — used to identify the account owner and for support correspondence.</li>
+        <li><strong>OAuth access tokens</strong> — for Slack and for any knowledge source you choose to connect (Jira, Confluence, SharePoint, G Suite).</li>
+        <li><strong>Content from connected sources</strong> — issue summaries, page titles and body text, used to build the answers IvvY gives in Slack.</li>
+        <li><strong>Questions and answers</strong> — the questions users ask IvvY and the answers it returns.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Why we collect it</h2>
+      <p>Solely to operate the service: to identify your workspace, to read the
+        knowledge sources you explicitly connect, and to answer your team's
+        questions in Slack. We do not sell your data, and we do not use your
+        content to train or fine-tune machine-learning models.</p>
+    </section>
+
+    <section>
+      <h2>How it is stored and isolated</h2>
+      <p>Every record is scoped to your workspace's tenant ID, and each tenant's
+        content is stored under a separate storage bucket. Data is transmitted
+        over TLS 1.2 or higher.</p>
+    </section>
+
+    <section>
+      <h2>Retention and deletion</h2>
+      <p>Your data is retained while IvvY is installed. Uninstalling IvvY from
+        your Slack workspace revokes its access; to have stored data and tokens
+        deleted, contact us using the address below and we will action the
+        request within 30 days. You may also request a copy of the data we hold
+        for your workspace.</p>
+    </section>
+
+    <section>
+      <h2>Your rights</h2>
+      <p>You may request access to, export of, or deletion of your workspace's
+        data at any time by emailing the contact below. We respond to data
+        requests within 30 days.</p>
+    </section>
+
+    <section>
+      <h2>Use of AI</h2>
+      <p>IvvY uses a large language model to generate answers from the content
+        you connect. Model output can be inaccurate or incomplete and should not
+        be relied on as authoritative. Your content is not used to train models.</p>
+    </section>
+
+    <section>
+      <h2>Contact</h2>
+      <p>Privacy and data requests: <a href="mailto:{{ contact_email }}">{{ contact_email }}</a></p>
+    </section>
+  </div>
+</main>
+
+<footer class="foot">
+  <p class="foot-note"><a href="/login">Back to sign in</a> · <a href="/support">Support</a></p>
+</footer>
+
+</body>
+</html>

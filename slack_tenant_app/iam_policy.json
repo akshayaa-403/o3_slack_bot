@@ -26,7 +26,8 @@
         "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/tenants",
         "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/tenants/index/*",
         "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/intents",
-        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/conversations"
+        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/conversations",
+        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/tenant_workspace_registry"
       ]
     },
     {
@@ -37,6 +38,16 @@
         "s3:CreateBucket"
       ],
       "Resource": "arn:aws:s3:::tenant-data-*"
+    },
+    {
+      "Sid": "ConnectorTokenEncryption",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:GenerateDataKey"
+      ],
+      "Resource": "arn:aws:kms:REGION:ACCOUNT_ID:key/KMS_KEY_ARN_ID"
     }
   ]
 }

@@ -2,6 +2,7 @@ import json
 import os
 import time
 import hashlib
+import contextvars
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,6 +26,20 @@ DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "o3_slack_sessions")
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "86400"))
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_API_TIMEOUT_SECONDS = int(os.environ.get("SLACK_API_TIMEOUT_SECONDS", "10"))
+
+# --- Per-tenant Slack token --------------------------------------------------
+# The caller (the worker) has already resolved and decrypted the workspace's
+# bot token, so it arrives on the invoke payload as `slack_bot_token` rather
+# than being looked up again here. That keeps the DynamoDB read and the KMS
+# decrypt in exactly one place, and means this Lambda needs no extra IAM.
+#
+# Absent (every invocation today) it falls back to the env var, so behaviour
+# is unchanged until the worker starts sending one.
+_slack_token_ctx = contextvars.ContextVar("slack_token", default=None)
+
+
+def current_slack_token():
+    return _slack_token_ctx.get() or SLACK_BOT_TOKEN
 SUMMARY_HISTORY_LOOKBACK_SECONDS = int(os.environ.get("SUMMARY_HISTORY_LOOKBACK_SECONDS", "7200"))
 SUMMARY_HISTORY_LIMIT = int(os.environ.get("SUMMARY_HISTORY_LIMIT", "100"))
 SUMMARY_WEBHOOK_URL = os.environ.get("SUMMARY_WEBHOOK_URL") or os.environ.get("POWER_AUTOMATE_URL")
@@ -151,7 +166,7 @@ def slack_api(method, params=None, payload=None, http_method=None):
 
     data = None
     headers = {
-        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+        "Authorization": f"Bearer {current_slack_token()}",
     }
 
     if payload is not None:
@@ -1152,6 +1167,10 @@ def lambda_handler(event, context):
     session_id = event.get("session_id")
     global _CURRENT_EVENT
     _CURRENT_EVENT = event or {}
+    # Set before any Slack call below. Lambda reuses a warm container across
+    # invocations, so this is set unconditionally — including to None — to
+    # avoid inheriting the previous invocation's tenant token.
+    _slack_token_ctx.set((event or {}).get("slack_bot_token"))
     timeout_token = event.get("timeout_token")
     started_at = datetime.now(timezone.utc).replace(microsecond=0)
     closed_at = parse_iso(event.get("closed_at")) or started_at

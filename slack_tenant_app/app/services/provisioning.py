@@ -1,16 +1,27 @@
 """
 Provisions per-tenant infrastructure: an S3 bucket (or namespaced prefix
-in mock mode) and a set of default pre-populated intents.
+in mock mode) and the tenant's answering configuration.
 
 Idempotent: safe to call more than once for the same tenant_id.
+
+On global intents. A new tenant must be able to answer generic IT/HR
+questions the moment the bot is installed, with no connected sources —
+that was an explicit requirement from the design review. It is met by
+pointing the tenant at IvvY's existing shared Lex bot (which already
+carries the full generic intent set) rather than copying intents into
+each tenant.
+
+Copying was the obvious alternative and is worse: it duplicates hundreds
+of intents per tenant, and every tenant's copy starts drifting from the
+shared bot the moment that bot is updated. A pointer means an
+improvement to the shared intent set reaches every tenant at once.
+
+Tenant-specific intents (created when a customer connects Atlassian and
+friends) are stored per-tenant and take precedence — the shared bot is
+the floor, not the ceiling.
 """
 from app.config import Config
 from app.db import store
-
-DEFAULT_INTENTS = {
-    "greeting": {"body": "Handles hello/hi/greeting style messages."},
-    "fallback": {"body": "Default response when no other intent or connected source matches."},
-}
 
 
 def _ensure_s3_bucket(tenant_id: str) -> str:
@@ -43,8 +54,16 @@ def _ensure_s3_bucket(tenant_id: str) -> str:
 def provision_tenant(tenant_id: str) -> dict:
     bucket_name = _ensure_s3_bucket(tenant_id)
 
-    # Namespace default intents with the tenant_id, e.g. "<tenant_id>_greeting"
-    namespaced = {f"{tenant_id}_{k}": v for k, v in DEFAULT_INTENTS.items()}
-    store.put_intents(tenant_id, namespaced)
+    # Record which Lex bot answers for this tenant. Every new tenant starts
+    # on the shared bot, so global intents work from the first message. The
+    # field exists (rather than the worker just assuming the shared bot) so
+    # a tenant can later be moved to a dedicated bot without a code change.
+    answering = {
+        "lex_bot_id": Config.GLOBAL_LEX_BOT_ID,
+        "lex_bot_alias_id": Config.GLOBAL_LEX_BOT_ALIAS_ID,
+        "lex_locale_id": Config.GLOBAL_LEX_LOCALE_ID,
+        "scope": "global",
+    }
+    store.set_answering_config(tenant_id, answering)
 
-    return {"bucket": bucket_name, "intents_seeded": list(namespaced.keys())}
+    return {"bucket": bucket_name, "answering": answering}

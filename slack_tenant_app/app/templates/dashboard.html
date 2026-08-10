@@ -26,6 +26,38 @@
   @media (max-width: 34rem) {
     .lines { grid-template-columns: minmax(0, 16rem); }
   }
+  .skip-row {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 0.5rem;
+  }
+  .skip-link {
+    font-size: 0.875rem;
+    color: var(--ink-2);
+    text-decoration: underline;
+    text-underline-offset: 0.2em;
+    cursor: pointer;
+  }
+  .skip-link:hover { color: var(--ink); }
+  .continue-row { display: flex; justify-content: center; margin-bottom: 1.5rem; }
+  .continue-card {
+    display: flex;
+    align-items: center;
+    gap: 1.25rem;
+    flex-wrap: wrap;
+    justify-content: center;
+    max-width: 46rem;
+    padding: 1rem 1.25rem;
+    border: 1px solid var(--rule-2);
+    border-radius: 0.5rem;
+    background: var(--sunk);
+  }
+  .continue-text { color: var(--ink-2); font-size: 0.9375rem; margin: 0; }
+  .connect-link.is-locked {
+    opacity: 0.45;
+    cursor: not-allowed;
+    pointer-events: none;
+  }
 </style>
 <script>
   /* Applied before first paint so a dark-mode user never sees a white flash. */
@@ -57,10 +89,37 @@
       <span class="theme-track" aria-hidden="true"><span class="theme-knob"></span></span>
       <span class="theme-label" id="theme-label">Light</span>
     </button>
+    {# Ends this browser session only — it does not uninstall the bot or
+       disconnect any source, so signing out is safe to click. #}
+    <a class="btn btn-quiet" href="/logout" title="Sign out of this dashboard">Sign out</a>
   </div>
 </header>
 
 <main class="page">
+
+  {% if not tenant.connected_services %}
+  {# Per design review: a single plain hyperlink, top-right — deliberately
+     not a fourth tile and not a prominent button, so skipping reads as the
+     quiet secondary path next to the three connection tiles. #}
+  <div class="skip-row">
+    <a class="skip-link" href="#" role="button" id="skip-connectors">I don't want any connections for now</a>
+  </div>
+
+  {# Shown once the user skips: connecting a source is optional, so there has
+     to be a way out of this screen and back to the bot. Hidden until then so
+     it does not compete with the connection tiles. #}
+  <div class="continue-row" id="continue-row" hidden>
+    <div class="continue-card">
+      <p class="continue-text">
+        No problem — IvvY already answers general IT and HR questions.
+        You can connect your own sources here whenever you like.
+      </p>
+      <a class="btn btn-solid" id="continue-slack"
+         href="{{ slack_workspace_url }}"
+         data-web-fallback="{{ slack_web_fallback_url }}">Continue to Slack</a>
+    </div>
+  </div>
+  {% endif %}
 
   <section class="lede-block">
     <p class="eyebrow">Connect your knowledge sources</p>
@@ -69,6 +128,7 @@
       I learn from tickets your team has already resolved — connect Jira,
       Confluence, SharePoint, or G Suite and I'll start reading from them too.</p>
   </section>
+
 
   <section class="lines" aria-label="Connect a service">
     {% for c in connectors %}
@@ -162,7 +222,7 @@
                 {{ tenant.connected_services[c.id].intents_added|default([])|length }} item(s) synced
               </span>
             {% else %}
-              <a class="btn btn-solid" href="/connectors/{{ c.id }}/connect?tenant_id={{ tenant.tenant_id }}">
+              <a class="btn btn-solid connect-link" href="/connectors/{{ c.id }}/connect?tenant_id={{ tenant.tenant_id }}">
                 Connect {{ c.name }}
               </a>
             {% endif %}
@@ -184,7 +244,7 @@
 </main>
 
 <footer class="foot">
-  <p class="foot-note">
+  <p class="foot-note" id="foot-note">
     {% if tenant.connected_services %}
       {{ tenant.connected_services|length }} of {{ connectors|length }} sources connected. You can add the rest later.
     {% else %}
@@ -223,6 +283,61 @@
     });
 
     paintTheme();
+  })();
+
+  (function () {
+    var skipBtn = document.getElementById('skip-connectors');
+    if (!skipBtn) return;
+    var footNote = document.getElementById('foot-note');
+    var connectLinks = document.querySelectorAll('.connect-link');
+    var locked = false;
+
+    var SKIP_LABEL = "I don't want any connections for now";
+    var ALLOW_LABEL = "Allow connectors now";
+
+    var continueRow = document.getElementById('continue-row');
+
+    skipBtn.addEventListener('click', function (e) {
+      e.preventDefault();
+      locked = !locked;
+      skipBtn.textContent = locked ? ALLOW_LABEL : SKIP_LABEL;
+      skipBtn.setAttribute('aria-pressed', String(locked));
+      connectLinks.forEach(function (link) {
+        link.classList.toggle('is-locked', locked);
+        link.setAttribute('aria-disabled', String(locked));
+      });
+      // Only offer the way out once they have actually opted out; showing it
+      // upfront would read as "you are done here" before they have chosen.
+      if (continueRow) continueRow.hidden = !locked;
+      if (footNote) {
+        footNote.textContent = locked
+          ? "No sources connected. Click \"Allow connectors now\" above to connect one."
+          : "Connect at least one source and I will have something to answer from.";
+      }
+    });
+
+    // The "Not now" button on the Slack welcome card links here with ?skip=1,
+    // so arriving that way lands the user directly in the skipped state
+    // rather than making them click again.
+    if (new URLSearchParams(window.location.search).get('skip') === '1') {
+      skipBtn.click();
+    }
+
+    // A slack:// link fails silently when the desktop app isn't installed —
+    // the click just does nothing. There's no event for "protocol handler
+    // missing", so fall back to the web client if the page is still here and
+    // visible shortly after the click; a successful handoff either navigates
+    // away or backgrounds the tab.
+    var continueBtn = document.getElementById('continue-slack');
+    if (continueBtn) {
+      continueBtn.addEventListener('click', function () {
+        var fallback = continueBtn.getAttribute('data-web-fallback');
+        if (!fallback) return;
+        setTimeout(function () {
+          if (!document.hidden) window.location.href = fallback;
+        }, 1200);
+      });
+    }
   })();
 </script>
 

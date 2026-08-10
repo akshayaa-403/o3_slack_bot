@@ -1,6 +1,7 @@
 import json
 import os
 import base64
+import contextvars
 import hashlib
 from datetime import datetime, timezone
 import time
@@ -34,6 +35,17 @@ LIVE_AGENT_WEBHOOK_TIMEOUT_SECONDS = int(os.environ.get("LIVE_AGENT_WEBHOOK_TIME
 LIVE_AGENT_TICKET_BASE_URL = os.environ.get("LIVE_AGENT_TICKET_BASE_URL", "https://innovyq.atlassian.net").rstrip("/")
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "86400"))
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+
+# --- Per-tenant Slack token --------------------------------------------------
+# The worker resolves and decrypts the workspace's bot token before invoking
+# this Lambda and passes it as `slack_bot_token` on the payload, so the
+# DynamoDB read and KMS decrypt stay in one place and this function needs no
+# extra IAM. Absent (every invocation today) it falls back to the env var.
+_slack_token_ctx = contextvars.ContextVar("slack_token", default=None)
+
+
+def current_slack_token():
+    return _slack_token_ctx.get() or SLACK_BOT_TOKEN
 ONCALL_USER_TABLE = os.environ.get("ONCALL_USER_TABLE", "O3_JSMOps_Oncall")
 ONCALL_CACHE_KEY = os.environ.get("ONCALL_CACHE_KEY", "current")
 ONCALL_USER_FUNCTION = os.environ.get("ONCALL_USER_FUNCTION") or os.environ.get("JSM_ONCALL_USER_FUNCTION")
@@ -1644,7 +1656,7 @@ def mark_slack_confirmation(pointer_session_id, status, result=None, error=None)
 
 
 def post_slack_message(channel, text, thread_ts="", blocks=None):
-    if not (SLACK_BOT_TOKEN and channel):
+    if not (current_slack_token() and channel):
         return {
             "attempted": False
         }
@@ -1664,7 +1676,7 @@ def post_slack_message(channel, text, thread_ts="", blocks=None):
         data=json.dumps(message).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+            "Authorization": f"Bearer {current_slack_token()}",
         },
         method="POST",
     )
@@ -1682,7 +1694,7 @@ def post_slack_message(channel, text, thread_ts="", blocks=None):
 
 
 def post_slack_ticket(callback):
-    if not (SLACK_BOT_TOKEN and callback.get("slack_channel")):
+    if not (current_slack_token() and callback.get("slack_channel")):
         return {
             "attempted": False
         }
@@ -3923,6 +3935,10 @@ def lambda_handler(event, context):
     api_gateway_event = isinstance(event, dict) and "body" in event
     effective_event = parse_api_gateway_body(event) if api_gateway_event else event
     effective_event = effective_event if isinstance(effective_event, dict) else {}
+    # Set before any Slack call. Unconditional, including to None: Lambda
+    # reuses warm containers, so a conditional set would let one invocation
+    # inherit the previous tenant's token.
+    _slack_token_ctx.set(effective_event.get("slack_bot_token"))
     received_context = (
         normalize_callback(effective_event)
         if is_jsm_callback(effective_event) or is_unsupported_jsm_callback(effective_event)

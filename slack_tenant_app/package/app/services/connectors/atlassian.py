@@ -70,6 +70,15 @@ class AtlassianConnector(BaseConnector):
     ]
 
     def build_authorize_url(self, tenant_id: str) -> str:
+        # offline_access asks for a refresh token, so an expired access token
+        # can be renewed silently instead of dragging the user back through
+        # the consent screen.
+        #
+        # Deliberately no `prompt=consent`: that flag forces Atlassian to
+        # re-ask every single time, even for a user who has already approved
+        # this app. Omitting it lets Atlassian skip straight through for an
+        # already-consented account, which is the "ask once, never again"
+        # behaviour we want.
         return (
             "https://auth.atlassian.com/authorize"
             f"?audience=api.atlassian.com"
@@ -77,7 +86,7 @@ class AtlassianConnector(BaseConnector):
             f"&scope={quote('read:jira-work read:confluence-content.summary')}"
             f"&redirect_uri={quote(Config.ATLASSIAN_REDIRECT_URI, safe='')}"
             f"&state={tenant_id}"
-            "&response_type=code&prompt=consent"
+            "&response_type=code"
         )
 
     def handle_callback(self, tenant_id: str, code: str) -> dict:

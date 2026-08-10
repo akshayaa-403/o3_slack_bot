@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Account inactive — IvvY</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Familjen+Grotesk:wght@500;600;700&family=Hanken+Grotesk:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+<style>
+  .state-wrap {
+    min-height: 60vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    gap: 1.25rem;
+  }
+  .state-wrap .lede { max-width: 46ch; }
+  .state-mark {
+    width: 3rem; height: 3rem;
+    display: grid; place-items: center;
+    border-radius: 50%;
+    background: var(--stop-bg);
+    color: var(--stop);
+  }
+  .state-mark svg { width: 1.5rem; height: 1.5rem; }
+  .state-meta {
+    font-size: 0.8125rem;
+    color: var(--ink-2);
+    font-family: 'DM Mono', monospace;
+  }
+</style>
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem('ivvy_theme');
+      if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+    } catch (e) { /* private mode */ }
+  })();
+</script>
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M6 4l6 9M18 4l-6 9M12 13v7" stroke="currentColor" stroke-width="2.4"
+              stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </span>
+    <span class="brand-name">IvvY</span>
+  </div>
+</header>
+
+<main class="page">
+  <div class="state-wrap">
+    <span class="state-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+           stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16.5v.01"/>
+      </svg>
+    </span>
+
+    {% if status == 'expired' %}
+      <h1 class="display">Your plan has expired</h1>
+      <p class="lede">IvvY is paused for {{ tenant.name }}. Renew your plan to
+        start answering questions in Slack again — your connected sources and
+        settings are kept in the meantime.</p>
+    {% elif status == 'suspended' %}
+      <h1 class="display">This account is suspended</h1>
+      <p class="lede">IvvY is paused for {{ tenant.name }}. Get in touch and
+        we'll sort out what's needed to restore access.</p>
+    {% else %}
+      <h1 class="display">This account is inactive</h1>
+      <p class="lede">IvvY is paused for {{ tenant.name }}. Get in touch and
+        we'll help get it running again.</p>
+    {% endif %}
+
+    <a class="btn btn-solid" href="mailto:{{ contact_email }}?subject=Reactivate%20IvvY%20-%20{{ tenant.name|urlencode }}">
+      Contact support
+    </a>
+
+    <p class="state-meta">Tenant {{ tenant.tenant_id }} · status: {{ status }}</p>
+  </div>
+</main>
+
+<footer class="foot">
+  <p class="foot-note"><a href="/privacy">Privacy</a> · <a href="/support">Support</a></p>
+</footer>
+
+</body>
+</html>

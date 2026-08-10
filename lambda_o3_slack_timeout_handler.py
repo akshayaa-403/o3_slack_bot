@@ -1,7 +1,9 @@
 import json
 import os
 import time
+import base64
 import hashlib
+import contextvars
 import boto3
 import urllib.request
 from datetime import datetime, timezone, timedelta
@@ -17,6 +19,79 @@ DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "o3_slack_sessions")
 SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "86400"))
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 TIMEOUT_CLOSE_GRACE_SECONDS = int(os.environ.get("TIMEOUT_CLOSE_GRACE_SECONDS", "30"))
+
+# --- Per-tenant Slack token --------------------------------------------------
+# Unlike the summarizer and live agent, this Lambda is woken by EventBridge
+# Scheduler hours after the conversation happened, so there is no live invoke
+# payload to carry a token on. The token is deliberately NOT put in the
+# schedule's Input either: that would persist it in plaintext AWS config for
+# hours, and lambda_handler logs the whole event to CloudWatch, so it would
+# end up in the logs too.
+#
+# Instead the session record carries `slack_team_id` (written by the worker on
+# every message) and this resolves the token from it at wake-up.
+MULTITENANT_ENABLED = os.environ.get("MULTITENANT_ENABLED", "false").lower() == "true"
+TENANTS_TABLE = os.environ.get("TENANTS_TABLE", "tenants")
+
+_slack_token_ctx = contextvars.ContextVar("slack_token", default=None)
+_tenants_table = None
+_tenant_kms_client = None
+
+
+def current_slack_token():
+    return _slack_token_ctx.get() or SLACK_BOT_TOKEN
+
+
+def resolve_tenant_token(session_item):
+    """Bot token for the workspace this session belongs to, or None.
+
+    Never raises: falling back to the shared env token keeps timeouts firing,
+    which matters more than perfect attribution on an edge case.
+    """
+    if not MULTITENANT_ENABLED:
+        return None
+
+    team_id = (session_item or {}).get("slack_team_id")
+    if not team_id:
+        return None
+
+    try:
+        global _tenants_table, _tenant_kms_client
+        if _tenants_table is None:
+            _tenants_table = dynamodb.Table(TENANTS_TABLE)
+
+        items = _tenants_table.query(
+            IndexName="slack_team_id-index",
+            KeyConditionExpression="slack_team_id = :t",
+            ExpressionAttributeValues={":t": team_id},
+        ).get("Items") or []
+        if not items:
+            return None
+
+        tenant = items[0]
+        stored = tenant.get("bot_access_token")
+        if not isinstance(stored, dict) or stored.get("__enc__") != "kms.v1":
+            return stored if isinstance(stored, str) else None
+
+        if _tenant_kms_client is None:
+            _tenant_kms_client = boto3.client("kms", region_name=AWS_REGION)
+
+        resp = _tenant_kms_client.decrypt(
+            CiphertextBlob=base64.b64decode(stored["data"]),
+            EncryptionContext={
+                "tenant_id": tenant["tenant_id"],
+                "purpose": "connector-oauth-token",
+            },
+        )
+        return json.loads(resp["Plaintext"].decode("utf-8")).get("token")
+    except Exception as exc:
+        log_json({
+            "level": "ERROR",
+            "message": "tenant_token_resolution_failed",
+            "team_id": team_id,
+            "error": exc.__class__.__name__,
+        })
+        return None
 TIMEOUT_PROMPT_TEXT = os.environ.get(
     "TIMEOUT_PROMPT_TEXT",
     "Are you still there? I will close this conversation if I do not hear back soon."
@@ -67,7 +142,7 @@ def send_slack_message(channel, text, thread_ts=None):
         data=data,
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {SLACK_BOT_TOKEN}"
+            "Authorization": f"Bearer {current_slack_token()}"
         },
         method="POST"
     )
@@ -486,6 +561,17 @@ def lambda_handler(event, context):
     })
 
     action = event.get("action", "prompt")
+
+    # Resolve the workspace token from the session before dispatching, since
+    # both branches post to Slack. Set unconditionally (including to None) —
+    # Lambda reuses warm containers, so a conditional set would let this
+    # invocation inherit the previous tenant's token.
+    # The get_session call is skipped entirely when multi-tenant is off, so
+    # this adds no read to the current single-workspace path.
+    _slack_token_ctx.set(
+        resolve_tenant_token(get_session(event.get("session_id")))
+        if MULTITENANT_ENABLED else None
+    )
 
     if action == "prompt":
         return handle_prompt(event, context)

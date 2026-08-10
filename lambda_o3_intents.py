@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+import contextvars
 import urllib.parse
 import urllib.request
 
@@ -59,13 +60,31 @@ INTENTS_LEX_BUILD = os.environ.get("INTENTS_LEX_BUILD", "false").strip().lower()
 INTENTS_SOURCE = os.environ.get("INTENTS_SOURCE", "mock").strip().lower()
 
 
+# --- Per-tenant Slack token --------------------------------------------------
+# Accepts `slack_bot_token` on the invoke payload so this can post as the right
+# workspace once the caller supplies one.
+#
+# The handler does not send one yet, and that is deliberate rather than an
+# oversight: this pipeline is an internal admin tool (/generate-intents and its
+# review-card buttons), not per-customer functionality, so it runs in InnovyQ's
+# own workspace on the shared token. Wiring tenant resolution into the handler
+# purely for this would add a DynamoDB read and a KMS decrypt to the 3-second
+# Slack ack path for no current benefit. The hook exists so that when intents
+# genuinely go per-customer, only the caller needs changing.
+_slack_token_ctx = contextvars.ContextVar("slack_token", default=None)
+
+
+def current_slack_token():
+    return _slack_token_ctx.get() or SLACK_BOT_TOKEN
+
+
 def log_json(data):
     print(json.dumps(data, default=str))
 
 
 def slack_post(channel, text, blocks=None):
     """Post a message to Slack via chat.postMessage (stdlib only)."""
-    if not SLACK_BOT_TOKEN:
+    if not current_slack_token():
         raise ValueError("Missing SLACK_BOT_TOKEN")
     payload = {"channel": channel, "text": text}
     if blocks:
@@ -73,7 +92,7 @@ def slack_post(channel, text, blocks=None):
     request = urllib.request.Request(
         "https://slack.com/api/chat.postMessage",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {current_slack_token()}", "Content-Type": "application/json"},
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=10) as response:
@@ -89,7 +108,7 @@ def slack_upload_csv(channel, filename, content_bytes, title, comment):
     query = urllib.parse.urlencode({"filename": filename, "length": len(content_bytes)})
     req1 = urllib.request.Request(
         "https://slack.com/api/files.getUploadURLExternal?" + query,
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}, method="GET")
+        headers={"Authorization": f"Bearer {current_slack_token()}"}, method="GET")
     with urllib.request.urlopen(req1, timeout=10) as resp:
         d1 = json.loads(resp.read().decode("utf-8"))
     if not d1.get("ok"):
@@ -112,7 +131,7 @@ def slack_upload_csv(channel, filename, content_bytes, title, comment):
     req3 = urllib.request.Request(
         "https://slack.com/api/files.completeUploadExternal",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {current_slack_token()}", "Content-Type": "application/json"},
         method="POST")
     with urllib.request.urlopen(req3, timeout=10) as resp:
         d3 = json.loads(resp.read().decode("utf-8"))
@@ -258,6 +277,10 @@ def lambda_handler(event, context=None):
     action = (event or {}).get("action")
     channel = (event or {}).get("channel")
     proposal_id = (event or {}).get("proposal_id")
+    # Set unconditionally, including to None: Lambda reuses warm containers,
+    # so a conditional set would let this run inherit the previous caller's
+    # token. None simply falls back to the env var.
+    _slack_token_ctx.set((event or {}).get("slack_bot_token"))
     try:
         if not channel:
             raise ValueError("missing channel")
